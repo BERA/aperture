@@ -210,7 +210,7 @@
       },
 
       outcomeClass(ev) {
-        return "bera-badge--" + String(ev.Outcome || "").toLowerCase();
+        return "a-badge--" + String(ev.Outcome || "").toLowerCase();
       },
 
       dash(v) {

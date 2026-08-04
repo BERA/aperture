@@ -30,7 +30,7 @@ func TestStaticShellServed(t *testing.T) {
 	}{
 		{"/", "<title>Aperture", "text/html"},
 		{"/index.html", "shell()", "text/html"},
-		{"/css/bera.css", "--bera-500", "text/css"},
+		{"/css/styles.css", "--a-500", "text/css"},
 		{"/js/app.js", "apiFetch", ""},
 		{"/js/crud.js", "window.crud", ""},
 		{"/js/grants.js", "window.grants", ""},

@@ -45,7 +45,7 @@ func newTestServer(t *testing.T) (*httptest.Server, model.Storage) {
 	must(t, store.PutObjectType(ctx, model.ObjectType{Name: "system", Actions: []string{authz.AdminAction}}))
 	must(t, store.PutPermission(ctx, model.Permission{ID: "perm-admin", ObjectType: "system", Action: authz.AdminAction}))
 	// Stamped to the "*" wildcard account so root is a platform system-admin
-	// (resolves in every account, like bera.yaml's platform-admins), not an
+	// (resolves in every account, like example.yaml's platform-admins), not an
 	// admin confined to one account.
 	must(t, store.PutGrant(ctx, model.Grant{
 		ID: "g-root-admin", AccountID: model.AccountWildcard,

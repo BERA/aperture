@@ -20,7 +20,7 @@ assets are pre-built, committed blobs embedded via `//go:embed all:static` (see
 | Layer | Role in the shell |
 |---|---|
 | **Alpine.js** | Small reactive framework driving each screen's component and the hash-routed navigation. |
-| **BERA design tokens** | The house design-token system. The shell's authoritative styling is the hand-authored `static/css/bera.css`, written from the token spec; it is *not* Tailwind/DaisyUI. |
+| **BERA design tokens** | The house design-token system. The shell's authoritative styling is the hand-authored `static/css/styles.css`, written from the token spec; it is *not* Tailwind/DaisyUI. |
 | **Tailwind CSS / DaisyUI** | Vendored utility/component CSS carried for the domain screens. |
 | **Rete.js** | A node-graph editing library. The **Rules** screen mounts a Rete canvas to edit rule blueprints; the bundle is loaded at runtime from `/vendor/rete/rete.min.js`. |
 
