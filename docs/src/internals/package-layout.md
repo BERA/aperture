@@ -38,7 +38,7 @@ this page is a map, not a re-explanation.
 | `cmd/aperture/` | The binary entry point (`main.go`) and e2e tests. Thin — no business logic. |
 | `internal/cli/` | The `urfave/cli/v3` command tree (`NewApp`); the CLI-reference generation source. |
 | `internal/server/` | `net/http` ServeMux + Twirp handlers + admin-UI static serving + middleware. |
-| `internal/server/static/` | The admin UI (Alpine + BERA + Rete.js); `vendor/rete/` is a committed JS bundle. |
+| `internal/server/static/` | The admin UI (Alpine + Styles + Rete.js); `vendor/rete/` is a committed JS bundle. |
 | `internal/wire/rpc/` | `service.proto` plus the **committed** generated `service.pb.go` / `service.twirp.go`. |
 | `internal/docsgen/` | The on-demand documentation generators (`errcodes`, `cliref`) run by `make docs-gen`. |
 | `mcp/gosdk/` | The one adapter that imports the MCP protocol SDK; a firewall test keeps the core SDK-free. |
