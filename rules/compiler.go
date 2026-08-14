@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
+	"github.com/expr-lang/expr/vm/runtime"
 
 	aerr "github.com/frankbardon/aperture/errors"
 )
@@ -102,10 +105,11 @@ func Function(name string, fn func(args ...any) (any, error)) CompilerOption {
 }
 
 // NewCompiler builds a Compiler. By default the only callable functions are the
-// curated pure set (lower, upper, contains, startsWith, endsWith, len); all of
-// expr-lang's builtins are disabled, so no wall-clock or random function is
-// reachable and evaluation stays deterministic. Host functions added with
-// Function join that set.
+// curated pure set (lower, upper, contains, startsWith, endsWith, len, plus the
+// collection-operator backings hasAll, hasAny, hasNone, subsetOf, isEmpty,
+// isNotEmpty); all of expr-lang's builtins are disabled, so no wall-clock or
+// random function is reachable and evaluation stays deterministic. Host functions
+// added with Function join that set.
 func NewCompiler(opts ...CompilerOption) *Compiler {
 	c := &Compiler{}
 	// The typed env, a required boolean result, and a disabled builtin library
@@ -167,9 +171,27 @@ func hashSource(src string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Names of the backing functions the collection operators render to. They are
+// constants rather than string literals so opSpecs (ast.go) and defaultFunctions
+// (below) cannot drift apart.
+const (
+	fnHasAll     = "hasAll"
+	fnHasAny     = "hasAny"
+	fnHasNone    = "hasNone"
+	fnSubsetOf   = "subsetOf"
+	fnIsEmpty    = "isEmpty"
+	fnIsNotEmpty = "isNotEmpty"
+)
+
 // defaultFunctions is the curated pure function set every Compiler exposes. They
 // are deterministic and side-effect-free, the safe baseline a rule can rely on
 // regardless of host configuration.
+//
+// The last six back the collection operators that have no native expr spelling
+// under DisableAllBuiltins (see opSpecs in ast.go). Each declares an explicit
+// signature so the type-checker knows it returns a bool — that is what lets a
+// bare `isEmpty(object.tags)` satisfy expr.AsBool as a whole rule. All six read
+// their arguments and nothing else: no state, no clock, no I/O.
 func defaultFunctions() []expr.Option {
 	return []expr.Option{
 		expr.Function("lower", func(args ...any) (any, error) {
@@ -207,6 +229,170 @@ func defaultFunctions() []expr.Option {
 				return 0, nil
 			}
 		}),
+
+		// hasAll(coll, items): every element of items is in coll.
+		expr.Function(fnHasAll, func(args ...any) (any, error) {
+			coll, items, err := collectionPair(fnHasAll, args)
+			if err != nil {
+				return false, err
+			}
+			for _, it := range items {
+				if !containsValue(coll, it) {
+					return false, nil
+				}
+			}
+			return true, nil
+		}, new(func(any, any) bool)),
+
+		// hasAny(coll, items): at least one element of items is in coll.
+		expr.Function(fnHasAny, func(args ...any) (any, error) {
+			coll, items, err := collectionPair(fnHasAny, args)
+			if err != nil {
+				return false, err
+			}
+			for _, it := range items {
+				if containsValue(coll, it) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}, new(func(any, any) bool)),
+
+		// hasNone(coll, items): no element of items is in coll. An absent coll
+		// reads as empty, so this is TRUE for an object missing the field — the
+		// same "negative operator grants on missing data" shape as `nin`.
+		expr.Function(fnHasNone, func(args ...any) (any, error) {
+			coll, items, err := collectionPair(fnHasNone, args)
+			if err != nil {
+				return false, err
+			}
+			for _, it := range items {
+				if containsValue(coll, it) {
+					return false, nil
+				}
+			}
+			return true, nil
+		}, new(func(any, any) bool)),
+
+		// subsetOf(coll, super): every element of coll is in super. An absent
+		// coll reads as empty, and the empty set is a subset of everything, so
+		// this is TRUE for an object missing the field.
+		expr.Function(fnSubsetOf, func(args ...any) (any, error) {
+			coll, super, err := collectionPair(fnSubsetOf, args)
+			if err != nil {
+				return false, err
+			}
+			for _, v := range coll {
+				if !containsValue(super, v) {
+					return false, nil
+				}
+			}
+			return true, nil
+		}, new(func(any, any) bool)),
+
+		// isEmpty(v): v is an absent, empty array, empty object, or empty string.
+		expr.Function(fnIsEmpty, func(args ...any) (any, error) {
+			empty, err := isEmptyValue(fnIsEmpty, args)
+			if err != nil {
+				return false, err
+			}
+			return empty, nil
+		}, new(func(any) bool)),
+
+		// isNotEmpty(v): the exact negation of isEmpty, registered separately so
+		// the rendered expression stays a single atomic call.
+		expr.Function(fnIsNotEmpty, func(args ...any) (any, error) {
+			empty, err := isEmptyValue(fnIsNotEmpty, args)
+			if err != nil {
+				return false, err
+			}
+			return !empty, nil
+		}, new(func(any) bool)),
+	}
+}
+
+// collectionPair normalizes the two arguments of a binary collection operator to
+// element slices.
+//
+// A nil argument — an ABSENT metadata field, which optional chaining also yields
+// for a missing intermediate — reads as an EMPTY collection rather than an error.
+// That single rule is what makes every collection operator deny-safe in the same
+// way: the positive operators (hasAll, hasAny) go false on missing data, and the
+// negative ones (hasNone, subsetOf) go true, exactly mirroring in/nin.
+//
+// A non-collection argument (a string, a number, a map) is a genuine type
+// mismatch and IS an error, matching expr's own `operator "in" not defined on
+// string`. Only the operator and the Go type are reported; no metadata value
+// reaches the message.
+func collectionPair(op string, args []any) ([]any, []any, error) {
+	if len(args) != 2 {
+		return nil, nil, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+			"rule: collection operator takes exactly two operands",
+			map[string]any{"op": op, "args": len(args)})
+	}
+	left, err := elements(op, args[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	right, err := elements(op, args[1])
+	if err != nil {
+		return nil, nil, err
+	}
+	return left, right, nil
+}
+
+// elements flattens an array-shaped value to []any, treating nil as empty.
+func elements(op string, v any) ([]any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		out := make([]any, rv.Len())
+		for i := range out {
+			out[i] = rv.Index(i).Interface()
+		}
+		return out, nil
+	default:
+		return nil, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+			"rule: collection operator requires an array operand",
+			map[string]any{"op": op, "type": fmt.Sprintf("%T", v)})
+	}
+}
+
+// containsValue reports whether coll holds v, using expr-lang's own equality so
+// element matching is identical to the native `in` operator `has` renders to —
+// including its numeric cross-type handling and its refusal to coerce "1" to 1.
+func containsValue(coll []any, v any) bool {
+	for _, e := range coll {
+		if runtime.Equal(e, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// isEmptyValue reports whether the single argument is absent or an empty array,
+// object, or string. Absent counts as empty, keeping isEmpty/isNotEmpty on the
+// same deny-safe footing as the rest: isNotEmpty is false for a missing field.
+func isEmptyValue(op string, args []any) (bool, error) {
+	if len(args) != 1 {
+		return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+			"rule: unary collection operator takes exactly one operand",
+			map[string]any{"op": op, "args": len(args)})
+	}
+	if args[0] == nil {
+		return true, nil
+	}
+	rv := reflect.ValueOf(args[0])
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.String:
+		return rv.Len() == 0, nil
+	default:
+		return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+			"rule: operator requires an array, object, or string operand",
+			map[string]any{"op": op, "type": fmt.Sprintf("%T", args[0])})
 	}
 }
 

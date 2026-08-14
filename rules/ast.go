@@ -54,14 +54,20 @@ const (
 	NodeVar NodeType = "var"
 	// NodeLiteral is a scalar constant (string, number, bool, or null).
 	NodeLiteral NodeType = "literal"
-	// NodeList is an ordered list of operand nodes, used as the right side of an
-	// in/nin comparison.
+	// NodeList is an ordered list of operand nodes, used as the right side of a
+	// collection comparison (in, nin, hasAll, hasAny, hasNone, subsetOf).
 	NodeList NodeType = "list"
 	// NodeCall is a call to a registered pure function.
 	NodeCall NodeType = "call"
 )
 
 // Comparison operators carried in a NodeCompare's Op field.
+//
+// The first eight are the scalar/membership operators. The nine that follow are
+// the collection operators, which read a list- or object-valued metadata field.
+// Three of those (OpIsEmpty, OpIsNotEmpty, OpExists) are UNARY: they reuse
+// NodeCompare with Right OMITTED rather than introducing a new node type, so the
+// editor gains nine operators and no new palette primitive.
 const (
 	OpEq  = "eq"  // ==
 	OpNe  = "ne"  // !=
@@ -71,18 +77,115 @@ const (
 	OpGe  = "ge"  // >=
 	OpIn  = "in"  // in  (right operand is a list/collection)
 	OpNin = "nin" // not in
+
+	OpHas        = "has"        // object.tags has "x"           (array)
+	OpHasAll     = "hasAll"     // object.tags has all [a, b]    (array)
+	OpHasAny     = "hasAny"     // object.tags has any [a, b]    (array)
+	OpHasNone    = "hasNone"    // object.tags has none [a, b]   (array)
+	OpSubsetOf   = "subsetOf"   // object.tags subset of [a, b]  (array)
+	OpHasKey     = "hasKey"     // object.owner has key "dept"   (object)
+	OpIsEmpty    = "isEmpty"    // object.tags is empty          (array, object) — unary
+	OpIsNotEmpty = "isNotEmpty" // object.tags is not empty      (array, object) — unary
+	OpExists     = "exists"     // object.owner.dept exists      (any path)      — unary
 )
 
-// compareRender maps each comparison operator to its expr-lang spelling.
-var compareRender = map[string]string{
-	OpEq:  "==",
-	OpNe:  "!=",
-	OpLt:  "<",
-	OpLe:  "<=",
-	OpGt:  ">",
-	OpGe:  ">=",
-	OpIn:  "in",
-	OpNin: "not in",
+// rightShape constrains what a comparison's right operand may be — the
+// operand-shape half of an operator's contract, enforced by Validate.
+type rightShape uint8
+
+const (
+	// rightAny accepts any operand node (the scalar comparisons).
+	rightAny rightShape = iota
+	// rightCollection requires a list literal or a variable: the right operand is
+	// itself a collection (in, nin, hasAll, hasAny, hasNone, subsetOf).
+	rightCollection
+	// rightElement requires a single element — anything but a list node. A set on
+	// the right is hasAll/hasAny/hasNone, not has (has, hasKey).
+	rightElement
+	// rightNone requires Right to be omitted entirely: the unary operators.
+	rightNone
+)
+
+// renderKind is how a comparison operator turns into expr-lang source.
+type renderKind uint8
+
+const (
+	// renderInfix writes `(left <text> right)` — the native spelling.
+	renderInfix renderKind = iota
+	// renderFlippedIn writes `(right in left)`: the operator reads
+	// collection-first but compiles to expr's element-first `in`.
+	renderFlippedIn
+	// renderNotNil writes `(left != nil)`.
+	renderNotNil
+	// renderFunc writes `<text>(left)` or `<text>(left, right)`, calling one of
+	// the backing functions registered in defaultFunctions().
+	renderFunc
+)
+
+// opSpec is one comparison operator's contract: the shape its right operand must
+// take, and how it renders to expr-lang. Keeping both in a single table is what
+// stops Validate and render from disagreeing about the operator set. text is the
+// infix operator for renderInfix and the backing function name for renderFunc;
+// the other kinds do not use it.
+type opSpec struct {
+	shape rightShape
+	kind  renderKind
+	text  string
+}
+
+// opSpecs is the closed comparison-operator registry.
+//
+// RENDER STRATEGY, recorded per operator. expr-lang's builtin library is disabled
+// (expr.DisableAllBuiltins, compiler.go), so nothing may be ASSUMED reachable:
+// every operator either renders to NATIVE expr syntax or is backed by a pure
+// function registered in defaultFunctions().
+//
+//   - eq ne lt le gt ge in nin — NATIVE infix, unchanged.
+//   - has, hasKey — NATIVE, a flipped `in`: `(right in left)`. expr's `in` is
+//     element membership over a slice AND KEY membership over a map, so hasKey is
+//     pure spelling over behavior that already exists and neither operator needs
+//     a backing function.
+//   - exists — NATIVE: `(left != nil)`. Together with the optional chaining
+//     renderVar emits, a missing intermediate reads as nil, so
+//     `object.owner.dept exists` is false rather than a runtime error.
+//   - hasAll hasAny hasNone subsetOf isEmpty isNotEmpty — REGISTERED FUNCTIONS.
+//     Their native spellings would be expr's `all`/`any`/`len`, which are either
+//     genuinely disabled (len) or reachable only through a `#` pointer this AST
+//     cannot emit — and which validateCall explicitly denies. Each is backed by a
+//     deterministic, side-effect-free func in defaultFunctions().
+var opSpecs = map[string]opSpec{
+	OpEq:         {shape: rightAny, kind: renderInfix, text: "=="},
+	OpNe:         {shape: rightAny, kind: renderInfix, text: "!="},
+	OpLt:         {shape: rightAny, kind: renderInfix, text: "<"},
+	OpLe:         {shape: rightAny, kind: renderInfix, text: "<="},
+	OpGt:         {shape: rightAny, kind: renderInfix, text: ">"},
+	OpGe:         {shape: rightAny, kind: renderInfix, text: ">="},
+	OpIn:         {shape: rightCollection, kind: renderInfix, text: "in"},
+	OpNin:        {shape: rightCollection, kind: renderInfix, text: "not in"},
+	OpHas:        {shape: rightElement, kind: renderFlippedIn},
+	OpHasKey:     {shape: rightElement, kind: renderFlippedIn},
+	OpHasAll:     {shape: rightCollection, kind: renderFunc, text: fnHasAll},
+	OpHasAny:     {shape: rightCollection, kind: renderFunc, text: fnHasAny},
+	OpHasNone:    {shape: rightCollection, kind: renderFunc, text: fnHasNone},
+	OpSubsetOf:   {shape: rightCollection, kind: renderFunc, text: fnSubsetOf},
+	OpIsEmpty:    {shape: rightNone, kind: renderFunc, text: fnIsEmpty},
+	OpIsNotEmpty: {shape: rightNone, kind: renderFunc, text: fnIsNotEmpty},
+	OpExists:     {shape: rightNone, kind: renderNotNil},
+}
+
+// blockedCallNames are expr-lang's PREDICATE builtins. expr.DisableAllBuiltins
+// does NOT reach them: the parser matches a predicate name (parser.predicates)
+// BEFORE it consults the disabled-builtin table, so `all(...)` and `any(...)`
+// still compile under Aperture's option set even though `len(...)` does not.
+// None is reachable through a well-formed rule today — nothing in this AST emits
+// expr's `#` pointer — but NodeCall renders `name(args...)` verbatim, so a
+// NodeCall{Name: "all"} WOULD compile. Denying the names structurally in Validate
+// closes that door for every caller, ValidateAST and the editor's save path
+// included. Keep in sync with expr-lang/expr parser/parser.go.
+var blockedCallNames = map[string]struct{}{
+	"all": {}, "none": {}, "any": {}, "one": {}, "filter": {}, "map": {},
+	"count": {}, "sum": {}, "find": {}, "findIndex": {}, "findLast": {},
+	"findLastIndex": {}, "groupBy": {}, "sortBy": {}, "reduce": {},
 }
 
 // allowedRoots is the closed set of context-variable roots a rule may reference.
@@ -110,7 +213,8 @@ var varPath = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-
 //
 //	and/or   Children (>= 2)
 //	not      Children (exactly 1)
-//	compare  Op, Left, Right
+//	compare  Op, Left, Right — Right is OMITTED for the unary operators
+//	         (isEmpty, isNotEmpty, exists) and required for every other operator
 //	var      Name (dotted path)
 //	literal  Value (scalar JSON: string, number, bool, or null)
 //	list     Items
@@ -135,9 +239,18 @@ func Or(children ...*Node) *Node { return &Node{Type: NodeOr, Children: children
 // Not returns the logical negation of child.
 func Not(child *Node) *Node { return &Node{Type: NodeNot, Children: []*Node{child}} }
 
-// Compare returns a binary comparison node for one of the Op* operators.
+// Compare returns a binary comparison node for one of the Op* operators. Use
+// Unary for OpIsEmpty / OpIsNotEmpty / OpExists, which take no right operand.
 func Compare(op string, left, right *Node) *Node {
 	return &Node{Type: NodeCompare, Op: op, Left: left, Right: right}
+}
+
+// Unary returns a unary comparison node for one of the unary operators —
+// OpIsEmpty, OpIsNotEmpty, OpExists. It is still a NodeCompare; Right is left nil
+// so it is omitted from the JSON form, which is exactly what Validate requires
+// for these three operators.
+func Unary(op string, left *Node) *Node {
+	return &Node{Type: NodeCompare, Op: op, Left: left}
 }
 
 // Var returns a variable reference for a dotted path (e.g. object.classification).
@@ -153,12 +266,14 @@ func Lit(v any) *Node {
 	return &Node{Type: NodeLiteral, Value: json.RawMessage(b)}
 }
 
-// List returns a list literal over items, used as the right operand of in/nin.
+// List returns a list literal over items, used as the right operand of a
+// collection comparison (in, nin, hasAll, hasAny, hasNone, subsetOf).
 func List(items ...*Node) *Node { return &Node{Type: NodeList, Items: items} }
 
 // Call returns a function-call node. The function must be one registered with the
 // compiler (the curated pure set, plus any the host adds); an unknown function is
-// caught at compile time.
+// caught at compile time, and expr's predicate builtins are refused by Validate
+// (see blockedCallNames).
 func Call(name string, args ...*Node) *Node {
 	return &Node{Type: NodeCall, Name: name, Items: args}
 }
@@ -188,23 +303,7 @@ func (n *Node) Validate() error {
 		}
 		return n.Children[0].Validate()
 	case NodeCompare:
-		if _, ok := compareRender[n.Op]; !ok {
-			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
-				"rule: unknown comparison operator", map[string]any{"op": n.Op})
-		}
-		if n.Left == nil || n.Right == nil {
-			return aerr.New(aerr.APERTURE_RULE_INVALID,
-				"rule: comparison requires a left and a right operand")
-		}
-		if err := n.Left.Validate(); err != nil {
-			return err
-		}
-		if (n.Op == OpIn || n.Op == OpNin) && n.Right.Type != NodeList && n.Right.Type != NodeVar {
-			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
-				"rule: in/nin requires a list or variable on the right",
-				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
-		}
-		return n.Right.Validate()
+		return n.validateCompare()
 	case NodeVar:
 		return validateVar(n.Name)
 	case NodeLiteral:
@@ -212,15 +311,79 @@ func (n *Node) Validate() error {
 	case NodeList:
 		return validateAll(n.Items)
 	case NodeCall:
-		if !varPath.MatchString(n.Name) || n.Name == "" {
-			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
-				"rule: call has an invalid function name", map[string]any{"name": n.Name})
-		}
-		return validateAll(n.Items)
+		return n.validateCall()
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: unknown node type", map[string]any{"type": string(n.Type)})
 	}
+}
+
+// validateCompare checks a NodeCompare against its operator's opSpec: the
+// operator is known, the operand ARITY matches (a unary operator takes no right
+// operand and a binary one requires both), and the right operand's SHAPE is what
+// the operator can act on.
+//
+// The arity rule is deliberately per-operator rather than blanket: exactly
+// OpIsEmpty / OpIsNotEmpty / OpExists must omit Right, and a Right supplied for
+// one of them is an error rather than something silently ignored — otherwise the
+// AST would have two spellings for the same rule and would stop round-tripping
+// predictably.
+func (n *Node) validateCompare() error {
+	spec, ok := opSpecs[n.Op]
+	if !ok {
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: unknown comparison operator", map[string]any{"op": n.Op})
+	}
+	if n.Left == nil {
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: comparison requires a left operand", map[string]any{"op": n.Op})
+	}
+	if spec.shape == rightNone {
+		if n.Right != nil {
+			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+				"rule: unary operator takes no right operand",
+				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
+		}
+		return n.Left.Validate()
+	}
+	if n.Right == nil {
+		return aerr.New(aerr.APERTURE_RULE_INVALID,
+			"rule: comparison requires a left and a right operand")
+	}
+	if err := n.Left.Validate(); err != nil {
+		return err
+	}
+	switch spec.shape {
+	case rightCollection:
+		if n.Right.Type != NodeList && n.Right.Type != NodeVar {
+			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+				"rule: operator requires a list or variable on the right",
+				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
+		}
+	case rightElement:
+		if n.Right.Type == NodeList {
+			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+				"rule: operator requires a single element on the right; use hasAll/hasAny/hasNone for a set",
+				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
+		}
+	}
+	return n.Right.Validate()
+}
+
+// validateCall checks a NodeCall's function name. Beyond the identifier shape it
+// rejects expr-lang's predicate builtins, which survive DisableAllBuiltins — see
+// blockedCallNames. Whether the name is actually REGISTERED is the compiler's
+// call (a host may add its own functions), surfaced as APERTURE_RULE_TYPE_ERROR.
+func (n *Node) validateCall() error {
+	if n.Name == "" || !varPath.MatchString(n.Name) {
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: call has an invalid function name", map[string]any{"name": n.Name})
+	}
+	if _, blocked := blockedCallNames[n.Name]; blocked {
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: function is not callable from a rule", map[string]any{"name": n.Name})
+	}
+	return validateAll(n.Items)
 }
 
 func validateAll(nodes []*Node) error {
@@ -303,18 +466,7 @@ func (n *Node) render(b *bytes.Buffer) error {
 		b.WriteByte(')')
 		return nil
 	case NodeCompare:
-		b.WriteByte('(')
-		if err := n.Left.render(b); err != nil {
-			return err
-		}
-		b.WriteByte(' ')
-		b.WriteString(compareRender[n.Op])
-		b.WriteByte(' ')
-		if err := n.Right.render(b); err != nil {
-			return err
-		}
-		b.WriteByte(')')
-		return nil
+		return n.renderCompare(b)
 	case NodeVar:
 		renderVar(b, n.Name)
 		return nil
@@ -348,6 +500,74 @@ func (n *Node) render(b *bytes.Buffer) error {
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: cannot render unknown node type", map[string]any{"type": string(n.Type)})
+	}
+}
+
+// renderCompare writes a NodeCompare in the form its operator's opSpec calls for.
+// Each branch is documented at opSpecs; the short version is that has/hasKey flip
+// to expr's element-first `in`, exists becomes a nil test, and the six operators
+// with no native spelling call a registered backing function.
+func (n *Node) renderCompare(b *bytes.Buffer) error {
+	spec, ok := opSpecs[n.Op]
+	if !ok {
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: cannot render unknown comparison operator", map[string]any{"op": n.Op})
+	}
+	switch spec.kind {
+	case renderInfix:
+		b.WriteByte('(')
+		if err := n.Left.render(b); err != nil {
+			return err
+		}
+		b.WriteByte(' ')
+		b.WriteString(spec.text)
+		b.WriteByte(' ')
+		if err := n.Right.render(b); err != nil {
+			return err
+		}
+		b.WriteByte(')')
+		return nil
+
+	case renderFlippedIn:
+		// No backing function is needed: expr's `in` already covers slice
+		// membership AND map-key membership, and it is nil-safe (`x in nil` is
+		// false, never an error).
+		b.WriteByte('(')
+		if err := n.Right.render(b); err != nil {
+			return err
+		}
+		b.WriteString(" in ")
+		if err := n.Left.render(b); err != nil {
+			return err
+		}
+		b.WriteByte(')')
+		return nil
+
+	case renderNotNil:
+		// Because renderVar emits optional chaining, a path through a missing
+		// intermediate reads as nil, so this is false for an absent field rather
+		// than a runtime error.
+		b.WriteByte('(')
+		if err := n.Left.render(b); err != nil {
+			return err
+		}
+		b.WriteString(" != nil)")
+		return nil
+
+	default: // renderFunc — a call is atomic, so it needs no wrapping parens.
+		b.WriteString(spec.text)
+		b.WriteByte('(')
+		if err := n.Left.render(b); err != nil {
+			return err
+		}
+		if n.Right != nil {
+			b.WriteString(", ")
+			if err := n.Right.render(b); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(')')
+		return nil
 	}
 }
 
