@@ -214,13 +214,23 @@ the inline entry declared never appears on an object the file does carry. A rule
 reading a field the CSV silently did not override is a support ticket nobody can
 reproduce; predictability wins over usefulness here.
 
-Because that discard is total, **a collision is `APERTURE_CONFIG_INVALID` by
-default**, naming every colliding object *type* (sorted, in both the message and
-the error context — never the object ids, which can embed an account). Nothing in
-`seed` has a logging path to an operator, so a warning would be a silent discard
-in practice. A deliberate collision is accepted with
-`doc.BuildRegistry(dir, seed.AllowProviderPrecedence())` — Go wiring, not a
-seed-file key, so the file stays a plain declaration and the tolerance sits where
+**That is the default, and a collision builds rather than failing.** Adding a CSV
+for a type that still has inline entries is an ordinary migration step, not a
+fault: a seed that booted yesterday must not refuse to boot today because a
+`providers:` row was added.
+
+The discard is still surfaced. **`doc.ProviderCollisions()` returns the object
+types the build discarded** — sorted, deduplicated, types only and never ids
+(which can embed an account) — reading the document alone, with no file IO and no
+registry, so it answers the same before and after `BuildRegistry`. Nothing in
+`seed` picks a logger for the host; the collision is returned as a fact the host
+logs however it already logs.
+
+A host that reads the overlap as an authoring mistake instead opts into a
+refusal: `doc.BuildRegistry(dir, seed.StrictProviderCollision())` returns
+`APERTURE_CONFIG_INVALID` naming every colliding object *type* (sorted, in both
+the message and the error context — never the object ids). It is Go wiring, not a
+seed-file key, so the file stays a plain declaration and the strictness sits where
 a reviewer sees it.
 
 **Validation does not depend on precedence.** Every inline entry is validated
@@ -318,7 +328,7 @@ Changing the value model means changing all of these in the same PR:
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
-| The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `AllowProviderPrecedence` doc comments in `seed/provider.go` |
+| The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the
 value model must not change that.

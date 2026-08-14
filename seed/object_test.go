@@ -290,16 +290,50 @@ func TestInlineObjects_ApplyWritesNothingAndExportOmitsThem(t *testing.T) {
 	}
 }
 
-// A type served by BOTH sections is a CONFIGURATION fault, not the incidental
-// duplicate-registration error it used to surface as: the precedence rule
-// discards every inline entry for the type, and a silent-by-default discard is
-// hostile, so the collision is refused by name.
-func TestInlineObjects_ConflictWithProvidersSection(t *testing.T) {
+// A type served by BOTH sections BUILDS by default: adding a CSV for a type that
+// still carries inline entries is an ordinary migration step, not an authoring
+// fault, and a document that booted yesterday must not stop booting because a
+// providers: row was added. The discard is not silent — ProviderCollisions names
+// the types — but it is not fatal either.
+func TestInlineObjects_ConflictWithProvidersSectionBuildsByDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "brands.csv"),
+		[]byte("id,tier\nbrand:1,bronze\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc := &Document{
+		Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "brands.csv", TTL: "0"}},
+		Objects:   []Object{{ID: "brand:1"}},
+	}
+	reg, err := doc.BuildRegistry(dir)
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	if !reg.Has("brand") {
+		t.Fatalf("registry keys = %v, want brand", reg.Keys())
+	}
+	// The file-backed provider is the one that survived.
+	md, err := reg.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if md["tier"] != "bronze" {
+		t.Errorf("tier = %v, want bronze from the CSV", md["tier"])
+	}
+	if got := doc.ProviderCollisions(); !reflect.DeepEqual(got, []string{"brand"}) {
+		t.Errorf("ProviderCollisions() = %#v, want [brand]", got)
+	}
+}
+
+// StrictProviderCollision is the opt-in that turns the collision back into a
+// refusal, for a host that reads the overlap as an authoring mistake rather than
+// a migration in progress.
+func TestInlineObjects_StrictCollisionRefusesToBuild(t *testing.T) {
 	doc := &Document{
 		Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "brands.csv"}},
 		Objects:   []Object{{ID: "brand:1"}},
 	}
-	_, err := doc.BuildRegistry("")
+	_, err := doc.BuildRegistry("", StrictProviderCollision())
 	if aerr.CodeOf(err) != aerr.APERTURE_CONFIG_INVALID {
 		t.Fatalf("code = %s, want APERTURE_CONFIG_INVALID", aerr.CodeOf(err))
 	}
@@ -312,15 +346,16 @@ func TestInlineObjects_ConflictWithProvidersSection(t *testing.T) {
 	if strings.Contains(msg, "brand:1") {
 		t.Errorf("error %q leaks an object id", msg)
 	}
-	// The escape hatch is named in the error, not just in the docs.
-	if !strings.Contains(msg, "AllowProviderPrecedence") {
-		t.Errorf("error %q does not point at the override", msg)
+	// The error says which option produced it, so the reader knows the refusal
+	// was asked for and how to stop asking.
+	if !strings.Contains(msg, "StrictProviderCollision") {
+		t.Errorf("error %q does not name the option that caused it", msg)
 	}
 }
 
-// Every colliding type is reported at once, in a stable order, so one fix pass
-// clears the document.
-func TestInlineObjects_ConflictReportsEveryTypeSorted(t *testing.T) {
+// Under strict mode every colliding type is reported at once, in a stable order,
+// so one fix pass clears the document.
+func TestInlineObjects_StrictCollisionReportsEveryTypeSorted(t *testing.T) {
 	doc := &Document{
 		Providers: []Provider{
 			{ObjectType: "brand", Kind: "csv", Path: "brands.csv"},
@@ -328,7 +363,7 @@ func TestInlineObjects_ConflictReportsEveryTypeSorted(t *testing.T) {
 		},
 		Objects: []Object{{ID: "brand:1"}, {ID: "app:be"}},
 	}
-	_, err := doc.BuildRegistry("")
+	_, err := doc.BuildRegistry("", StrictProviderCollision())
 	if aerr.CodeOf(err) != aerr.APERTURE_CONFIG_INVALID {
 		t.Fatalf("code = %s, want APERTURE_CONFIG_INVALID", aerr.CodeOf(err))
 	}
@@ -347,7 +382,69 @@ func TestInlineObjects_ConflictReportsEveryTypeSorted(t *testing.T) {
 	}
 }
 
-// With the override, precedence is TYPE-LEVEL and TOTAL: the file-backed
+// ProviderCollisions is how the default discard reaches an operator, so it has to
+// report the same set the build acts on: every colliding type, once, sorted, and
+// nothing else. It is document-only — no registry, no file IO — so it answers the
+// same before and after a build.
+func TestInlineObjects_ProviderCollisionsReportsDiscardedTypes(t *testing.T) {
+	cases := map[string]struct {
+		doc  *Document
+		want []string
+	}{
+		"no providers section": {
+			&Document{Objects: []Object{{ID: "brand:1"}}}, nil,
+		},
+		"no objects section": {
+			&Document{Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "b.csv"}}}, nil,
+		},
+		"disjoint sections": {
+			&Document{
+				Providers: []Provider{{ObjectType: "app", Kind: "csv", Path: "a.csv"}},
+				Objects:   []Object{{ID: "brand:1"}},
+			}, nil,
+		},
+		"only the colliding type, sorted and deduplicated": {
+			&Document{
+				Providers: []Provider{
+					{ObjectType: "brand", Kind: "csv", Path: "b.csv"},
+					{ObjectType: "app", Kind: "csv", Path: "a.csv"},
+				},
+				Objects: []Object{
+					{ID: "brand:1"}, {ID: "team:core"}, {ID: "app:be"}, {ID: "brand:2"},
+				},
+			}, []string{"app", "brand"},
+		},
+		"a nested id collides on its terminal type": {
+			&Document{
+				Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "b.csv"}},
+				Objects:   []Object{{ID: "account:acme/brand:1"}},
+			}, []string{"brand"},
+		},
+		"an unparseable id is not a collision": {
+			&Document{
+				Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "b.csv"}},
+				Objects:   []Object{{ID: "not an identity"}},
+			}, nil,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := tc.doc.ProviderCollisions()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("ProviderCollisions() = %#v, want %#v", got, tc.want)
+			}
+			// Types only, never ids: the value is destined for a log line and an
+			// id can embed an account.
+			for _, typ := range got {
+				if strings.ContainsAny(typ, ":/") {
+					t.Errorf("ProviderCollisions() returned %q, which is not a bare object type", typ)
+				}
+			}
+		})
+	}
+}
+
+// By default, precedence is TYPE-LEVEL and TOTAL: the file-backed
 // provider serves the whole type and every inline entry for it is discarded.
 // There is no merge at any granularity and no fallback — an inline id the CSV
 // does not carry is simply not resolvable, and a field only the inline entry
@@ -370,7 +467,7 @@ objects:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	reg, err := doc.BuildRegistry(dir, AllowProviderPrecedence())
+	reg, err := doc.BuildRegistry(dir)
 	if err != nil {
 		t.Fatalf("BuildRegistry: %v", err)
 	}
@@ -422,7 +519,7 @@ objects:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	reg, err := doc.BuildRegistry(dir, AllowProviderPrecedence())
+	reg, err := doc.BuildRegistry(dir)
 	if err != nil {
 		t.Fatalf("BuildRegistry: %v", err)
 	}
@@ -436,6 +533,11 @@ objects:
 	want := map[string]any{"tier": "gold", "seats": int64(3)}
 	if !reflect.DeepEqual(map[string]any(md), want) {
 		t.Errorf("app metadata = %#v, want %#v", md, want)
+	}
+	// The report is scoped the same way the discard is: app was kept, so it is
+	// not named.
+	if got := doc.ProviderCollisions(); !reflect.DeepEqual(got, []string{"brand"}) {
+		t.Errorf("ProviderCollisions() = %#v, want [brand]", got)
 	}
 }
 
@@ -472,26 +574,34 @@ func TestInlineObjects_DiscardedTypeIsStillValidated(t *testing.T) {
 				t.Fatalf("Parse: %v", err)
 			}
 			doc.Providers = []Provider{{ObjectType: "brand", Kind: "csv", Path: "brands.csv"}}
-			_, err = doc.BuildRegistry("", AllowProviderPrecedence())
-			if aerr.CodeOf(err) != tc.want {
-				t.Fatalf("code = %s, want %s (err=%v)", aerr.CodeOf(err), tc.want, err)
+			// Both under the default discard and under the strict refusal: the
+			// validation pass runs first either way, so the author is told what
+			// is wrong with the entry rather than that it was ignored.
+			if _, err := doc.BuildRegistry(""); aerr.CodeOf(err) != tc.want {
+				t.Fatalf("default: code = %s, want %s (err=%v)", aerr.CodeOf(err), tc.want, err)
+			}
+			if _, err := doc.BuildRegistry("", StrictProviderCollision()); aerr.CodeOf(err) != tc.want {
+				t.Fatalf("strict: code = %s, want %s (err=%v)", aerr.CodeOf(err), tc.want, err)
 			}
 		})
 	}
 }
 
-// The override changes nothing for a document that has no collision.
-func TestInlineObjects_ProviderPrecedenceIsANoOpWithoutCollision(t *testing.T) {
+// StrictProviderCollision changes nothing for a document that has no collision.
+func TestInlineObjects_StrictCollisionIsANoOpWithoutCollision(t *testing.T) {
 	doc, err := Parse([]byte(inlineObjectsYAML), FormatYAML)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	reg, err := doc.BuildRegistry("", AllowProviderPrecedence())
+	reg, err := doc.BuildRegistry("", StrictProviderCollision())
 	if err != nil {
 		t.Fatalf("BuildRegistry: %v", err)
 	}
 	if len(reg.Keys()) != 2 || !reg.Has("brand") || !reg.Has("app") {
 		t.Fatalf("registry keys = %v, want brand and app", reg.Keys())
+	}
+	if got := doc.ProviderCollisions(); got != nil {
+		t.Errorf("ProviderCollisions() = %#v, want none", got)
 	}
 }
 

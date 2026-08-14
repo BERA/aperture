@@ -161,23 +161,43 @@ That is deliberate. Field-level merging is the most useful-sounding behaviour an
 the most impossible to debug: a rule reading a field the CSV silently did not
 override is a support ticket nobody can reproduce. Predictability wins.
 
-Because the discard is total, **a collision is a hard error by default**:
-`BuildRegistry` returns `APERTURE_CONFIG_INVALID` naming every colliding object
-type (sorted, in both the message and the error context — never the object ids,
-which can embed an account). Silently discarding a section the author took the
-trouble to write would be hostile, and nothing in `seed` has a logging path that
-could carry a warning to an operator instead.
+**This is the default. A collision builds, it does not fail.** Pointing a type at
+a CSV while its inline entries are still in the file is an ordinary migration
+step, not an authoring fault — a seed that booted yesterday must not refuse to
+boot today because someone added a `providers:` row.
 
-A collision that *is* deliberate — a CSV shadowing checked-in inline defaults for
-a dev run, say — is accepted by building with the override:
+The discard is not silent, though. `BuildRegistry` needs no logger to say so,
+because the document can be asked directly:
 
 ```go
-reg, err := doc.BuildRegistry(dir, seed.AllowProviderPrecedence())
+reg, err := doc.BuildRegistry(dir)
+if err != nil {
+    return err
+}
+if types := doc.ProviderCollisions(); len(types) > 0 {
+    slog.Warn("seed: inline objects discarded, providers: entry wins",
+        "object_types", types)
+}
 ```
 
-The discard still happens in full; the option only says the host meant it. It is
+`ProviderCollisions` returns exactly the object types whose inline entries the
+build discarded — sorted, deduplicated, and object **types** only, never object
+ids (an id can embed an account, and this value is destined for a log line). It
+reads the document alone — no file IO, no registry — so it answers the same
+before and after a build, and a host surfaces it however it already surfaces
+things. Nothing in `seed` picks a logger for you.
+
+A host that would rather read the overlap as an authoring mistake — a checked-in
+seed nobody is mid-migration on — opts into a refusal:
+
+```go
+reg, err := doc.BuildRegistry(dir, seed.StrictProviderCollision())
+```
+
+That returns `APERTURE_CONFIG_INVALID` naming every colliding object type
+(sorted, in both the message and the error context — never the object ids). It is
 Go wiring rather than a seed-file key on purpose: the file stays a plain
-declaration of what exists, and the choice to tolerate an ambiguous one sits in
+declaration of what exists, and the choice to make an ambiguous one fatal sits in
 code, where a reviewer sees it.
 
 **Validation is independent of precedence.** Every inline entry is checked —
