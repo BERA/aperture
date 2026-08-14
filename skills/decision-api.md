@@ -91,6 +91,14 @@ enumerates unboundedly:
 disposition, any evaluation notes, the verdict and reason), with the deciding
 grants marked.
 
+The report is **deterministic**: two traces of the same decision render
+byte-identically, so a trace can be diffed, snapshotted, or pasted into a bug
+report. `Storage` promises no order for `GrantsForSubjects` or
+`GroupsForPrincipal` — `storage/memory` answers both from a Go map — so `String`
+sorts the subjects, considered grants and notes itself, on copies. The `Trace`
+struct still carries its lists in storage order, which is what the Twirp and MCP
+surfaces serialize; only the rendered report is normalised.
+
 ### Evaluation notes
 
 A rule-backed scope can decide `false` for a reason the verdict does not show:
