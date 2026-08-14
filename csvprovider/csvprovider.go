@@ -90,6 +90,21 @@
 // departure: it yields an empty list ([]any{}), not an absent field, so "x" in
 // object.tags is a definite false rather than an evaluation against nil.
 //
+// # Querying
+//
+// Query implements provider.Filter's Fields contract by calling
+// provider.MatchFields, so it needs no rules of its own: a list column matches by
+// MEMBERSHIP and every other column by typed equality.
+//
+//	Filter{Fields: map[string]any{"tags": "premium"}}   // rows whose tags contain premium
+//	Filter{Fields: map[string]any{"seats": 5}}          // rows whose seats list contains 5
+//	Filter{Fields: map[string]any{"tier": "gold"}}      // scalar equality
+//
+// Typing carries through from the column: a :list<int> column holds int64
+// elements, so 5 matches and "5" does not — the same answer a rule's `in` gives
+// over the same data, which is what keeps Query usable for bounding an
+// enumeration.
+//
 // # Errors
 //
 // A missing "id" column, a duplicate id, a wrong column count, an unknown type
@@ -239,11 +254,13 @@ func (p *Provider) List(_ context.Context) ([]provider.Object, error) {
 	return out, nil
 }
 
-// Query returns the objects satisfying filter. Filter.Fields are matched by
-// string-equality against each object's metadata (a field absent from an object
-// never matches); Filter.Pattern and Filter.Limit are honoured directly. The
-// Registry re-enforces Pattern and Limit, so honouring them here is an
-// optimisation that also makes Query correct when called standalone.
+// Query returns the objects satisfying filter. Filter.Fields go through
+// provider.MatchFields — the shared implementation of the Fields contract, so a
+// list column matches by MEMBERSHIP ("premium" selects every row whose tags
+// array contains it) and everything else by typed equality; Filter.Pattern and
+// Filter.Limit are honoured directly. The Registry re-enforces Pattern and
+// Limit, so honouring them here is an optimisation that also makes Query correct
+// when called standalone.
 func (p *Provider) Query(_ context.Context, filter provider.Filter) ([]provider.Object, error) {
 	if err := p.ensure(); err != nil {
 		return nil, err
@@ -256,7 +273,7 @@ func (p *Provider) Query(_ context.Context, filter provider.Filter) ([]provider.
 			continue
 		}
 		md := p.byID[id.String()]
-		if !matchFields(md, filter.Fields) {
+		if !provider.MatchFields(md, filter.Fields) {
 			continue
 		}
 		out = append(out, provider.Object{ID: id, Metadata: md})
@@ -265,18 +282,6 @@ func (p *Provider) Query(_ context.Context, filter provider.Filter) ([]provider.
 		}
 	}
 	return out, nil
-}
-
-// matchFields reports whether md satisfies every predicate in fields by
-// string-equality. An empty/nil fields map matches everything.
-func matchFields(md provider.Metadata, fields map[string]any) bool {
-	for k, want := range fields {
-		got, ok := md[k]
-		if !ok || fmt.Sprint(got) != fmt.Sprint(want) {
-			return false
-		}
-	}
-	return true
 }
 
 // column describes one non-id header column and where to read it in each row.
