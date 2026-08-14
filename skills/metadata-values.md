@@ -76,6 +76,25 @@ sum of `len(key) + value` per entry. Container framing costs nothing.
 `provider.MetadataBytes` sums a whole object, but the enforced cap is per
 **field**.
 
+### What the size cap costs on the hot path
+
+The size cap is not only a memory bound — it bounds how long a **collection
+operator** can spend traversing a field. A rule whose collection operand is a
+variable evaluates through the guarded dispatcher, which walks the array, so
+`Check` latency is linear in the array's element count.
+
+Measured (Apple M1 Max, `bench/`, see [benchmarks](../docs/benchmarks.md)): about
+**12 ns and 16.9 bytes per element, per `Check`**. At the 64 KiB default and a
+9-byte element, the cap admits **7 281** elements — roughly 88 µs and 123 KB of
+per-`Check` cost, which takes sustained throughput to ~6 200 checks/sec against
+the 10 000 checks/sec NFR floor. The practical ceiling for that floor is nearer
+**3 000 elements (~27 KB)**.
+
+`ValueLimits.MaxBytes` is the lever: a deployment whose rules read large arrays
+should set it from the array length its `Check` budget allows, not leave it at the
+default and discover the cost as latency. `docs/benchmarks.md` → *Findings*
+carries the numbers and the open question of whether the default should move.
+
 ## The entry point
 
 Every loader — `csvprovider`, the seed document, a future database-backed

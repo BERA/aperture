@@ -6,7 +6,11 @@ import (
 	"testing"
 
 	"github.com/frankbardon/aperture/engine"
+	aerr "github.com/frankbardon/aperture/errors"
+	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/provider"
+	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/storage/memory"
 )
 
@@ -26,10 +30,193 @@ const (
 
 // model bundles a seeded store with a representative request the benchmarks and
 // the NFR test exercise.
+//
+// registry / ruleEngine / ruleReqs are the E5-S2 rule-backed extension: the SAME
+// seeded store additionally carries one rule-backed inclusive grant per rule
+// variant, so a collection-rule Check runs against the same non-trivial model
+// rather than a parallel toy harness. They are consumed only by newRuleService
+// (bench_test.go) — the literal-scope benchmarks are untouched by their presence,
+// because an engine only consults scope resolvers when built
+// WithScopeResolution.
 type benchModel struct {
-	store   *memory.Store
-	req     engine.Request
-	enumReq engine.EnumerateRequest
+	store    *memory.Store
+	req      engine.Request
+	enumReq  engine.EnumerateRequest
+	registry *provider.Registry
+	rules    *rules.Engine
+	ruleReqs map[string]engine.Request
+}
+
+// ---------------------------------------------------------------------------
+// E5-S2: collection / nested-object rule fixture
+// ---------------------------------------------------------------------------
+
+// Array sizing for the collection fixtures, DERIVED from the metadata value
+// model's per-field size cap rather than picked for roundness.
+//
+// provider.ValueBytes measures a []any of strings as the SUM OF THEIR LENGTHS
+// (container framing is free), and provider.DefaultMaxValueBytes is 64 KiB per
+// FIELD value. So at a fixed tag width the cap fixes an exact element count, and
+// that count — not a round number — is the largest array a host can legally load
+// under the defaults. That upper bound is the number the NFR has to survive; if
+// it does not, the finding is about the cap, not about the benchmark.
+const (
+	// benchTagWidth is the byte width of a fixture tag: "tag-" + 5 digits = 9.
+	benchTagWidth = 9
+	// tagsAtCapLen is the LARGEST tag array the default 64 KiB per-value cap
+	// admits at benchTagWidth: floor(65536/9) = 7281 tags occupying 65 529 of
+	// the 65 536 available bytes, where 7282 would breach it (asserted by
+	// TestCollectionFixtureSitsAtTheValueCap). This is the adversarial-but-legal
+	// worst case, and the case the "is 64 KiB too generous?" question is about.
+	tagsAtCapLen = provider.DefaultMaxValueBytes / benchTagWidth
+	// tagsTypicalLen is a REALISTIC document tag list — a dozen labels, ~108
+	// bytes, about 0.16% of the cap. It is the other end of the same axis: the
+	// pair of sizes is what makes the scaling behaviour visible, rather than a
+	// single point that could be read as either typical or worst case.
+	tagsTypicalLen = 12
+)
+
+// Rule-variant names. Each is simultaneously the rule reference, the document
+// action its permission declares, and the benchmark sub-name, so a number in
+// `make bench` output maps to exactly one rendered expression.
+const (
+	// ruleScalar is the CONTROL: a scalar comparison over metadata, native infix
+	// render, no collection anywhere. Every other variant's cost is read as a
+	// delta from this one.
+	ruleScalar = "rule-scalar"
+	// ruleLiteralIn is the E5-S1 unguarded common path: the collection operand is
+	// a LIST LITERAL, statically known to be an array, so the comparison keeps its
+	// native `in` render and never reaches the guarded dispatcher.
+	ruleLiteralIn = "rule-literal-in"
+	// ruleNested reads through a nested object via the E2-S2 optional-chaining
+	// render (object.owner.dept -> object?.owner?.dept).
+	ruleNested = "rule-nested"
+	// ruleTagsTypical is a collection operation over a VARIABLE operand, which
+	// E5-S1 renders to the guarded dispatcher $op(...), over a realistic array.
+	ruleTagsTypical = "rule-tags-typical"
+	// ruleTagsAtCap is the same guarded render over the cap-maximal array.
+	ruleTagsAtCap = "rule-tags-at-cap"
+)
+
+// benchObject is the object every rule variant is checked against. Using ONE
+// object for all variants is deliberate: the provider fetch and its cache hit are
+// then byte-identical across variants, so the measured delta is purely the rule's
+// evaluation cost and not a difference in metadata plumbing.
+const benchObject = "account:acct0/project:proj0/document:doc42"
+
+// The rule variants' subject. Deliberately NOT user0/role0: the literal-scope
+// benchmarks are the control this story compares against, and adding grants to
+// role0 would change their measured allocation profile.
+const (
+	ruleUser = "user-rules"
+	ruleRole = "role-rules"
+)
+
+// ruleVariant is one benchmark case: a rule AST, the action whose permission
+// carries the inclusive;rule= scope strategy that reaches it, and the render
+// strategy it is here to measure (recorded so the two E5-S1 strategies are
+// visibly both covered).
+type ruleVariant struct {
+	name   string
+	ast    *rules.Node
+	render string
+}
+
+// ruleVariants is the closed set of rule-backed benchmark cases.
+//
+// The two hasAny cases match on the LAST element of the array on purpose: the
+// operator short-circuits on the first hit, so matching early would measure a
+// best case that a real tag list does not guarantee.
+func ruleVariants() []ruleVariant {
+	return []ruleVariant{
+		{
+			name:   ruleScalar,
+			ast:    rules.Compare(rules.OpEq, rules.Var("object.classification"), rules.Lit("public")),
+			render: `native infix: (object.classification == "public")`,
+		},
+		{
+			name: ruleLiteralIn,
+			ast: rules.Compare(rules.OpIn, rules.Var("object.region"),
+				rules.List(rules.Lit("us-east"), rules.Lit("us-west"), rules.Lit("eu-west"))),
+			render: `native infix, list literal: (object.region in ["us-east", ...])`,
+		},
+		{
+			name:   ruleNested,
+			ast:    rules.Compare(rules.OpEq, rules.Var("object.owner.dept"), rules.Lit("platform")),
+			render: `optional chaining: (object?.owner?.dept == "platform")`,
+		},
+		{
+			name: ruleTagsTypical,
+			ast: rules.Compare(rules.OpHasAny, rules.Var("object.tags"),
+				rules.List(rules.Lit(benchTag(tagsTypicalLen-1)))),
+			render: `guarded dispatcher: $op("hasAny", __notes, "object.tags", object?.tags, ...)`,
+		},
+		{
+			name: ruleTagsAtCap,
+			ast: rules.Compare(rules.OpHasAny, rules.Var("object.tagsAtCap"),
+				rules.List(rules.Lit(benchTag(tagsAtCapLen-1)))),
+			render: `guarded dispatcher: $op("hasAny", __notes, "object.tagsAtCap", object?.tagsAtCap, ...)`,
+		},
+	}
+}
+
+// benchTag renders the fixed-width tag the size derivation assumes.
+func benchTag(i int) string { return fmt.Sprintf("tag-%05d", i) }
+
+// benchTags builds an n-element []any of fixed-width tags.
+func benchTags(n int) []any {
+	out := make([]any, n)
+	for i := range out {
+		out[i] = benchTag(i)
+	}
+	return out
+}
+
+// benchMetadata is the single object's metadata bag. It carries every field the
+// rule variants read, including BOTH tag arrays — legal because the 64 KiB cap is
+// per FIELD, not per object — so one cached entry serves every variant.
+func benchMetadata() provider.Metadata {
+	return provider.Metadata{
+		"classification": "public",
+		"region":         "us-east",
+		"owner": map[string]any{
+			"dept": "platform",
+			"team": "access",
+		},
+		"tags":      benchTags(tagsTypicalLen),
+		"tagsAtCap": benchTags(tagsAtCapLen),
+	}
+}
+
+// benchProvider is the fixture's ObjectProvider: a single object, returned BY
+// REFERENCE, so the registry cache stores and hands back the very map built here.
+// That is the contract E5-S2 measures — a defensive copy anywhere between here
+// and the rule evaluator shows up as allocated bytes per Check.
+type benchProvider struct {
+	id identity.Identity
+	md provider.Metadata
+}
+
+func (p benchProvider) Fetch(_ context.Context, id identity.Identity) (provider.Metadata, error) {
+	if id.String() == p.id.String() {
+		return p.md, nil
+	}
+	return nil, aerr.New(aerr.APERTURE_NOT_FOUND, "bench provider: absent object")
+}
+
+func (p benchProvider) List(_ context.Context) ([]provider.Object, error) {
+	return []provider.Object{{ID: p.id, Metadata: p.md}}, nil
+}
+
+func (p benchProvider) Query(ctx context.Context, f provider.Filter) ([]provider.Object, error) {
+	all, err := p.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if f.Pattern != nil && !f.Pattern.Matches(p.id) {
+		return nil, nil
+	}
+	return all, nil
 }
 
 // buildModel seeds a sizable org -> project -> document authorization model into
@@ -48,9 +235,15 @@ func buildModel(tb testing.TB) benchModel {
 		}
 	}
 
-	// Object types + permissions (read/write/delete on documents).
+	// Object types + permissions (read/write/delete on documents). Each E5-S2
+	// rule variant additionally declares its own action verb, so one permission —
+	// and therefore one scope strategy — reaches exactly one rule.
+	docActions := []string{"read", "write", "delete", "share"}
+	for _, v := range ruleVariants() {
+		docActions = append(docActions, v.name)
+	}
 	must(store.PutObjectType(ctx, model.ObjectType{
-		Name: "document", Actions: []string{"read", "write", "delete", "share"},
+		Name: "document", Actions: docActions,
 	}))
 	must(store.PutObjectType(ctx, model.ObjectType{
 		Name: "project", Actions: []string{"read", "write", "delete"},
@@ -174,7 +367,78 @@ func buildModel(tb testing.TB) benchModel {
 		Action:    "read",
 		Pattern:   "account:" + acct(0) + "/project:proj0/document:*",
 	}
-	return benchModel{store: store, req: req, enumReq: enumReq}
+
+	// E5-S2: rule-backed inclusive grants over the same model. One permission +
+	// one grant per variant, all on role0 (which user0 holds) in acct0, all
+	// bounded to the same object — so the ONLY thing that differs between the
+	// variants' measurements is the rule expression that decides membership.
+	reg, ruleEng, ruleReqs := buildRuleLayer(tb, ctx, store, must)
+
+	return benchModel{
+		store: store, req: req, enumReq: enumReq,
+		registry: reg, rules: ruleEng, ruleReqs: ruleReqs,
+	}
+}
+
+// buildRuleLayer seeds the rule-backed half of the fixture and returns the
+// provider registry, the rules engine, and one Check request per variant.
+//
+// The registry is built WITH EXPIRY DISABLED (provider.WithTTL(0)). The NFR is
+// about the CACHED Check, and DefaultTTL is 30s — long benchmark runs would
+// otherwise silently start re-fetching partway through and measure a mix of the
+// cached and uncached paths.
+func buildRuleLayer(tb testing.TB, ctx context.Context, store *memory.Store, must func(error)) (*provider.Registry, *rules.Engine, map[string]engine.Request) {
+	tb.Helper()
+
+	md := benchMetadata()
+	// The fixture's own size claims are ASSERTED, not asserted-in-a-comment: if a
+	// future change to the value model moves the caps, this fails here rather
+	// than quietly benchmarking a different array.
+	if err := provider.ValidateMetadata(md); err != nil {
+		tb.Fatalf("bench metadata violates the value model: %v", err)
+	}
+
+	objID, err := identity.Parse(benchObject)
+	if err != nil {
+		tb.Fatalf("parse bench object: %v", err)
+	}
+	reg := provider.NewRegistry()
+	reg.MustRegister("document", benchProvider{id: objID, md: md}, provider.WithTTL(0))
+
+	// The rule grants hang off a DEDICATED principal and role that user0 does not
+	// hold, so the pre-existing literal-scope baseline is measured on exactly the
+	// subject set and candidate grants it was measured on before E5-S2. Attaching
+	// them to role0 instead moved the committed baseline by +5 allocs/op and
+	// +2 KB/op — a fixture that changes the number it is the control for.
+	//
+	// ruleUser keeps a comparable subject set (self + three roles) so the rule
+	// variants are still resolved against the sizable model rather than a toy.
+	must(store.PutRole(ctx, model.Role{ID: ruleRole, Name: ruleRole}))
+	must(store.PutPrincipal(ctx, model.Principal{
+		ID: ruleUser, Kind: model.PrincipalUser, Identity: "user:" + ruleUser,
+		RoleIDs: []string{ruleRole, role(1), role(14)},
+	}))
+
+	source := rules.MapSource{}
+	reqs := make(map[string]engine.Request, len(ruleVariants()))
+	for _, v := range ruleVariants() {
+		source[v.name] = &rules.Rule{Name: v.name, AST: v.ast}
+		must(store.PutPermission(ctx, model.Permission{
+			ID: "perm-" + v.name, ObjectType: "document", Action: v.name,
+			ScopeStrategy: "inclusive;rule=" + v.name,
+		}))
+		must(store.PutGrant(ctx, model.Grant{
+			ID: "g-" + v.name, AccountID: acct(0),
+			Subject:      model.Subject{Kind: model.SubjectRole, ID: ruleRole},
+			PermissionID: "perm-" + v.name,
+			Object:       "account:" + acct(0) + "/**",
+			Effect:       model.EffectAllow,
+		}))
+		reqs[v.name] = engine.Request{
+			Account: acct(0), Principal: ruleUser, Action: v.name, Object: benchObject,
+		}
+	}
+	return reg, rules.NewEngine(source, reg), reqs
 }
 
 func acct(i int) string  { return fmt.Sprintf("acct%d", i) }
