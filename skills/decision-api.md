@@ -151,5 +151,15 @@ svc := service.New(eng)
 `*provider.Registry` satisfies the `ObjectLister` seam and `*rules.Engine`
 satisfies the `RuleEvaluator` seam. The assembly is optional — with no
 providers the literal default still works, and Check never needs the lister
-(membership is computable without enumeration). E4-S1 builds this graph in the
-`serve` DI wiring.
+(membership is computable without enumeration).
+
+**Every Aperture surface assembles the same graph.** `internal/cli` builds it
+once (`buildDecisionStack`) and both `serve` and the one-shot commands —
+`check`, `enumerate`, `identifiers`, `explain` — use that one builder. This is
+load-bearing, not tidiness: the one-shot commands used to construct
+`service.New(engine.New(store))` with no rules engine and no scope resolution, so
+a permission with a rule-backed strategy had no `RuleEvaluator`, the resolver
+reported `APERTURE_SCOPE_RULE_UNCONFIGURED`, and the facade folded that into a
+fail-closed deny. The CLI returned a **different verdict** from the server for
+the same model. A surface that skips the assembly does not merely lose
+diagnostics — it decides differently.

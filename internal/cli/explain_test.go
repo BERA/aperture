@@ -36,12 +36,22 @@ func TestExplainCommandPrintsTheWholeTrace(t *testing.T) {
 	}
 
 	// The same question, asked through the library the command wraps.
+	//
+	// This side used to build service.New(engine.New(store)) — the bare engine —
+	// which was only equivalent to the command because the command was ALSO
+	// unwired (issue #8). Now that every surface shares one decision stack, the
+	// comparison has to be built the same way, or this test would quietly become a
+	// wired-vs-unwired comparison that happens to agree on a rule-free fixture.
 	store, err := buildStore(ctx, "", "")
 	if err != nil {
 		t.Fatalf("buildStore: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	tr, err := service.New(engine.New(store)).Explain(ctx, service.Query{
+	stack, err := buildDecisionStack(store, "")
+	if err != nil {
+		t.Fatalf("buildDecisionStack: %v", err)
+	}
+	tr, err := stack.newService().Explain(ctx, service.Query{
 		Account: seed.ExampleAccount, Principal: principal, Action: action, Object: object,
 	})
 	if err != nil {
