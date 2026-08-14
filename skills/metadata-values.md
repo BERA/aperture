@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, and the load-time validation entry point every loader calls.
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -137,6 +137,41 @@ value-model check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
 A `:json` rejection carries the column, the line, and the JSON kind or the
 decoder's message — never the cell.
 
+## Querying the model: `Filter.Fields`
+
+The shape a field holds decides how a `provider.Filter.Fields` predicate compares
+against it. A provider *evaluates* `Fields`, but it does not *define* it — `Query`
+is how scope enumeration bounds itself, so the rule is stated once on
+`provider.Filter` and implemented once in `provider.MatchFields`. A provider
+either calls that helper or reproduces it exactly (pushing the predicate into SQL,
+say).
+
+| Field shape | Rule | Example |
+|---|---|---|
+| **array** | **membership** | `Fields{"tags": "premium"}` selects every object whose `tags` **contains** `"premium"` |
+| **scalar** | equality | `Fields{"tier": "gold"}` |
+| **object** | equality, deep — **not** key membership | `Fields{"owner": map[string]any{"dept": "eng"}}` matches; `Fields{"owner": "dept"}` is a plain `false` |
+| *absent* | never matches, `nil` want included | |
+
+Two properties are load-bearing:
+
+- **Comparison is typed, never a string rendering.** Numbers compare across Go
+  numeric types by value (`int(5)` == `int64(5)` == `float64(5)`), but `"5"` is
+  never `5` and a string equals only a string. That is the same rule the
+  expression evaluator applies, so `Enumerate` cannot select an object a `Check`
+  over the same value then denies. This is why element typing at load
+  (`:list<int>`) is mandatory rather than decorative — it is what a `Fields`
+  predicate compares against.
+- **A want that is itself a container compares by equality at both ends**, since
+  no element of a legal array (scalars only) could ever equal an array or object.
+
+`provider.ValuesEqual` is the exported leaf comparison. It **reimplements**
+expr-lang's equality rather than importing it, because `provider/` is a strict
+leaf; `csvprovider/membership_equivalence_test.go` runs both over the same
+metadata so the two cannot drift. The only documented divergences —
+`time.Time`/`time.Duration`, and a `uint64` above `math.MaxInt64` — are outside
+the value model.
+
 ## Errors
 
 A violation is **`APERTURE_METADATA_INVALID`**. Its context carries:
@@ -177,6 +212,7 @@ Changing the value model means changing all of these in the same PR:
 | Change | Also update |
 |---|---|
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
+| The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md` |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |

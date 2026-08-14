@@ -78,16 +78,45 @@ type Object struct {
 
 // Filter is the criteria an ObjectProvider.Query selects on. Every field is
 // optional; the zero Filter selects every object of the type (equivalent to
-// List). The host provider interprets Fields; Aperture additionally enforces
+// List). The host provider evaluates Fields; Aperture additionally enforces
 // Pattern and Limit on the results it returns, so a provider that ignores them
 // is still correct, only less efficient.
+//
+// # The Fields contract
+//
+// Fields is evaluated by the provider, but its MEANING is fixed here, and every
+// implementation owes callers the same answer — Query is how scope enumeration
+// bounds itself, so a provider that filters differently is a provider that
+// authorizes differently. An implementation either calls MatchFields or
+// reproduces it exactly (e.g. by pushing the predicate into SQL):
+//
+//   - EVERY predicate must hold (the map is an AND), and an empty or nil Fields
+//     selects every object.
+//   - A field ABSENT from an object never matches — not even against a nil want.
+//   - A COLLECTION field ([]any) matches by MEMBERSHIP: Fields{"tags":
+//     "premium"} selects every object whose tags array CONTAINS "premium".
+//     Equality against a whole array is never what a caller filtering on a tag
+//     list means.
+//   - Every other field — scalar or object (map[string]any) — matches by
+//     EQUALITY. An object field is deliberately NOT key membership, so a scalar
+//     want against one is simply false rather than a panic or an accidental
+//     string-rendering match.
+//   - A want that is itself a container compares by equality at both ends, since
+//     no element of a legal array could ever equal one.
+//   - Comparison is TYPED, never a string rendering: numbers compare across Go
+//     numeric types by value (int(5) == int64(5) == float64(5)), but a number
+//     never equals its string spelling ("5" != 5), and a string equals only a
+//     string. These are the rules engine's own comparison semantics
+//     (expr-lang's), so Enumerate cannot select an object that Check then denies
+//     over the same value. See ValuesEqual.
 type Filter struct {
 	// Pattern, when non-nil, restricts results to identities it matches. The
 	// Registry's scope-lister adapter sets this to bound enumeration to a grant's
 	// scope.
 	Pattern *identity.Pattern
-	// Fields are host-interpreted metadata predicates (equality by default). The
-	// provider decides their semantics; Aperture passes them through untouched.
+	// Fields are metadata predicates: membership for a collection field,
+	// equality for everything else, per the contract on Filter. Aperture passes
+	// them to the provider untouched; MatchFields is the shared implementation.
 	Fields map[string]any
 	// Limit bounds the number of results; <= 0 means the provider's own default.
 	Limit int

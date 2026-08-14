@@ -35,13 +35,58 @@ type ObjectProvider interface {
   operational failure.
 - **`List`** is the unfiltered enumeration of the type.
 - **`Query`** returns the objects matching a `Filter` — an optional `Pattern`
-  (bounds results to matching identities), host-interpreted `Fields` predicates,
-  and a `Limit`. The zero `Filter` selects everything (equivalent to `List`).
+  (bounds results to matching identities), a set of `Fields` predicates, and a
+  `Limit`. The zero `Filter` selects everything (equivalent to `List`).
 
 `Metadata` is `map[string]any` — an **alias**, not a named type — so the rules
 engine reads each field straight into its expression environment with no
 conversion layer. An `Object` pairs an identity with its metadata; the identity's
 terminal segment type is the object-type the provider is registered under.
+
+### The `Filter.Fields` contract
+
+A provider *evaluates* `Fields`, but it does not get to *define* it. `Query` is
+how [scope](scopes.md) enumeration bounds itself, so two providers disagreeing
+about what `Fields{"tags": "premium"}` selects is two different answers to the
+same authorization question. The rule is stated once on `provider.Filter` and
+implemented once in `provider.MatchFields`; an implementation either calls that
+helper or reproduces it exactly (by pushing the predicate into SQL, say).
+
+| Field value | Want | Rule |
+|---|---|---|
+| `["premium","launch"]` | `"premium"` | **membership** — true |
+| `["premium-trial"]` | `"premium"` | membership — **false**, never substring |
+| `[3, 5]` (`int64`) | `5` | membership — true |
+| `[3, 5]` (`int64`) | `"5"` | **false** — a number is not its string spelling |
+| `"gold"` | `"gold"` | equality — true |
+| `{"dept":"eng"}` | `"dept"` | equality — **false**, *not* key membership |
+| `{"dept":"eng"}` | `{"dept":"eng"}` | equality — true |
+| *(field absent)* | anything, `nil` included | **false** |
+
+Three properties are worth stating outright, because each one closes a failure
+mode:
+
+- **A collection field matches by membership.** Equality against a whole array
+  is never what a caller filtering on a tag list means, and the predicate this
+  replaced compared against the array's *literal rendering* (`[premium launch]`),
+  so a tag filter could not match anything useful.
+- **Comparison is typed, not stringly.** Numbers compare across Go numeric types
+  by value (`int(5)`, `int64(5)`, `float64(5)` are one value), but a number never
+  equals `"5"` and a string equals only a string. These are the [rules
+  engine](rules.md)'s own comparison semantics, so `Enumerate` cannot select an
+  object that a `Check` over the same value then denies. `provider.ValuesEqual`
+  is the exported leaf comparison, and `csvprovider`'s
+  `membership_equivalence_test.go` runs it against a real compiled rule to keep
+  the two from drifting.
+- **Every predicate must hold** (the map is an AND), and an object field is
+  compared *by equality*, never by key membership — so a scalar want against one
+  is a plain `false`, not a panic and not an accidental rendering match.
+
+Because `provider` is a strict leaf (`identity` + `errors` + stdlib), `ValuesEqual`
+**reimplements** the evaluator's equality rather than importing `expr-lang`. It
+agrees with it on every value the metadata value model admits; the two documented
+divergences — `time.Time`/`time.Duration`, and a `uint64` above `math.MaxInt64` —
+are both outside that model.
 
 ## The metadata value model
 
@@ -344,10 +389,22 @@ into a slice, and every json cell decoded into a map, allocated for that row
 alone, so no two rows — and no two loads — ever share one. After a `Reload`, call `Registry.InvalidateType` to drop the
 now-stale cache entries.
 
-`Query` honours `Filter.Pattern` and `Filter.Limit` directly and matches
-`Filter.Fields` by string-equality (a field absent from an object never matches).
-The Registry re-enforces the pattern and limit, so honouring them in the provider
-is an optimisation that also keeps `Query` correct when called standalone.
+`Query` honours `Filter.Pattern` and `Filter.Limit` directly and hands
+`Filter.Fields` to `provider.MatchFields`, so it inherits [the contract](#the-filterfields-contract)
+instead of restating it — a `:list` column matches by **membership**, everything
+else by typed equality, and a field absent from a row never matches:
+
+```go
+p.Query(ctx, provider.Filter{Fields: map[string]any{"tags": "premium"}})  // rows whose tags contain premium
+p.Query(ctx, provider.Filter{Fields: map[string]any{"ranks": 5}})         // a :list<int> column, matched by value
+p.Query(ctx, provider.Filter{Fields: map[string]any{"tier": "gold"}})     // scalar equality
+```
+
+The column's declared type is what makes the second one work: `:list<int>` holds
+`int64` elements, so `5` matches and `"5"` does not — the same answer a rule's
+`in` gives over the same data. The Registry re-enforces the pattern and limit, so
+honouring them in the provider is an optimisation that also keeps `Query` correct
+when called standalone.
 
 Like the core packages, `csvprovider` imports only `errors`, `identity`, and
 `provider` plus the standard library — pure-Go and CGO-free.
