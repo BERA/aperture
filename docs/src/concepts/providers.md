@@ -409,6 +409,47 @@ when called standalone.
 Like the core packages, `csvprovider` imports only `errors`, `identity`, and
 `provider` plus the standard library — pure-Go and CGO-free.
 
+## In-memory objects: `provider.Static`
+
+Not every object set comes from a file. A [seed document](seed.md#inline-object-metadata)
+declares metadata inline, a test needs three objects and no fixture on disk, and
+an embedded demo has its data compiled in. `provider.Static` is the
+`ObjectProvider` for all three — the same semantics as `csvprovider` over a slice
+already in memory, so nothing has to be re-derived per caller:
+
+```go
+p, err := provider.NewStatic([]provider.Object{
+    {ID: identity.MustParse("account:acme/brand:1"),
+        Metadata: provider.Metadata{"tier": "gold", "tags": []any{"premium"}}},
+    {ID: identity.MustParse("account:acme/brand:2"),
+        Metadata: provider.Metadata{"tier": "silver"}},
+})
+reg.MustRegister("brand", p, provider.WithTTL(0))
+```
+
+It is **immutable after construction**, which is what makes it safe for concurrent
+use with no lock and makes the read-only contract trivially true: there is no
+reload that could edit a map the Registry already cached.
+
+Everything is checked at construction, so a `Fetch`/`List`/`Query` can never fail
+for a reason the caller could have been told about at wiring time. An empty or
+duplicate identity is `APERTURE_PROVIDER_INVALID` (a last-writer-wins duplicate is
+how one object's metadata becomes another's); metadata violating the
+[value model](#the-metadata-value-model) is `APERTURE_METADATA_INVALID` naming the
+id, the field, and the offending path. `Static` does not re-implement the model —
+and it does not trust a caller that says it already validated.
+
+`Fetch` returns `APERTURE_NOT_FOUND` for an undeclared id, `List` returns
+declaration order, and `Query` hands `Filter.Fields` to `provider.MatchFields`
+while honouring `Pattern` and `Limit` directly — the [same contract](#the-filterfields-contract)
+every other provider implements.
+
+Values are **deep-copied in** at construction and handed out **by reference** on
+every read. The copy is what makes the read-only contract hold against a caller
+that keeps its input: mutating those maps afterwards, at any depth, cannot reach
+metadata the Registry has already cached. Nothing is copied on the read path,
+which is the allocation-aware half of the same contract.
+
 ## Where this leads
 
 Providers feed two consumers documented elsewhere: the object metadata a
