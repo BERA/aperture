@@ -89,9 +89,62 @@ func TestExprRender(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expr: %v", err)
 	}
-	want := `((object.classification == "public") && ((principal.clearance >= 3) || !((action == "delete"))) && (object.region in ["us", "eu"]) && (lower(object.owner) == "alice"))`
+	// Every path segment after the root carries optional chaining; the root
+	// itself (object / principal / action) is a typed env field and needs none.
+	want := `((object?.classification == "public") && ((principal?.clearance >= 3) || !((action == "delete"))) && (object?.region in ["us", "eu"]) && (lower(object?.owner) == "alice"))`
 	if src != want {
 		t.Fatalf("render mismatch:\n got  %s\n want %s", src, want)
+	}
+}
+
+// TestVarRenderOptionalChaining pins the render-time nil guard: every segment
+// after the root gets `?.`, the root itself gets none. Reading through a missing
+// intermediate must yield nil rather than the expr-lang runtime error
+// "cannot fetch <field> from <nil>" (see the E2 research probe).
+func TestVarRenderOptionalChaining(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"action", "action"},
+		{"object", "object"},
+		{"object.tier", "object?.tier"},
+		{"object.owner.dept", "object?.owner?.dept"},
+		{"principal.attrs.team.name", "principal?.attrs?.team?.name"},
+		{"account.a.b.c.d", "account?.a?.b?.c?.d"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			n := Var(tc.path)
+			if err := n.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			src, err := n.Expr()
+			if err != nil {
+				t.Fatalf("Expr: %v", err)
+			}
+			if src != tc.want {
+				t.Fatalf("render = %q, want %q", src, tc.want)
+			}
+		})
+	}
+}
+
+// TestVarASTStoresPlainPath proves the chaining is render-only: the AST (and so
+// the JSON the node editor and the state file exchange) still carries a plain
+// dotted path, with no `?` anywhere.
+func TestVarASTStoresPlainPath(t *testing.T) {
+	n := Var("object.owner.dept")
+	if n.Name != "object.owner.dept" {
+		t.Fatalf("Name = %q, want plain dotted path", n.Name)
+	}
+	out, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const want = `{"type":"var","name":"object.owner.dept"}`
+	if string(out) != want {
+		t.Fatalf("JSON = %s, want %s", out, want)
 	}
 }
 
@@ -109,7 +162,7 @@ func TestParseFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expr: %v", err)
 	}
-	if want := `(object.tier == "gold")`; src != want {
+	if want := `(object?.tier == "gold")`; src != want {
 		t.Fatalf("render = %q, want %q", src, want)
 	}
 }

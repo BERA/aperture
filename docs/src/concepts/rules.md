@@ -86,6 +86,70 @@ fields dynamically; `action` is a typed string so misusing it (`action.foo`) is
 a type error. This closed environment is enforced twice — structurally by
 `Validate` (below) and again by the expr-lang type-checker at compile time.
 
+## Missing fields and nested access
+
+Metadata is host-defined and ragged: one object carries an `owner`, the next does
+not. Two behaviors follow from that, and both matter for whether a rule *grants*.
+
+### Nested access is nil-safe
+
+A `var` may read a nested path — `object.owner.dept`. Aperture renders every
+segment after the root with optional chaining, so that path compiles to
+`object?.owner?.dept`. If `owner` is absent the read yields **nil**, the
+enclosing comparison goes **false**, and the rule simply does not select.
+
+This matters because the un-chained form is *not* nil-safe: in expr-lang,
+`object.owner.dept` against an object with no `owner` is a **runtime error**
+(`cannot fetch dept from <nil>`), which would surface as `APERTURE_RULE_EVAL` at
+`Check` time. A rule that works against every object carrying an `owner` would
+otherwise blow up on the one object that lacks it — in production, not in dev.
+Optional chaining makes that uniform and deny-safe, so no rule author has to
+write a guard. A path through a **present** intermediate behaves exactly as
+before; `?.` differs from `.` only when the receiver is nil.
+
+```go
+// Selects only for objects that actually carry owner.dept == "eng".
+// An object with no owner at all evaluates to false, never an error.
+rules.Compare(rules.OpEq, rules.Var("object.owner.dept"), rules.Lit("eng"))
+```
+
+### ⚠️ `nin` over a field the object lacks **grants**
+
+`in` and `nin` over a missing field do not error — but they are not symmetric in
+their consequences:
+
+| Expression | Object has the field | Object lacks the field |
+|---|---|---|
+| `x in object.blocklist` | membership | **`false`** — does not select |
+| `x not in object.blocklist` | non-membership | **`true`** — **selects** |
+
+`x not in <nil>` evaluating to `true` is the correct logical dual, and it is
+expr-lang's pre-existing behavior, not something Aperture introduces. But the
+practical effect is a trap: **a deny-list rule written with `nin` passes every
+object that is simply missing the column.** A typo'd field name, a CSV without
+that header, or a nested path through an absent intermediate all read as nil —
+and the rule grants.
+
+List-valued and nested metadata make this far easier to hit than it used to be.
+If a rule must not select for objects lacking the field, require the field
+explicitly:
+
+```go
+rules.And(
+    rules.Compare(rules.OpNe, rules.Var("object.blocklist"), rules.Lit(nil)),
+    rules.Compare(rules.OpNin, rules.Var("principal.id"), rules.Var("object.blocklist")),
+)
+```
+
+### Other missing-field behavior
+
+- **Equality** against a missing field is `false` (nil never equals a scalar).
+- **Ordered comparison** (`lt le gt ge`) against a missing field is a **runtime
+  error** — `APERTURE_RULE_EVAL`. The rule assumes a field the object does not
+  carry; the scope resolver treats that as a non-decision, not a silent select.
+- **Type mismatch** is likewise a runtime error: `in` over a string or a number
+  (rather than a list or a map) is not defined in expr-lang.
+
 ## Validation
 
 `Node.Validate()` checks that a node and its subtree are **structurally
@@ -114,8 +178,15 @@ rendering is direct and injection-free (variable paths are Go-style identifiers,
 string literals are quoted, integers keep their exact form via `json.Number`):
 
 ```text
-((object.classification == "public") || (principal.tier in ["gold", "platinum"]))
+((object?.classification == "public") || (principal?.tier in ["gold", "platinum"]))
 ```
+
+Every path segment **after the root** renders with expr-lang's optional chaining
+(`?.`); the root itself is a typed environment field and needs none. That is what
+makes nested reads nil-safe — see [Missing fields and nested
+access](#missing-fields-and-nested-access) below. The AST is unchanged: a `var`
+node still stores the plain dotted path (`object.owner.dept`), so the JSON form
+the editor and the state file share carries no `?`.
 
 `Compiler.Compile(node)` validates, renders, and compiles that expression to a
 reusable `*vm.Program` via `expr.Compile`. Every compiler fixes the same options:

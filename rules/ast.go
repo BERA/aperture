@@ -277,6 +277,10 @@ func indexByte(s string, b byte) int {
 // Expr renders the validated AST to an expr-lang expression string — the
 // predicate the compiler feeds to the evaluator. Expr assumes the node is valid;
 // callers reach it through the compiler, which validates first.
+//
+// Variable references render with optional chaining after the root
+// (object.owner.dept -> object?.owner?.dept) so a missing intermediate yields
+// nil instead of a runtime error; see renderVar.
 func (n *Node) Expr() (string, error) {
 	var b bytes.Buffer
 	if err := n.render(&b); err != nil {
@@ -312,7 +316,7 @@ func (n *Node) render(b *bytes.Buffer) error {
 		b.WriteByte(')')
 		return nil
 	case NodeVar:
-		b.WriteString(n.Name)
+		renderVar(b, n.Name)
 		return nil
 	case NodeLiteral:
 		return renderLiteral(b, n.Value)
@@ -344,6 +348,39 @@ func (n *Node) render(b *bytes.Buffer) error {
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: cannot render unknown node type", map[string]any{"type": string(n.Type)})
+	}
+}
+
+// renderVar writes a variable reference with optional chaining on every segment
+// after the root: object.owner.dept renders as object?.owner?.dept.
+//
+// Why: reading through a MISSING intermediate is a runtime error in expr-lang
+// ("cannot fetch dept from <nil>"), not nil — so a rule that works against every
+// object carrying an owner blows up as APERTURE_RULE_EVAL on the one object that
+// lacks it. Optional chaining makes a missing intermediate yield nil, which turns
+// the enclosing comparison false, so nested reads are uniformly deny-safe and no
+// author has to write a guard. A present path is unaffected: `?.` differs from
+// `.` only when the receiver is nil.
+//
+// The root needs no chaining — it is a typed field of evalEnv and is always
+// present (a nil metadata map still reads as an empty map, not a missing name).
+//
+// This is deliberately a RENDER-time concern only: the AST keeps storing plain
+// dotted paths, so the JSON form the node editor and the state file share is
+// untouched. Validate (varPath) has already proven every segment is a Go-style
+// identifier, so splitting on '.' cannot produce an empty or injectable segment.
+func renderVar(b *bytes.Buffer, path string) {
+	for first := true; ; first = false {
+		i := indexByte(path, '.')
+		if !first {
+			b.WriteString("?.")
+		}
+		if i < 0 {
+			b.WriteString(path)
+			return
+		}
+		b.WriteString(path[:i])
+		path = path[i+1:]
 	}
 }
 

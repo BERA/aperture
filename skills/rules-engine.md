@@ -54,6 +54,37 @@ an unknown variable, rejected at validation:
 - `account` — account attributes (reserved; empty until wired).
 - `action` — the action verb (a string).
 
+## Missing fields: nested access is nil-safe, but `nin` grants
+
+Metadata is ragged — one object carries `owner`, the next does not. Two rules of
+thumb, and the second is a trap.
+
+**Nested access is nil-safe.** A `var` may read a nested path
+(`object.owner.dept`). Every segment after the root renders with optional
+chaining — `object?.owner?.dept` — so a **missing intermediate yields nil and the
+enclosing comparison goes false**, never a runtime error. Without it, expr-lang
+raises `cannot fetch dept from <nil>` and the rule fails with
+`APERTURE_RULE_EVAL` at `Check` time on exactly the objects that lack the field.
+A present path is unaffected. This is **render-time only**: the AST and its JSON
+still store the plain dotted path, so the editor/state-file contract is unchanged.
+
+**⚠️ `x not in <absent field>` is `true` — a `nin` rule GRANTS on objects missing
+the field.** This is pre-existing expr-lang behavior (the correct dual of
+`x in <nil>` being `false`), not something Aperture added, but list-valued and
+nested metadata make it easy to hit: a deny-list over a column an object does not
+have passes everything. Require the field explicitly when that matters:
+
+```go
+rules.And(
+    rules.Compare(rules.OpNe, rules.Var("object.blocklist"), rules.Lit(nil)),
+    rules.Compare(rules.OpNin, rules.Var("principal.id"), rules.Var("object.blocklist")),
+)
+```
+
+Other missing-field behavior: equality against a missing field is `false`; an
+ordered comparison (`lt le gt ge`) against one is an `APERTURE_RULE_EVAL` runtime
+error, as is `in` over a non-collection (a string or a number).
+
 ## Validation before evaluation
 
 `Compiler.Compile` (and `Engine.Compile`) validate and type-check before any
