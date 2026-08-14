@@ -98,13 +98,18 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 	// matching for grants with no strategy, so E1 behaviour is preserved. The
 	// storage source is also handed to the facade (WithRuleSource) so the editor's
 	// live what-if can preview an UNSAVED rule read-only.
-	// Build the object-metadata providers declared in the seed's `providers:`
-	// section (E-provider): each entry links an object-type to a real data source
-	// (a CSV file today, a database later) with no Go wiring. The same *Registry
-	// feeds BOTH the rules engine's metadata fetcher (so a rule can read
-	// object.category_id) AND the scope resolver's object lister (so implicit /
-	// exclusive scopes can enumerate a type's objects). When no providers are
-	// declared, both stay nil and the server behaves exactly as before.
+	// Build the object-metadata providers declared in the seed's TWO wiring
+	// sections: `providers:`, where each entry links an object-type to a real data
+	// source (a CSV file today, a database later), and `objects:`, where metadata
+	// is declared inline and served from memory. Both produce entries in the same
+	// *Registry, which feeds BOTH the rules engine's metadata fetcher (so a rule
+	// can read object.category_id) AND the scope resolver's object lister (so
+	// implicit / exclusive scopes can enumerate a type's objects). When neither
+	// section is declared, both stay nil and the server behaves exactly as before.
+	//
+	// The guard below MUST test both sections. Gating on `providers:` alone made a
+	// seed that declared only `objects:` build a populated registry that nothing
+	// ever read — inline metadata was invisible to rules and to enumeration.
 	providerDoc, err := seedDocument(cmd.String("seed"))
 	if err != nil {
 		return err
@@ -115,7 +120,7 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 	}
 	var fetcher rules.MetadataFetcher // nil => empty object metadata (unchanged default)
 	scopeDeps := engine.ScopeDeps{}
-	if len(providerDoc.Providers) > 0 {
+	if hasObjectSources(providerDoc) {
 		fetcher = lenientFetcher{reg: reg}
 		scopeDeps.Lister = reg
 	}
