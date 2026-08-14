@@ -3,6 +3,7 @@ package rules
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -69,22 +70,52 @@ func TestEditorASTContract(t *testing.T) {
 
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {
-			var n Node
-			if err := json.Unmarshal([]byte(src), &n); err != nil {
-				t.Fatalf("unmarshal editor JSON: %v", err)
-			}
-			if err := n.Validate(); err != nil {
-				t.Fatalf("editor AST failed validation: %v", err)
-			}
-			// The literal edge cases must survive the round-trip: false/0/""/null
-			// are non-empty RawMessage, so they are NOT dropped by omitempty.
-			out, err := json.Marshal(&n)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if !bytes.Equal([]byte(src), out) {
-				t.Errorf("editor AST is not byte-stable\n  in:  %s\n  out: %s", src, out)
-			}
+			assertEditorJSONRoundTrips(t, src)
 		})
+	}
+
+	// The handwritten table above documents what the editor actually emits; it
+	// is not proof that every operator is covered. That is
+	// TestEditorASTContractCoversEveryOperator's job (editor_js_contract_test.go),
+	// which drives the same assertion off opSpecs itself.
+	for op := range opSpecs {
+		if !opAppearsIn(cases, op) {
+			t.Logf("operator %q has no handwritten editor case; "+
+				"TestEditorASTContractCoversEveryOperator covers it generically", op)
+		}
+	}
+}
+
+// opAppearsIn reports whether any case JSON carries `"op":"<op>"`.
+func opAppearsIn(cases map[string]string, op string) bool {
+	needle := `"op":"` + op + `"`
+	for _, src := range cases {
+		if strings.Contains(src, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// assertEditorJSONRoundTrips is the single assertion both contract tests share:
+// the editor's JSON parses into a rules.Node, validates, and marshals back
+// BYTE-IDENTICALLY. Byte identity is the real contract — the falsy scalars
+// (false/0/""/null) are non-empty RawMessage and must not be dropped by
+// omitempty, and the unary operators must not gain a `right` key.
+func assertEditorJSONRoundTrips(t *testing.T, src string) {
+	t.Helper()
+	var n Node
+	if err := json.Unmarshal([]byte(src), &n); err != nil {
+		t.Fatalf("unmarshal editor JSON: %v", err)
+	}
+	if err := n.Validate(); err != nil {
+		t.Fatalf("editor AST failed validation: %v", err)
+	}
+	out, err := json.Marshal(&n)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Equal([]byte(src), out) {
+		t.Errorf("editor AST is not byte-stable\n  in:  %s\n  out: %s", src, out)
 	}
 }
