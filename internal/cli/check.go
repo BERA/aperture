@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/frankbardon/aperture/engine"
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/seed"
 	"github.com/frankbardon/aperture/service"
@@ -58,7 +57,12 @@ func runCheck(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	svc := service.New(engine.New(store))
+	stack, err := buildDecisionStack(store, cmd.String("seed"))
+	if err != nil {
+		return err
+	}
+
+	svc := stack.newService()
 	res, err := svc.Check(ctx, service.Query{
 		Account:   cmd.String("account"),
 		Principal: principal,
@@ -113,7 +117,12 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	svc := service.New(engine.New(store))
+	stack, err := buildDecisionStack(store, cmd.String("seed"))
+	if err != nil {
+		return err
+	}
+
+	svc := stack.newService()
 	ids, err := svc.Enumerate(ctx, service.EnumerateQuery{
 		Account:   cmd.String("account"),
 		Principal: args.Get(0),
@@ -131,9 +140,9 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 }
 
 // identifiersCommand is `aperture identifiers <object_type>`: it lists every
-// valid instance id of an object type, enumerated from its provider (declared in
-// the seed's `providers:` section). --exclude drops ids, yielding the positive
-// allow-list an exclusive ("all except these") allowance expands to.
+// valid instance id of an object type, enumerated from the object sources the
+// seed declares (`providers:` and `objects:`). --exclude drops ids, yielding the
+// positive allow-list an exclusive ("all except these") allowance expands to.
 func identifiersCommand() *ucli.Command {
 	return &ucli.Command{
 		Name:      "identifiers",
@@ -160,16 +169,12 @@ func runIdentifiers(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	doc, err := seedDocument(cmd.String("seed"))
+	stack, err := buildDecisionStack(store, cmd.String("seed"))
 	if err != nil {
 		return err
 	}
-	reg, err := doc.BuildRegistry(seedBaseDir(cmd.String("seed")))
-	if err != nil {
-		return aerr.Wrap(aerr.APERTURE_BOOT, "cli: building object providers failed", err)
-	}
 
-	svc := service.New(engine.New(store), service.WithProviders(reg))
+	svc := stack.newService()
 	ids, err := svc.ObjectIdentifiers(ctx, args.Get(0), cmd.StringSlice("exclude")...)
 	if err != nil {
 		return err
@@ -208,7 +213,12 @@ func runExplain(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	svc := service.New(engine.New(store))
+	stack, err := buildDecisionStack(store, cmd.String("seed"))
+	if err != nil {
+		return err
+	}
+
+	svc := stack.newService()
 	tr, err := svc.Explain(ctx, service.Query{
 		Account:   cmd.String("account"),
 		Principal: args.Get(0),

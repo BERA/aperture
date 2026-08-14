@@ -8,9 +8,17 @@ applies_to: [cli, http]
 
 Aperture's first demoable slice exposes the engine's single decision — "may
 this principal take this action on this object?" — through two thin surfaces.
-Both translate to exactly one call into the `service` facade
-(`service.New(engine.New(store)).Check`), so the fail-closed decision policy
-lives in one place and never drifts between surfaces.
+Both translate to exactly one call into the `service` facade (`Service.Check`),
+so the fail-closed decision policy lives in one place and never drifts between
+surfaces.
+
+The facade is only half of "never drifts": both surfaces must also be built over
+the **same engine**. `internal/cli`'s `buildDecisionStack` is that single
+assembly — object providers, the rules engine over the storage-backed rule
+source, and scope resolution — and `check`, `enumerate`, `identifiers`, `explain`
+and `serve` all go through it. A command that builds a bare
+`service.New(engine.New(store))` instead has no rule evaluator, so every
+rule-backed permission fail-closed denies and the CLI contradicts the server.
 
 ## Service facade
 
@@ -39,6 +47,8 @@ Prints `allow` or `deny` plus the reason. Exit code reflects the decision:
 allow = 0, deny = non-zero, so checks compose in shell pipelines. Flags:
 
 - `--seed <file>` — JSON/YAML model to load (defaults to the embedded example).
+  The file is also the source of the `providers:` / `objects:` object-metadata
+  wiring, which rules and scope enumeration read.
 - `--store <dsn>` — sqlite DSN (defaults to in-memory).
 - `--account <id>` — active account (defaults to the example's `acme`).
 
