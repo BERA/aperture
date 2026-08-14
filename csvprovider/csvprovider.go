@@ -52,25 +52,56 @@
 // looks like to the parser — yields an empty element and is a hard error at
 // parse rather than a silently mis-split row.
 //
+// # Nested objects
+//
+// The type "json" parses its cell as JSON so a rule can read a structured value
+// with a dotted path — object.owner.dept. The cell MUST decode to a JSON OBJECT
+// at the top level; an array, a scalar, or null is rejected, because "list"
+// stays the only array path. That keeps "arrays hold scalars, objects hold
+// structure" true everywhere and the operator set flat.
+//
+// Because a JSON object contains commas and quotes, the cell has to be quoted
+// per RFC 4180 — the whole cell in double quotes, with every inner double quote
+// doubled. This is the least obvious part of the feature, so here it is in full:
+//
+//	id,owner:json
+//	brand:1,"{""dept"":""eng"",""lead"":""alice""}"
+//	brand:2,"{""dept"":""ops"",""tags"":[""oncall"",""eu""]}"
+//
+// Below the top level it is ordinary JSON, bounded by the shared value model's
+// depth and size caps (provider.ValueLimits): {"dept":"eng","tags":["a","b"]}
+// is fine, {"members":[{"id":1}]} is not — arrays of objects are rejected at
+// any position.
+//
+// Numbers decode through json.Decoder with UseNumber, so no precision is lost
+// before the type is chosen, and are then normalised the SAME way the scalar
+// columns coerce: a literal that is an exact integer fitting int64 becomes an
+// int64 (as :int and :list<int> do), and anything else becomes a float64 (as
+// :float and :list<float> do). A number the machine cannot represent at all is
+// a hard error rather than a silent Inf. That consistency is what makes
+// cross-column comparisons — object.owner.seats == object.seats — behave.
+//
 // # Empty cells
 //
 // An empty cell in a SCALAR column omits that field for the row, so a rule can
-// supply its own default. An empty cell in a LIST column is the one departure:
-// it yields an empty list ([]any{}), not an absent field, so "x" in object.tags
-// is a definite false rather than an evaluation against nil.
+// supply its own default. An empty cell in a JSON column does the same: an
+// object that is absent is meaningfully different from one that is empty, and
+// reading an absent object is safe. An empty cell in a LIST column is the one
+// departure: it yields an empty list ([]any{}), not an absent field, so "x" in
+// object.tags is a definite false rather than an evaluation against nil.
 //
 // # Errors
 //
 // A missing "id" column, a duplicate id, a wrong column count, an unknown type
 // or malformed type suffix, a value that will not coerce to its declared type,
-// or a list cell with an empty element is an APERTURE_CONFIG_INVALID error
-// naming the column (and, for a cell, the line and the offending element). A
-// malformed id passes through as the identity package's
-// APERTURE_IDENTITY_INVALID. Every parsed value is additionally checked against
-// the shared metadata value model (provider.ValidateField) before it is stored,
-// so a shape, depth, or size violation fails the load as
-// APERTURE_METADATA_INVALID instead of surfacing as a runtime error on the
-// Check hot path.
+// a list cell with an empty element, or a json cell that is not valid JSON or
+// does not decode to an object is an APERTURE_CONFIG_INVALID error naming the
+// column (and, for a cell, the line and the offending element). A malformed id
+// passes through as the identity package's APERTURE_IDENTITY_INVALID. Every
+// parsed value is additionally checked against the shared metadata value model
+// (provider.ValidateField) before it is stored, so a shape, depth, or size
+// violation fails the load as APERTURE_METADATA_INVALID instead of surfacing as
+// a runtime error on the Check hot path.
 //
 // # Loading and the read-only contract
 //
@@ -79,9 +110,9 @@
 // map is owned by the provider and MUST be treated as read-only: the provider
 // never mutates a map in place — Reload builds a fresh set and swaps it in, so
 // maps already handed to (and cached by) the Registry stay immutable. The
-// contract is transitive now that a value may be a slice: every list cell is
-// parsed into a slice allocated for that row alone, so no two rows (and no two
-// loads) ever share one.
+// contract is transitive now that a value may be a slice or a map: every list
+// cell is parsed into a slice, and every json cell decoded into a map, allocated
+// for that row alone, so no two rows (and no two loads) ever share one.
 //
 // Dependencies stay minimal: csvprovider imports only errors, identity, and
 // provider, plus the standard library (pure-Go, CGO-free).
@@ -90,6 +121,8 @@ package csvprovider
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -250,14 +283,21 @@ func matchFields(md provider.Metadata, fields map[string]any) bool {
 // elem and delim are set only for a list column; they stay empty for a scalar.
 type column struct {
 	name  string
-	typ   string // "string", "int", "float", "bool", or "list"
+	typ   string // "string", "int", "float", "bool", "list", or "json"
 	elem  string // element type of a list column ("string" unless <elem> says otherwise)
 	delim string // element separator of a list column (defaultListDelim unless (delim) says otherwise)
 	index int
 }
 
-// typeList is the column type that yields a []any; the rest are scalars.
-const typeList = "list"
+const (
+	// typeList is the column type that yields a []any.
+	typeList = "list"
+	// typeJSON is the column type that yields a map[string]any decoded from the
+	// cell. It is the only column type that produces structure, and it produces
+	// nothing else: a cell decoding to an array, a scalar, or null is rejected
+	// so that "list" stays the single array path.
+	typeJSON = "json"
+)
 
 // defaultListDelim separates the elements of a list cell unless the header
 // overrides it per column with a "(delim)" suffix.
@@ -333,7 +373,8 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 		for _, c := range cols {
 			cell := strings.TrimSpace(row[c.index])
 			var val any
-			if c.typ == typeList {
+			switch {
+			case c.typ == typeList:
 				// A list cell always produces a field, empty cell included:
 				// [] is a definite "member of nothing", where an absent field
 				// would leave the rule evaluating against nil.
@@ -342,7 +383,19 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 					return nil, nil, err
 				}
 				val = list
-			} else {
+			case c.typ == typeJSON:
+				if cell == "" {
+					// Unlike a list, an empty json cell omits the field: an
+					// absent object is meaningfully different from an empty one,
+					// and reading an absent object is safe.
+					continue
+				}
+				obj, err := decodeObject(cell, c, line)
+				if err != nil {
+					return nil, nil, err
+				}
+				val = obj
+			default:
 				if cell == "" {
 					continue // omit an empty scalar field; a rule can default it
 				}
@@ -444,8 +497,12 @@ func parseTypeSuffix(name, suffix string) (column, error) {
 	}
 
 	typ := rest
+	// Everything but "list" is a single, undecorated type. "json" joins the
+	// scalars here rather than growing a branch of its own: its cell carries its
+	// whole structure, so an element type or a delimiter is as meaningless on it
+	// as it is on ":int" and is rejected identically.
 	if typ != typeList {
-		if !isScalarType(typ) {
+		if !isScalarType(typ) && typ != typeJSON {
 			return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
 				"csvprovider: unknown column type",
 				map[string]any{"name": name, "type": typ})
@@ -516,6 +573,113 @@ func splitList(cell string, c column, line int) ([]any, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// decodeObject parses one json cell into a map[string]any. The map — and every
+// container inside it — is decoded fresh for this row, so no two rows and no two
+// loads ever share one, which is what keeps the read-only metadata contract true
+// at depth.
+//
+// The cell MUST decode to a JSON object. An array, a scalar, or null is rejected
+// here rather than left to the value model, because "list" is the only array
+// path and a scalar already has a scalar column type; below the top level it is
+// ordinary JSON, which provider.ValidateField then bounds.
+//
+// Errors name the column and the line and carry the JSON kind or the decoder's
+// message — never the cell, which is host data.
+func decodeObject(cell string, c column, line int) (map[string]any, error) {
+	dec := json.NewDecoder(strings.NewReader(cell))
+	// UseNumber is the house pattern (rules/ast.go decodeScalar): it defers the
+	// int/float choice to normalizeNumbers instead of floating every integer.
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: json cell is not valid JSON; quote the whole cell per RFC 4180 and double every inner double quote",
+			map[string]any{"line": line, "field": c.name, "type": typeJSON, "error": err.Error()})
+	}
+	if _, err := dec.Token(); !stderrors.Is(err, io.EOF) {
+		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: json cell has trailing content after its JSON value",
+			map[string]any{"line": line, "field": c.name, "type": typeJSON})
+	}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: json cell must decode to a JSON object; use a list column for an array and a scalar column type for a scalar",
+			map[string]any{"line": line, "field": c.name, "type": typeJSON, "kind": jsonKind(v)})
+	}
+	if err := normalizeObject(obj, c, line); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
+// normalizeObject rewrites every json.Number below obj in place. Numbers are the
+// one place a json column could disagree with the rest of the file, and a
+// disagreement is invisible: the evaluator does no numeric coercion, so
+// object.owner.seats == object.seats would be a silent false if one side were a
+// float64 and the other an int64. The rule is therefore exactly the scalar
+// columns' rule — an exact integer that fits int64 becomes an int64, everything
+// else a float64 — applied at every depth.
+func normalizeObject(obj map[string]any, c column, line int) error {
+	for k, v := range obj {
+		nv, err := normalizeValue(v, c, line)
+		if err != nil {
+			return err
+		}
+		obj[k] = nv
+	}
+	return nil
+}
+
+// normalizeValue applies normalizeObject's rule to one decoded value.
+func normalizeValue(v any, c column, line int) (any, error) {
+	switch x := v.(type) {
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i, nil // matches :int and :list<int>
+		}
+		if f, err := x.Float64(); err == nil {
+			return f, nil // matches :float and :list<float>
+		}
+		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: json cell holds a number no int64 or float64 can represent",
+			map[string]any{"line": line, "field": c.name, "type": typeJSON, "value": x.String()})
+	case map[string]any:
+		return x, normalizeObject(x, c, line)
+	case []any:
+		for i, elem := range x {
+			nv, err := normalizeValue(elem, c, line)
+			if err != nil {
+				return nil, err
+			}
+			x[i] = nv
+		}
+		return x, nil
+	default:
+		return v, nil
+	}
+}
+
+// jsonKind names the JSON kind of a decoded value, so a rejection can say what
+// the cell held without repeating the cell itself.
+func jsonKind(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "bool"
+	case json.Number:
+		return "number"
+	case string:
+		return "string"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	}
+	return "unknown"
 }
 
 // coerce converts a raw cell to the value for its declared column type. int is
