@@ -1,6 +1,6 @@
 ---
 name: rules-engine
-description: The rules engine evaluates a JSON rule AST as a Pulse expression over object metadata and principal/action context, compiling once and caching, to back the inclusive/exclusive scope resolvers.
+description: The rules engine evaluates a JSON rule AST as an expr-lang expression over object metadata and principal/action context, compiling once and caching, to back the inclusive/exclusive scope resolvers.
 applies_to: [cli, http, mcp]
 ---
 
@@ -12,10 +12,12 @@ is the rule-backed variant of the inclusive/exclusive scope resolvers (E2-S1): a
 `*rules.Engine` satisfies `scope.RuleEvaluator`, so wiring it as
 `engine.ScopeDeps{Rules: eng}` turns on rule-driven scope membership.
 
-Expressions are evaluated by Pulse's expression evaluator (`expr-lang/expr`, the
-same pure-Go engine Pulse uses for its `FILTER_EXPRESSION` predicate). Aperture
-does not hand-roll a parser and stays `CGO_ENABLED=0` — it never pulls Pulse's
-geo/h3 packages.
+Expressions are evaluated by [`expr-lang/expr`](https://github.com/expr-lang/expr)
+**directly**: `rules` renders each AST to an expr-lang expression and compiles it
+in-process with expr-lang's pure-Go evaluator. Aperture does not hand-roll a
+parser, has **no dependency on Pulse**, and stays `CGO_ENABLED=0`. Any older doc
+calling this a "Pulse expression" is stale — `rules` imports
+`github.com/expr-lang/expr` and that is the whole engine.
 
 ## The rule AST (the editor + state-file contract)
 
@@ -256,7 +258,7 @@ operators** by expr's grammar, so they are registered but not reachable through 
 
 ## Compile-once, cache
 
-A rule is rendered to its canonical Pulse expression, hashed (sha256), and the
+A rule is rendered to its canonical expr-lang expression, hashed (sha256), and the
 compiled program is cached by that hash — so distinct rule references whose ASTs
 render identically share one compiled program, and per-`Check` cost is bounded
 (the NFR lever E4-S4 tunes). The cache is concurrency-safe with an optional TTL
