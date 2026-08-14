@@ -41,10 +41,11 @@ node build: the whole frontend is pre-built, committed blobs behind `//go:embed`
   Save that persists the serialized AST via `PutRule` (SYSTEM tier, gated by the
   tier probe — non-admins load/validate/preview but cannot save), a server
   Validate (`ValidateRule`, non-persisting, surfacing `APERTURE_RULE_*` on the
-  canvas), and a READ-ONLY live what-if that previews the UNSAVED rule on the
-  canvas via `Simulate` / `SimulateExplain` with the edited rule as an overlay
-  (persists nothing); `vendor/` holds the pre-built blobs (see `vendor/README.md`
-  for pinned versions + regeneration).
+  canvas), and a READ-ONLY object what-if that previews the UNSAVED rule on the
+  canvas (`ListObjectTypes` / `ObjectIdentifiers` to pick a type + a sample
+  object, then `EvaluateRule`, which persists nothing) — see "What-if preview"
+  below; `vendor/` holds the pre-built blobs (see `vendor/README.md` for pinned
+  versions + regeneration).
 - `js/rules-serializer.js` is the pure, DOM-free, dependency-free bridge under
   `js/rules.js`: `astToGraph` / `graphToAST` are lossless inverses over the exact
   `rules.Node` JSON shape, plus `validateAST`, a client-side mirror of the Go
@@ -116,6 +117,39 @@ re-opens the sign-in affordance. Sign-in / sign-out dispatch DOM events —
 which principal the session presents. An unauthenticated shell shows a sign-in
 modal; there is no credential issuance UI. Later per-screen Alpine components
 reuse `window.apiFetch` so the auth header lives in exactly one place.
+
+## What-if preview (rule editor) — read-only, by design
+
+The Rules section's object what-if samples a REAL object of a chosen type and
+shows the metadata snapshot the rule actually saw, returned on the
+`EvaluateRule` response as `object_json`. It is **strictly read-only**: the panel
+has no metadata input and there is no request path by which the client supplies
+metadata. Supplying fake metadata is a different feature with different trust
+implications and is deliberately out of scope — the preview's value is that it
+shows real provider data.
+
+Rendering (`js/rules.js`: `metadataRows` / `pushMetadataRows` /
+`formatMetadataScalar`, displayed from `previewRows`) follows the provider value
+model, which is closed rather than arbitrary JSON:
+
+- A field value is a **scalar**, an **array of scalars**, or an **object** whose
+  members are scalars, scalar arrays, or one further object level. The depth cap
+  is 2, and arrays of objects are rejected at load — so no array element is ever
+  a container.
+- Snapshots are flattened to one indented row per field, plus one row per member
+  of an object-valued field. Scalars render in their JSON form, so a string keeps
+  its quotes and the string `"42"` stays distinguishable from the number `42`.
+- Array elements render as one chip each, so a long array wraps inside the panel;
+  the panel scrolls in its own container and never widens the page.
+- **An absent field has no row at all**, whereas an empty list renders `[]` and an
+  empty object renders `{}`, each with a count note. That distinction is load
+  bearing: an empty `:list` cell produces a real `[]`, while an empty scalar or
+  `:json` cell omits the field entirely, and a rule author debugging an `in`
+  comparison has to tell the two apart.
+- A collapsed "Raw JSON" disclosure keeps the whole snapshot available verbatim.
+
+A change to what the preview renders, or to its read-only guarantee, updates this
+section in the same PR.
 
 ## compliance (load-bearing)
 
