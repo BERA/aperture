@@ -487,3 +487,313 @@ func TestFromReader(t *testing.T) {
 		t.Errorf("reader Reload code = %s, want APERTURE_CONFIG_INVALID", aerr.CodeOf(err))
 	}
 }
+
+// jsonCell renders raw as an RFC 4180 quoted CSV cell — the whole cell in double
+// quotes, every inner double quote doubled. It is the escaping a CSV author has
+// to do by hand for a json column, so every fixture below goes through it.
+func jsonCell(raw string) string {
+	return `"` + strings.ReplaceAll(raw, `"`, `""`) + `"`
+}
+
+// jsonFile builds a one-column, one-row json fixture around raw.
+func jsonFile(raw string) string {
+	return "id,owner:json\nbrand:1," + jsonCell(raw) + "\n"
+}
+
+// TestJSONPackageDocExample loads the RFC 4180 quoted file printed verbatim in
+// the package doc and in docs/src/concepts/providers.md. The escaping is the
+// least obvious part of the feature, so the documented bytes are pinned rather
+// than paraphrased.
+func TestJSONPackageDocExample(t *testing.T) {
+	p, err := p_load(t, strings.Join([]string{
+		`id,owner:json`,
+		`brand:1,"{""dept"":""eng"",""lead"":""alice""}"`,
+		`brand:2,"{""dept"":""ops"",""tags"":[""oncall"",""eu""]}"`,
+		`brand:3,`,
+		``,
+	}, "\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	objs, err := p.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []map[string]any{
+		{"dept": "eng", "lead": "alice"},
+		{"dept": "ops", "tags": []any{"oncall", "eu"}},
+		nil, // brand:3 has an empty cell, so the field is omitted
+	}
+	for i, w := range want {
+		got := objs[i].Metadata["owner"]
+		if w == nil {
+			if _, ok := objs[i].Metadata["owner"]; ok {
+				t.Errorf("row %d owner = %#v, want the field omitted", i, got)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(got, w) {
+			t.Errorf("row %d owner = %#v, want %#v", i, got, w)
+		}
+	}
+}
+
+// TestJSONColumnAccepts walks the shapes a json cell may hold: a flat object,
+// one nested object level, and an object holding a scalar array.
+func TestJSONColumnAccepts(t *testing.T) {
+	cases := map[string]struct {
+		raw  string
+		want map[string]any
+	}{
+		"flat object": {
+			raw:  `{"dept":"eng","lead":"alice"}`,
+			want: map[string]any{"dept": "eng", "lead": "alice"},
+		},
+		"nested object": {
+			raw:  `{"lead":{"name":"alice"}}`,
+			want: map[string]any{"lead": map[string]any{"name": "alice"}},
+		},
+		"object with a scalar array": {
+			raw:  `{"dept":"eng","tags":["a","b"]}`,
+			want: map[string]any{"dept": "eng", "tags": []any{"a", "b"}},
+		},
+		"empty object": {
+			raw:  `{}`,
+			want: map[string]any{},
+		},
+		"mixed scalars": {
+			raw:  `{"active":true,"note":null,"seats":3}`,
+			want: map[string]any{"active": true, "note": nil, "seats": int64(3)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, err := p_load(t, jsonFile(tc.raw))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			md, err := p.Fetch(context.Background(), identity.MustParse("brand:1"))
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if !reflect.DeepEqual(md["owner"], tc.want) {
+				t.Errorf("owner = %#v, want %#v", md["owner"], tc.want)
+			}
+		})
+	}
+}
+
+// TestJSONNumbersMatchScalarColumns pins the documented int/float rule: an exact
+// integer that fits int64 becomes an int64 exactly as :int does, and everything
+// else a float64 exactly as :float does. UseNumber is what makes the large
+// integer survive — a plain decode would float it and lose the last digit.
+func TestJSONNumbersMatchScalarColumns(t *testing.T) {
+	p, err := p_load(t, "id,owner:json,seats:int,budget:float\nbrand:1,"+
+		jsonCell(`{"seats":3,"budget":1.5,"exp":1e3,"huge":9007199254740993,"list":[1,2.5]}`)+
+		",3,1.5\n")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	md, err := p.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	owner := md["owner"].(map[string]any)
+	want := map[string]any{
+		"seats":  int64(3),
+		"budget": 1.5,
+		"exp":    float64(1000), // "1e3" is not an integer literal, so it floats
+		"huge":   int64(9007199254740993),
+		"list":   []any{int64(1), 2.5},
+	}
+	if !reflect.DeepEqual(owner, want) {
+		t.Fatalf("owner = %#v, want %#v", owner, want)
+	}
+	// The point of the rule: a nested number and a scalar column of the same
+	// declared type land in the SAME Go type, so a cross-column comparison in a
+	// rule is not a silent false.
+	if owner["seats"] != md["seats"] {
+		t.Errorf("owner.seats = %T(%v), seats = %T(%v); the types must agree",
+			owner["seats"], owner["seats"], md["seats"], md["seats"])
+	}
+	if owner["budget"] != md["budget"] {
+		t.Errorf("owner.budget = %T(%v), budget = %T(%v); the types must agree",
+			owner["budget"], owner["budget"], md["budget"], md["budget"])
+	}
+}
+
+// TestJSONColumnRejects covers every way a json cell fails. A top-level array, a
+// top-level scalar, and malformed JSON are APERTURE_CONFIG_INVALID from the
+// loader; a shape, depth, or size violation below the top level is
+// APERTURE_METADATA_INVALID from the shared value model. Both name the column
+// and the line, and neither may panic or silently store the raw string.
+func TestJSONColumnRejects(t *testing.T) {
+	cases := map[string]struct {
+		raw  string
+		code aerr.Code
+	}{
+		"top-level array":        {`["a","b"]`, aerr.APERTURE_CONFIG_INVALID},
+		"top-level array of one": {`[{"dept":"eng"}]`, aerr.APERTURE_CONFIG_INVALID},
+		"top-level string":       {`"eng"`, aerr.APERTURE_CONFIG_INVALID},
+		"top-level number":       {`5`, aerr.APERTURE_CONFIG_INVALID},
+		"top-level bool":         {`true`, aerr.APERTURE_CONFIG_INVALID},
+		"top-level null":         {`null`, aerr.APERTURE_CONFIG_INVALID},
+		"malformed JSON":         {`{"dept":`, aerr.APERTURE_CONFIG_INVALID},
+		"unquoted key":           {`{dept:"eng"}`, aerr.APERTURE_CONFIG_INVALID},
+		"trailing content":       {`{"dept":"eng"} junk`, aerr.APERTURE_CONFIG_INVALID},
+		"unrepresentable number": {`{"n":1e400}`, aerr.APERTURE_CONFIG_INVALID},
+		"array of objects":       {`{"members":[{"id":1}]}`, aerr.APERTURE_METADATA_INVALID},
+		"nested array":           {`{"tags":[["a"]]}`, aerr.APERTURE_METADATA_INVALID},
+		"over depth":             {`{"a":{"b":{"c":"x"}}}`, aerr.APERTURE_METADATA_INVALID},
+		"empty key":              {`{"":"x"}`, aerr.APERTURE_METADATA_INVALID},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := p_load(t, jsonFile(tc.raw))
+			if got := aerr.CodeOf(err); got != tc.code {
+				t.Fatalf("code = %s, want %s (err %v)", got, tc.code, err)
+			}
+			// The loader names the column and the line in the coded context;
+			// the value-model wrap names them in the message. Either is enough
+			// for an operator to find the cell.
+			ctx := codedContext(t, err)
+			if ctx["field"] != "owner" && !strings.Contains(err.Error(), "owner") {
+				t.Errorf("error should name the column, got %q / %#v", err.Error(), ctx)
+			}
+			if ctx["line"] != 2 && !strings.Contains(err.Error(), "line 2") {
+				t.Errorf("error should name the line, got %q / %#v", err.Error(), ctx)
+			}
+			// The raw cell is host data and must never reach a diagnostic.
+			if strings.Contains(err.Error(), tc.raw) {
+				t.Errorf("error leaks the cell contents: %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestJSONOversizedCellRejected proves the size cap reaches inside a json cell
+// too: the failure is at LOAD, not on the Check hot path.
+func TestJSONOversizedCellRejected(t *testing.T) {
+	huge := strings.Repeat("x", provider.DefaultMaxValueBytes+1)
+	_, err := p_load(t, jsonFile(`{"note":"`+huge+`"}`))
+	if got := aerr.CodeOf(err); got != aerr.APERTURE_METADATA_INVALID {
+		t.Fatalf("code = %s, want APERTURE_METADATA_INVALID", got)
+	}
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("error should name the line, got %q", err.Error())
+	}
+}
+
+// TestJSONEmptyCellOmitsField documents the empty-cell rule: a json column
+// follows the SCALAR rule, not the list rule. An absent object is meaningfully
+// different from an empty one.
+func TestJSONEmptyCellOmitsField(t *testing.T) {
+	p, err := p_load(t, "id,owner:json,tags:list\nbrand:1,,\n")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	md, err := p.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if _, ok := md["owner"]; ok {
+		t.Errorf("owner = %#v, want the field omitted", md["owner"])
+	}
+	// The list column in the same row still yields [], so the two rules stay
+	// visibly distinct.
+	if !reflect.DeepEqual(md["tags"], []any{}) {
+		t.Errorf("tags = %#v, want []", md["tags"])
+	}
+}
+
+// TestJSONHeaderSuffixComposition holds :json to the same header grammar as the
+// scalars: it takes no element type and no delimiter, and misspelling it is an
+// unknown type rather than a silent string column.
+func TestJSONHeaderSuffixComposition(t *testing.T) {
+	for name, content := range map[string]string{
+		"element type on json": "id,owner:json<int>\nbrand:1," + jsonCell(`{"a":1}`) + "\n",
+		"delimiter on json":    "id,owner:json(;)\nbrand:1," + jsonCell(`{"a":1}`) + "\n",
+		"both on json":         "id,owner:json<int>(;)\nbrand:1," + jsonCell(`{"a":1}`) + "\n",
+		"json as list element": "id,owner:list<json>\nbrand:1,a\n",
+		"misspelled json":      "id,owner:jsonn\nbrand:1,a\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := p_load(t, content)
+			if got := aerr.CodeOf(err); got != aerr.APERTURE_CONFIG_INVALID {
+				t.Fatalf("code = %s, want APERTURE_CONFIG_INVALID", got)
+			}
+			if ctx := codedContext(t, err); ctx["name"] != "owner" {
+				t.Errorf("context = %#v, want the column named", ctx)
+			}
+		})
+	}
+}
+
+// TestJSONColumnComposesWithTheRestOfTheGrammar puts a json column beside every
+// other column type in one header and walks the row through Fetch.
+func TestJSONColumnComposesWithTheRestOfTheGrammar(t *testing.T) {
+	p, err := p_load(t, "id,tier,seats:int,active:bool,tags:list,ranks:list<int>,aliases:list(;),owner:json\n"+
+		"brand:1,gold,40,true,premium|launch,3|5,acme;acme-co,"+jsonCell(`{"dept":"eng","tags":["a","b"]}`)+"\n")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	md, err := p.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	want := provider.Metadata{
+		"tier":    "gold",
+		"seats":   int64(40),
+		"active":  true,
+		"tags":    []any{"premium", "launch"},
+		"ranks":   []any{int64(3), int64(5)},
+		"aliases": []any{"acme", "acme-co"},
+		"owner":   map[string]any{"dept": "eng", "tags": []any{"a", "b"}},
+	}
+	if !reflect.DeepEqual(md, want) {
+		t.Fatalf("metadata = %#v, want %#v", md, want)
+	}
+}
+
+// TestJSONObjectsAreNeverShared is TestListSlicesAreNeverShared for objects: two
+// rows with byte-identical cells must not share one map, and a Reload must not
+// touch a map already handed out.
+func TestJSONObjectsAreNeverShared(t *testing.T) {
+	cell := jsonCell(`{"dept":"eng","tags":["a"]}`)
+	path := write(t, "id,owner:json\nbrand:1,"+cell+"\nbrand:2,"+cell+"\n")
+	p := New(path)
+
+	objs, err := p.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	first := objs[0].Metadata["owner"].(map[string]any)
+	second := objs[1].Metadata["owner"].(map[string]any)
+	if reflect.ValueOf(first).UnsafePointer() == reflect.ValueOf(second).UnsafePointer() {
+		t.Fatal("two rows share one object; each row must own its map")
+	}
+	// The contract is transitive, so the nested array must not be shared either.
+	firstTags := first["tags"].([]any)
+	secondTags := second["tags"].([]any)
+	if reflect.ValueOf(firstTags).UnsafePointer() == reflect.ValueOf(secondTags).UnsafePointer() {
+		t.Fatal("two rows share one nested array; the read-only contract is transitive")
+	}
+
+	next := jsonCell(`{"dept":"ops","tags":["b"]}`)
+	if err := os.WriteFile(path, []byte("id,owner:json\nbrand:1,"+next+"\nbrand:2,"+cell+"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := p.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !reflect.DeepEqual(first, map[string]any{"dept": "eng", "tags": []any{"a"}}) {
+		t.Errorf("pre-reload map mutated: %#v", first)
+	}
+	after, err := p.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch after reload: %v", err)
+	}
+	if !reflect.DeepEqual(after["owner"], map[string]any{"dept": "ops", "tags": []any{"b"}}) {
+		t.Errorf("after reload owner = %#v", after["owner"])
+	}
+}

@@ -277,17 +277,59 @@ yields an **empty list** (`[]`), not an absent field, so a membership rule
 evaluates to a definite `false` rather than running against `nil` (row `brand:2`
 above has `tags: []`).
 
+#### Object columns
+
+The type `json` parses its cell as JSON, so a rule can read a structured value
+with a dotted path — `object.owner.dept`. The cell **must decode to a JSON
+object** at the top level; an array, a scalar, or `null` is rejected, because
+`list` stays the only array path. That keeps "arrays hold scalars, objects hold
+structure" true everywhere and the operator set flat.
+
+A JSON object contains commas and quotes, so the cell has to be quoted per
+RFC 4180 — **the whole cell in double quotes, with every inner double quote
+doubled**. `encoding/csv` handles this correctly; the part that trips authors up
+is writing it:
+
+```text
+id,owner:json
+brand:1,"{""dept"":""eng"",""lead"":""alice""}"
+brand:2,"{""dept"":""ops"",""tags"":[""oncall"",""eu""]}"
+brand:3,
+```
+
+Below the top level it is ordinary JSON, bounded by the
+[value model](#the-metadata-value-model)'s depth and size caps:
+`{"dept":"eng","tags":["a","b"]}` is fine (depth 2) and `{"members":[{"id":1}]}`
+is not — arrays of objects are rejected at any position.
+
+**Numbers follow the scalar columns exactly.** The cell decodes through
+`json.Decoder` with `UseNumber`, so nothing is floated before the type is
+chosen, and each number then becomes an `int64` when it is an exact integer that
+fits one (as `:int` and `:list<int>` produce) and a `float64` otherwise (as
+`:float` and `:list<float>` produce). `3` is `int64(3)`, `1.5` and `1e3` are
+`float64`, and `9007199254740993` survives as an exact `int64` rather than
+losing its last digit. That consistency is what makes a cross-column comparison
+such as `object.owner.seats == object.seats` behave. A number no `int64` or
+`float64` can represent is a hard error, not a silent `Inf`.
+
+An **empty cell in a json column omits the field**, following the scalar rule
+rather than the list rule (row `brand:3` above has no `owner`): an object that is
+absent is meaningfully different from one that is empty, and reading an absent
+object is safe.
+
 #### Errors
 
 A missing `id` column, a duplicate id, a wrong column count, an unknown type or
-malformed type suffix, a value that will not coerce to its declared type, or a
-list cell with an empty element is an `APERTURE_CONFIG_INVALID` error naming the
-column — and, for a cell, the line and the offending element. A malformed id
-passes through as the identity package's `APERTURE_IDENTITY_INVALID`. Every
-parsed value is then checked against the [value model](#validating-at-load) with
+malformed type suffix, a value that will not coerce to its declared type, a list
+cell with an empty element, or a json cell that is not valid JSON or does not
+decode to an object is an `APERTURE_CONFIG_INVALID` error naming the column —
+and, for a cell, the line and the offending element. A malformed id passes
+through as the identity package's `APERTURE_IDENTITY_INVALID`. Every parsed value
+is then checked against the [value model](#validating-at-load) with
 `provider.ValidateField`, so a shape, depth, or size violation fails the **load**
 as `APERTURE_METADATA_INVALID` instead of surfacing as a runtime error on the
-`Check` hot path.
+`Check` hot path. A json cell's rejection carries the column, the line, and the
+JSON kind or the decoder's message — never the cell, which is host data.
 
 ### Loading and the read-only contract
 
@@ -298,8 +340,8 @@ already-loaded provider from any reader (embedded data, tests). `Reload`
 re-reads the file, building a **fresh** set and swapping it in atomically, so maps
 already handed to and cached by the Registry stay immutable — honouring the
 "metadata is read-only" contract. That holds at depth: every list cell is parsed
-into a slice allocated for that row alone, so no two rows — and no two loads —
-ever share one. After a `Reload`, call `Registry.InvalidateType` to drop the
+into a slice, and every json cell decoded into a map, allocated for that row
+alone, so no two rows — and no two loads — ever share one. After a `Reload`, call `Registry.InvalidateType` to drop the
 now-stale cache entries.
 
 `Query` honours `Filter.Pattern` and `Filter.Limit` directly and matches

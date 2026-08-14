@@ -96,9 +96,9 @@ loader normalises into the model — it never widens it.
 A header column carries `name:type[<elem>][(delim)]`:
 
 ```text
-id,tier,seats:int,tags:list,ranks:list<int>,aliases:list(;)
-brand:1,gold,40,premium|launch,3|5,acme;acme-co
-brand:2,silver,,,,
+id,tier,seats:int,tags:list,ranks:list<int>,aliases:list(;),owner:json
+brand:1,gold,40,premium|launch,3|5,acme;acme-co,"{""dept"":""eng"",""tags"":[""a""]}"
+brand:2,silver,,,,,
 ```
 
 | Suffix | Value |
@@ -107,8 +107,9 @@ brand:2,silver,,,,
 | `:list` | an **array** of strings, split on `\|` |
 | `:list<int>` / `:list<float>` / `:list<bool>` | an array whose elements go through the **same** scalar coercion |
 | `:list(;)` | the delimiter override, for that column only |
+| `:json` | an **object**, decoded from the cell — takes no `<elem>` and no `(delim)` |
 
-Three rules the value model does not impose, but the CSV encoding must:
+Four rules the value model does not impose, but the CSV encoding must:
 
 - **Element typing is mandatory for numeric membership.** expr does no
   numeric/string coercion, so `5 in object.seats` is `false` against `["3","5"]`.
@@ -121,10 +122,20 @@ Three rules the value model does not impose, but the CSV encoding must:
   a silently mis-split row.
 - **An empty list cell is `[]`, not an absent field** — the one departure from
   the scalar rule, so a membership rule gets a definite `false` instead of
-  evaluating against `nil`. Empty *scalar* cells still omit the field.
+  evaluating against `nil`. Empty *scalar* **and `:json`** cells still omit the
+  field: an absent object is meaningfully different from an empty one.
+- **A `:json` cell must decode to a JSON _object_.** An array, a scalar, or
+  `null` is rejected (`APERTURE_CONFIG_INVALID`), so `:list` stays the only array
+  path. The cell is RFC 4180 quoted — the whole cell in double quotes, every
+  inner double quote doubled — and its numbers decode through `UseNumber` and
+  then normalise **exactly as the scalar columns do**: an exact integer that fits
+  `int64` becomes an `int64`, everything else a `float64`. That is what keeps
+  `object.owner.seats == object.seats` from being a silent `false`.
 
-Grammar and coercion failures are `APERTURE_CONFIG_INVALID`; the value-model
-check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
+Grammar, coercion, and `:json` decode failures are `APERTURE_CONFIG_INVALID`; the
+value-model check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
+A `:json` rejection carries the column, the line, and the JSON kind or the
+decoder's message — never the cell.
 
 ## Errors
 
@@ -152,7 +163,9 @@ The cache stores a provider's map **by reference** and never copies it on read
 and slices are shared too:
 
 - a provider returns a **fresh** map per object, with fresh nested containers, and
-  a reload builds a new value rather than editing the old one in place;
+  a reload builds a new value rather than editing the old one in place — in
+  `csvprovider` every list cell is split into its own slice and every `:json`
+  cell decoded into its own map, so no two rows share one;
 - **no holder** — engine, rules, scope, CLI, server, host code — writes to a
   `Metadata` it was given, **at any depth**;
 - a consumer that needs to modify metadata copies it deeply first.
