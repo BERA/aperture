@@ -21,6 +21,14 @@ func newService(tb testing.TB, m benchModel, withAudit bool) (*service.Service, 
 	if !withAudit {
 		return service.New(eng), func() {}
 	}
+	return newAuditedService(tb, m, eng)
+}
+
+// newAuditedService wraps an already-built engine in the sampled, asynchronous
+// audit shape. It is shared with newRuleService (collection_test.go) so both
+// service constructors wire audit identically.
+func newAuditedService(tb testing.TB, m benchModel, eng *engine.Engine) (*service.Service, func()) {
+	tb.Helper()
 	rec := audit.New(m.store, audit.WithSampleRate(0.01), audit.WithBuffer(4096))
 	return service.New(eng, service.WithAudit(rec)), func() { _ = rec.Close() }
 }
@@ -182,13 +190,6 @@ func TestCheckNFR(t *testing.T) {
 		t.Skip("set APERTURE_BENCH_ASSERT=1 to run the hard NFR latency/throughput gate")
 	}
 
-	const (
-		p99Samples     = 100_000
-		p99Ceiling     = time.Millisecond // the FR-31 target; actuals run far under it
-		throughputMin  = 10_000.0         // checks/sec/instance
-		throughputRunN = 200_000
-	)
-
 	for _, withAudit := range []bool{false, true} {
 		name := "audit-off"
 		if withAudit {
@@ -198,30 +199,56 @@ func TestCheckNFR(t *testing.T) {
 			m := buildModel(t)
 			svc, closeFn := newService(t, m, withAudit)
 			defer closeFn()
-			q := toQuery(m.req)
-			warm(t, svc, q, true)
-			ctx := context.Background()
-
-			p99 := measureP99(ctx, svc, q, p99Samples)
-			t.Logf("%s: p99 cached Check = %v (ceiling %v)", name, p99, p99Ceiling)
-			if p99 >= p99Ceiling {
-				t.Errorf("%s: p99 cached Check %v exceeds NFR ceiling %v", name, p99, p99Ceiling)
-			}
-
-			// Sustained throughput, single goroutine (a conservative floor; real
-			// instances parallelise across cores well above this).
-			start := time.Now()
-			for i := 0; i < throughputRunN; i++ {
-				if _, err := svc.Check(ctx, q); err != nil {
-					t.Fatalf("Check: %v", err)
-				}
-			}
-			elapsed := time.Since(start)
-			tput := float64(throughputRunN) / elapsed.Seconds()
-			t.Logf("%s: throughput = %.0f checks/sec (floor %.0f)", name, tput, throughputMin)
-			if tput < throughputMin {
-				t.Errorf("%s: throughput %.0f checks/sec is below NFR floor %.0f", name, tput, throughputMin)
-			}
+			assertCheckNFR(t, svc, toQuery(m.req), name, fullSamples)
 		})
+	}
+}
+
+// NFR thresholds, shared by TestCheckNFR and the collection variants in
+// collection_test.go so both halves of the gate assert the SAME targets.
+const (
+	p99Ceiling    = time.Millisecond // the FR-31 target; actuals run far under it
+	throughputMin = 10_000.0         // checks/sec/instance
+)
+
+// nfrSamples is how many Checks a gate run measures over. The thresholds above
+// are rates and are unaffected by the sample count, so the collection variants
+// can use a smaller sample without weakening the assertion — they only need it
+// because the gate multiplies out over ten variant/audit combinations and the
+// cap-sized array is an order of magnitude slower per Check.
+type nfrSamples struct{ p99, throughput int }
+
+var (
+	fullSamples    = nfrSamples{p99: 100_000, throughput: 200_000}
+	variantSamples = nfrSamples{p99: 20_000, throughput: 20_000}
+)
+
+// assertCheckNFR is the hard gate's body: warm the query, assert p99 < 1ms over
+// n.p99 cached Checks, then assert sustained single-goroutine throughput clears
+// the floor. label names the case in the failure and log lines.
+func assertCheckNFR(t *testing.T, svc *service.Service, q service.Query, label string, n nfrSamples) {
+	t.Helper()
+	warm(t, svc, q, true)
+	ctx := context.Background()
+
+	p99 := measureP99(ctx, svc, q, n.p99)
+	t.Logf("%s: p99 cached Check = %v (ceiling %v)", label, p99, p99Ceiling)
+	if p99 >= p99Ceiling {
+		t.Errorf("%s: p99 cached Check %v exceeds NFR ceiling %v", label, p99, p99Ceiling)
+	}
+
+	// Sustained throughput, single goroutine (a conservative floor; real
+	// instances parallelise across cores well above this).
+	start := time.Now()
+	for i := 0; i < n.throughput; i++ {
+		if _, err := svc.Check(ctx, q); err != nil {
+			t.Fatalf("%s: Check: %v", label, err)
+		}
+	}
+	elapsed := time.Since(start)
+	tput := float64(n.throughput) / elapsed.Seconds()
+	t.Logf("%s: throughput = %.0f checks/sec (floor %.0f)", label, tput, throughputMin)
+	if tput < throughputMin {
+		t.Errorf("%s: throughput %.0f checks/sec is below NFR floor %.0f", label, tput, throughputMin)
 	}
 }

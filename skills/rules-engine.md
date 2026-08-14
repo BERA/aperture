@@ -263,6 +263,29 @@ render identically share one compiled program, and per-`Check` cost is bounded
 read from an injected `Clock` (`WithCacheTTL` / `WithClock`); `CacheStats`
 exposes hit/miss/eviction counters.
 
+What the cache removes is the **expr-lang compile**, not the AST walk: `Selected`
+calls `Engine.Compile` per evaluation, and `Compile` re-validates, re-renders, and
+re-hashes the AST before it can probe the cache by hash. That walk is therefore on
+every decision, and its cost scales with node count — measured at ~2.2 µs / 19
+allocs for a 3-node rule and ~14 allocs per **literal** node beyond it, because
+`Validate` decodes each literal's JSON afresh.
+
+## What a rule costs a `Check`
+
+Measured in `bench/` (Apple M1 Max); see [benchmarks](../docs/benchmarks.md) for
+the fixture, the full tables, and the two findings.
+
+| Shape | Per-evaluation cost | Notes |
+|---|---|---|
+| scalar comparison | ~149 ns, 3 allocs | the control |
+| list-literal collection (`in [...]`) | ~167 ns, 3 allocs | the render E5-S1 leaves native — the operator itself is free |
+| nested read (`object?.owner?.dept`) | ~210 ns, 4 allocs | optional chaining is render-time only |
+| collection over a **variable** (guarded `$op`) | ~12 ns and ~16.9 B **per element** | linear in the array; ~530 ns over 12 elements, ~78 µs over 7 281 |
+
+The per-element term is the one to design around: a rule reading a large array
+puts an O(n) traversal on the decision hot path, and the array's maximum length is
+set by `provider.ValueLimits.MaxBytes` (see the `metadata-values` skill).
+
 ## Wiring
 
 ```go
