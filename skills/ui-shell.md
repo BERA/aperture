@@ -45,10 +45,63 @@ node build: the whole frontend is pre-built, committed blobs behind `//go:embed`
   canvas via `Simulate` / `SimulateExplain` with the edited rule as an overlay
   (persists nothing); `vendor/` holds the pre-built blobs (see `vendor/README.md`
   for pinned versions + regeneration).
+- `js/rules-serializer.js` is the pure, DOM-free, dependency-free bridge under
+  `js/rules.js`: `astToGraph` / `graphToAST` are lossless inverses over the exact
+  `rules.Node` JSON shape, plus `validateAST`, a client-side mirror of the Go
+  validator. It is unit-testable under plain `node` — see below.
 - Served by `staticHandler()`, mounted **LAST** on the mux in `server.New`
   (`mux.Handle("/", …)`). net/http resolves by longest matching pattern, so the
   Twirp prefix, `POST /check`, and `GET /healthz` win over root `/` — the file
   server never shadows the API. Guarded by `internal/server/static_test.go`.
+
+## The rule serializer contract (`js/rules-serializer.js`)
+
+The rule editor has **no** rule format of its own. `js/rules-serializer.js`
+carries a hand-maintained JS mirror of `rules/ast.go`, and the two must move
+together:
+
+| JS (`rules-serializer.js`) | Go (`rules/ast.go`) |
+|---|---|
+| `TYPES` | `NodeType` consts |
+| `OP_SPECS` / `OPS` (derived) | `opSpecs` / `Op*` consts |
+| `RIGHT` | `rightShape` |
+| `ROOTS` | `allowedRoots` |
+| `BLOCKED_CALLS` | `blockedCallNames` |
+| `VAR_PATH` | `varPath` |
+| `validateAST` | `(*Node).Validate` |
+
+`OP_SPECS` is the single registry both directions and the validator read, so a
+new operator is one entry, never a scattered conditional. It records each
+operator's **right-operand shape** — `any` (the scalar comparisons), `collection`
+(a `list` or a `var`: `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf`),
+`element` (anything but a `list`: `has` `hasKey`), or `none` (the unary
+`isEmpty` `isNotEmpty` `exists`). `validateAST` enforces exactly those rules and
+reports the Go validator's own codes and message wording, so a rule the canvas
+refuses is refused for the same stated reason server-side.
+
+**The unary operators carry no `right` key at all.** Neither direction may emit
+one — `graphToAST` omits it (never `right: null`), `astToGraph` wires no `right`
+pin (`inputKeys("compare", arity, op)` drops it), and a `right` supplied anyway
+is an `APERTURE_RULE_INVALID` error rather than something silently dropped.
+Emitting the key would break the byte-identical round-trip the AST guarantees.
+
+Client-side validation is **shape only**, never types: operand types, function
+arity, and signatures are the compiler's job and stay server-side behind
+`ValidateRule`. An unknown function NAME is likewise not rejected — a host may
+register more — but expr's predicate builtins (`BLOCKED_CALLS`) are, because the
+server denies them structurally.
+
+Run the round-trip test with plain node, no dependencies and no build step:
+
+```
+node internal/server/static/js/rules-serializer.test.js   # exit 0 = pass
+```
+
+**CI is node-free, so that test never runs in the pipeline.**
+`rules/editor_contract_test.go` is the CI-guarded half of the same invariant: it
+parses the identical AST JSON strings through `rules.Node` and asserts each is
+valid and byte-stable. A new operator lands in `OP_SPECS`, in the JS test, **and**
+in that Go contract test, or the two sides drift silently.
 
 ## Auth wiring (external credentials, never issued here)
 
@@ -84,5 +137,7 @@ The shell obeys `.planning/access-control/research/design-system.md`:
 
 A change to the embedded shell's public surface — the static routes it exposes
 (`/`, `/css/*`, `/js/*`, `/vendor/*`), the `apiFetch` bearer convention, the nav
-skeleton, or a rule above — updates this doc in the **same PR**. The gate in
+skeleton, the `rules-serializer.js` mirror of `rules/ast.go` (operators, operand
+shapes, blocked calls, validation wording), or a rule above — updates this doc in
+the **same PR**. The gate in
 `skills/skills_test.go` fails the build if this doc loses its frontmatter.
