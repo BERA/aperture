@@ -80,6 +80,14 @@ const (
 	// already carry an APERTURE_* code (e.g. APERTURE_NOT_FOUND for an
 	// absent object) pass through unwrapped instead.
 	APERTURE_PROVIDER_FETCH Code = "APERTURE_PROVIDER_FETCH"
+	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
+	// metadata value model: a value that is neither a scalar, a []any of
+	// scalars, nor a map[string]any one level deeper; an array holding an object
+	// or another array; a value nesting past the depth cap; or a value over the
+	// per-value size cap. Raised by the loader (CSV, seed, a database provider)
+	// at LOAD time, so a shape the expression evaluator cannot handle never
+	// reaches a Check.
+	APERTURE_METADATA_INVALID Code = "APERTURE_METADATA_INVALID"
 	// APERTURE_RULE_INVALID — a rule AST is structurally malformed: an unknown
 	// node type, a logical node with the wrong child count, a comparison missing
 	// an operand, an empty/ill-typed literal, or a variable reference whose path
@@ -280,6 +288,15 @@ var Registry = map[Code]Metadata{
 			"Return APERTURE_NOT_FOUND from the provider for an object that does not exist.",
 		},
 	},
+	APERTURE_METADATA_INVALID: {
+		Message: "object metadata violates the metadata value model",
+		Fixups: []string{
+			"Make each field a scalar, a []any of scalars, or a map[string]any whose values are scalars, scalar arrays, or one further object level.",
+			"Replace an array of objects with a scalar array (e.g. a list of ids) — arrays of objects are rejected at any position.",
+			"Flatten a value that nests past the depth cap, or raise provider.ValueLimits.MaxDepth for the loader.",
+			"Shorten a value over the per-value size cap, or raise provider.ValueLimits.MaxBytes for the loader.",
+		},
+	},
 	APERTURE_RULE_INVALID: {
 		Message: "rule AST is malformed",
 		Fixups: []string{
@@ -402,6 +419,7 @@ var AllCodes = []Code{
 	APERTURE_PROVIDER_INVALID,
 	APERTURE_PROVIDER_UNREGISTERED,
 	APERTURE_PROVIDER_FETCH,
+	APERTURE_METADATA_INVALID,
 	APERTURE_RULE_INVALID,
 	APERTURE_RULE_UNKNOWN_VARIABLE,
 	APERTURE_RULE_TYPE_ERROR,

@@ -24,11 +24,25 @@
 //
 // Metadata is host-defined and map-like (Metadata = map[string]any), so the
 // rules engine can expose each field as an expression variable directly without
-// a translation layer. A cached Metadata value is treated as READ-ONLY by every
-// consumer: the cache stores the provider's map by reference and never copies it
-// on read (allocation-aware on the hot path), so mutating a returned map would
-// race other readers. Providers must therefore return a fresh map per object and
-// callers must not write to it.
+// a translation layer. Its VALUE SHAPE is not free-form, though: a field value
+// is a scalar, a []any of scalars, or a map[string]any whose values are scalars,
+// scalar arrays, or one further object level. See metadata.go for the model and
+// ValidateMetadata, the load-time entry point every loader calls.
+//
+// A cached Metadata value is treated as READ-ONLY by every consumer, and the
+// contract is TRANSITIVE. The cache stores the provider's map by reference and
+// never copies it on read (allocation-aware on the hot path), which means the
+// nested maps and slices inside that map are shared by reference too — reaching
+// through a returned Metadata to append to a []any or write a key into a nested
+// map[string]any races every other reader exactly as writing the top-level map
+// would. So:
+//
+//   - a provider returns a FRESH map per object, with fresh nested containers —
+//     it must not hand out a value it also retains and mutates, and reloading a
+//     source builds a new value rather than editing the old one in place;
+//   - no holder — engine, rules, scope, CLI, server, host code — writes to a
+//     Metadata it was given, at ANY depth;
+//   - a consumer that needs to modify metadata copies it (deeply) first.
 //
 // Dependencies stay minimal: provider imports only identity and errors, never
 // scope/engine/model, so it remains a leaf those layers adapt to.
@@ -42,8 +56,12 @@ import (
 
 // Metadata is a host-defined, map-like bag of an object's attributes. It is an
 // alias for map[string]any so the rules engine (E2-S3) can read fields straight
-// into its expression environment with no conversion. A Metadata value handed
-// back by the cache is read-only; see the package doc.
+// into its expression environment with no conversion — keep it an alias.
+//
+// Legal field values are constrained by the shared value model (metadata.go);
+// loaders enforce it with ValidateMetadata. A Metadata value handed back by the
+// cache is read-only, transitively down through its nested containers; see the
+// package doc.
 type Metadata = map[string]any
 
 // Object pairs an object's identity with its metadata. Providers return Objects
