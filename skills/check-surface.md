@@ -8,9 +8,17 @@ applies_to: [cli, http]
 
 Aperture's first demoable slice exposes the engine's single decision — "may
 this principal take this action on this object?" — through two thin surfaces.
-Both translate to exactly one call into the `service` facade
-(`service.New(engine.New(store)).Check`), so the fail-closed decision policy
-lives in one place and never drifts between surfaces.
+Both translate to exactly one call into the `service` facade (`Service.Check`),
+so the fail-closed decision policy lives in one place and never drifts between
+surfaces.
+
+The facade is only half of "never drifts": both surfaces must also be built over
+the **same engine**. `internal/cli`'s `buildDecisionStack` is that single
+assembly — object providers, the rules engine over the storage-backed rule
+source, and scope resolution — and `check`, `enumerate`, `identifiers`, `explain`
+and `serve` all go through it. A command that builds a bare
+`service.New(engine.New(store))` instead has no rule evaluator, so every
+rule-backed permission fail-closed denies and the CLI contradicts the server.
 
 ## Service facade
 
@@ -27,12 +35,20 @@ returns a `service.Result` and renders engine errors fail-closed:
 
 The Twirp service in E4-S1 calls this same facade, inheriting the policy.
 
+**A rule-backed grant whose metadata is the wrong shape denies; it does not
+fail.** A collection operator applied to a non-collection evaluates to `false`
+rather than raising `APERTURE_RULE_EVAL`, so one mistyped field cannot break
+every `Check` that touches it. `Check` says only "deny" — the reason is recorded
+as an evaluation note and shown by `aperture explain` (see `decision-api`).
+
 ## CLI: `aperture check <principal> <action> <object>`
 
 Prints `allow` or `deny` plus the reason. Exit code reflects the decision:
 allow = 0, deny = non-zero, so checks compose in shell pipelines. Flags:
 
 - `--seed <file>` — JSON/YAML model to load (defaults to the embedded example).
+  The file is also the source of the `providers:` / `objects:` object-metadata
+  wiring, which rules and scope enumeration read.
 - `--store <dsn>` — sqlite DSN (defaults to in-memory).
 - `--account <id>` — active account (defaults to the example's `acme`).
 

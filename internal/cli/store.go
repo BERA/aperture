@@ -61,9 +61,10 @@ func loadSeed(ctx context.Context, store model.Storage, seedPath string) error {
 }
 
 // seedDocument parses the seed model (the --seed file, or the embedded example
-// when empty) into a Document so serve can read sections Apply does not write to
-// storage — notably the providers wiring that BuildRegistry turns into a live
-// registry. It mirrors loadSeed's file-vs-embedded choice.
+// when empty) into a Document so a command can read the sections Apply does not
+// write to storage — the two object-source wiring sections, `providers:` and
+// `objects:`, which BuildRegistry turns into one live registry. It mirrors
+// loadSeed's file-vs-embedded choice.
 func seedDocument(seedPath string) (*seed.Document, error) {
 	if seedPath == "" {
 		doc, err := seed.Parse(seed.Example, seed.FormatYAML)

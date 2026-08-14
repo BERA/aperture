@@ -8,6 +8,7 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
+	"github.com/expr-lang/expr/vm/runtime"
 
 	aerr "github.com/frankbardon/aperture/errors"
 )
@@ -20,12 +21,22 @@ import (
 // action is typed string so misusing it (action.foo) is a type error.
 //
 // The expr struct tags fix the identifier each field is exposed under.
+// Notes is the per-evaluation notes sink the guarded dispatcher writes to. It is
+// exposed under an identifier no rule can reference (allowedRoots does not list
+// it), so it is reachable only from the expression the renderer emits. It may be
+// nil — the decision hot path leaves it unset, and every NoteCollector method is
+// nil-safe.
 type evalEnv struct {
 	Object    map[string]any `expr:"object"`
 	Principal map[string]any `expr:"principal"`
 	Account   map[string]any `expr:"account"`
 	Action    string         `expr:"action"`
+	Notes     *NoteCollector `expr:"__notes"`
 }
+
+// notesVar is the identifier evalEnv.Notes is exposed under, and the name
+// renderGuarded passes to the dispatcher.
+const notesVar = "__notes"
 
 // Input is the per-evaluation context a compiled rule reads. Object is the
 // object's metadata snapshot (treated read-only — never mutated), Principal and
@@ -38,10 +49,17 @@ type Input struct {
 	Action    string
 }
 
-// env converts the public Input to the tagged evaluation environment. The two
-// structs share field layout (Input carries no expr tags), so a direct
-// conversion suffices.
-func (in Input) env() evalEnv { return evalEnv(in) }
+// env builds the tagged evaluation environment from the public Input, binding the
+// per-evaluation notes sink (nil on the decision hot path).
+func (in Input) env(notes *NoteCollector) evalEnv {
+	return evalEnv{
+		Object:    in.Object,
+		Principal: in.Principal,
+		Account:   in.Account,
+		Action:    in.Action,
+		Notes:     notes,
+	}
+}
 
 // Compiled is a rule compiled to a reusable program. It is immutable and safe for
 // concurrent evaluation, and carries the canonical source + hash the cache keys
@@ -61,10 +79,31 @@ func (c *Compiled) Hash() string { return c.hash }
 // Eval runs the compiled rule against in and returns its boolean result.
 // Evaluation is pure: it reads only in, mutates nothing, and exposes no
 // nondeterministic function. A runtime failure or a non-boolean result is an
-// APERTURE_RULE_EVAL coded error. The context is accepted for symmetry with the
-// engine seam; expression evaluation itself does not block on it.
-func (c *Compiled) Eval(_ context.Context, in Input) (bool, error) {
-	out, err := expr.Run(c.program, in.env())
+// APERTURE_RULE_EVAL coded error.
+//
+// The context carries the evaluation-notes collector (notes.go). When one is
+// installed — Explain does that; Check and Enumerate do not — any diagnostic the
+// evaluation records is published to it. Without one, nothing is recorded and
+// nothing is allocated. Notes never influence the result.
+func (c *Compiled) Eval(ctx context.Context, in Input) (bool, error) {
+	return c.eval(in, NoteCollectorFrom(ctx))
+}
+
+// EvalWithNotes runs the compiled rule and RETURNS the notes the evaluation
+// recorded instead of publishing them to the context's collector. It is the
+// direct-library entry point (and what the Engine uses so it can stamp each note
+// with the rule reference before publishing). The context is accepted for
+// symmetry with Eval; expression evaluation itself does not block on it.
+func (c *Compiled) EvalWithNotes(_ context.Context, in Input) (bool, []Note, error) {
+	sink := &NoteCollector{}
+	b, err := c.eval(in, sink)
+	return b, sink.Notes(), err
+}
+
+// eval is the single evaluation body. notes may be nil, which is the hot path:
+// the guarded dispatcher then records nothing and behaves identically.
+func (c *Compiled) eval(in Input, notes *NoteCollector) (bool, error) {
+	out, err := expr.Run(c.program, in.env(notes))
 	if err != nil {
 		return false, aerr.Wrapf(aerr.APERTURE_RULE_EVAL, err,
 			"rule: evaluation failed for %q", c.source)
@@ -102,10 +141,11 @@ func Function(name string, fn func(args ...any) (any, error)) CompilerOption {
 }
 
 // NewCompiler builds a Compiler. By default the only callable functions are the
-// curated pure set (lower, upper, contains, startsWith, endsWith, len); all of
-// expr-lang's builtins are disabled, so no wall-clock or random function is
-// reachable and evaluation stays deterministic. Host functions added with
-// Function join that set.
+// curated pure set (lower, upper, contains, startsWith, endsWith, len, plus the
+// collection-operator backings hasAll, hasAny, hasNone, subsetOf, isEmpty,
+// isNotEmpty); all of expr-lang's builtins are disabled, so no wall-clock or
+// random function is reachable and evaluation stays deterministic. Host functions
+// added with Function join that set.
 func NewCompiler(opts ...CompilerOption) *Compiler {
 	c := &Compiler{}
 	// The typed env, a required boolean result, and a disabled builtin library
@@ -167,9 +207,33 @@ func hashSource(src string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Names of the backing functions the collection operators render to. They are
+// constants rather than string literals so opSpecs (ast.go) and defaultFunctions
+// (below) cannot drift apart.
+const (
+	fnHasAll     = "hasAll"
+	fnHasAny     = "hasAny"
+	fnHasNone    = "hasNone"
+	fnSubsetOf   = "subsetOf"
+	fnIsEmpty    = "isEmpty"
+	fnIsNotEmpty = "isNotEmpty"
+
+	// fnCollectionOp is the guarded dispatcher every shape-sensitive collection
+	// comparison renders to (renderGuarded). The '$' is load-bearing: varPath
+	// rejects it, so no NodeCall can name this function — the guard is
+	// structurally compiler-only rather than denylisted.
+	fnCollectionOp = "$op"
+)
+
 // defaultFunctions is the curated pure function set every Compiler exposes. They
 // are deterministic and side-effect-free, the safe baseline a rule can rely on
 // regardless of host configuration.
+//
+// The last six back the collection operators that have no native expr spelling
+// under DisableAllBuiltins (see opSpecs in ast.go). Each declares an explicit
+// signature so the type-checker knows it returns a bool — that is what lets a
+// bare `isEmpty(object.tags)` satisfy expr.AsBool as a whole rule. All six read
+// their arguments and nothing else: no state, no clock, no I/O.
 func defaultFunctions() []expr.Option {
 	return []expr.Option{
 		expr.Function("lower", func(args ...any) (any, error) {
@@ -207,7 +271,84 @@ func defaultFunctions() []expr.Option {
 				return 0, nil
 			}
 		}),
+
+		// hasAll(coll, items): every element of items is in coll.
+		binaryCollectionFunc(fnHasAll, OpHasAll),
+		// hasAny(coll, items): at least one element of items is in coll.
+		binaryCollectionFunc(fnHasAny, OpHasAny),
+		// hasNone(coll, items): no element of items is in coll. An absent coll
+		// reads as empty, so this is TRUE for an object missing the field — the
+		// same "negative operator grants on missing data" shape as `nin`.
+		binaryCollectionFunc(fnHasNone, OpHasNone),
+		// subsetOf(coll, super): every element of coll is in super. An absent
+		// coll reads as empty, and the empty set is a subset of everything, so
+		// this is TRUE for an object missing the field.
+		binaryCollectionFunc(fnSubsetOf, OpSubsetOf),
+		// isEmpty(v): v is absent, an empty array, an empty object, or an empty
+		// string.
+		unaryCollectionFunc(fnIsEmpty, OpIsEmpty),
+		// isNotEmpty(v): the exact negation of isEmpty, registered separately so
+		// the rendered expression stays a single atomic call.
+		unaryCollectionFunc(fnIsNotEmpty, OpIsNotEmpty),
+
+		// $op is the guarded dispatcher (renderGuarded). Its arguments are the
+		// operator, the notes sink read out of the environment, and each
+		// operand's path + value. It applies the deny-safe shape policy, so a
+		// wrong-shaped operand yields false and a note rather than an error.
+		expr.Function(fnCollectionOp, func(args ...any) (any, error) {
+			if len(args) != 6 {
+				return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+					"rule: guarded collection operator takes exactly six operands",
+					map[string]any{"args": len(args)})
+			}
+			op, _ := args[0].(string)
+			sink, _ := args[1].(*NoteCollector)
+			leftPath, _ := args[2].(string)
+			rightPath, _ := args[4].(string)
+			return evalCollectionOp(op, sink, leftPath, args[3], rightPath, args[5]), nil
+		}, new(func(string, any, string, any, string, any) bool)),
 	}
+}
+
+// binaryCollectionFunc registers a binary collection operator's backing function.
+// A rule reaches it only when neither operand can be the wrong shape (see
+// guardNeeded) or when an author calls it directly with a NodeCall, so it carries
+// no notes sink — but it applies the same policy through evalCollectionOp, so a
+// direct call to hasAll over a string is false, never an error.
+func binaryCollectionFunc(name, op string) expr.Option {
+	return expr.Function(name, func(args ...any) (any, error) {
+		if len(args) != 2 {
+			return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+				"rule: collection operator takes exactly two operands",
+				map[string]any{"op": op, "args": len(args)})
+		}
+		return evalCollectionOp(op, nil, "", args[0], "", args[1]), nil
+	}, new(func(any, any) bool))
+}
+
+// unaryCollectionFunc is binaryCollectionFunc's one-operand twin (isEmpty /
+// isNotEmpty).
+func unaryCollectionFunc(name, op string) expr.Option {
+	return expr.Function(name, func(args ...any) (any, error) {
+		if len(args) != 1 {
+			return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+				"rule: unary collection operator takes exactly one operand",
+				map[string]any{"op": op, "args": len(args)})
+		}
+		return evalCollectionOp(op, nil, "", args[0], "", nil), nil
+	}, new(func(any) bool))
+}
+
+// containsValue reports whether coll holds v, using expr-lang's own equality so
+// element matching is identical to the native `in` operator `has` renders to —
+// including its numeric cross-type handling and its refusal to coerce "1" to 1.
+func containsValue(coll []any, v any) bool {
+	for _, e := range coll {
+		if runtime.Equal(e, v) {
+			return true
+		}
+	}
+	return false
 }
 
 func argString(args []any) string {

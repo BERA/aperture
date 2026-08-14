@@ -1872,9 +1872,58 @@
                           <strong x-text="previewResult ? 'true (selected)' : 'false (not selected)'"
                                   :style="previewResult ? 'color: var(--color-success, var(--neutral-700))' : 'color: var(--color-danger, var(--neutral-700))'"></strong>
                         </p>
+                        <!-- The metadata snapshot the rule actually saw, as a
+                             field list. Array values expand to one chip per
+                             element and object values to indented member rows
+                             (the value model caps nesting at 2, so a member row
+                             is as deep as it goes). A field NOT listed here was
+                             absent from the object — distinct from an empty list
+                             ([]) or an empty object ({}), which do get a row.
+                             Strictly read-only: no input, and no request path by
+                             which the client could supply metadata. -->
                         <template x-if="previewObject">
-                          <p class="a-caption a-mono" style="margin: 4px 0 0; word-break: break-all"
-                             x-text="'object = ' + JSON.stringify(previewObject)"></p>
+                          <div style="margin-top: 8px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-2); padding: 8px; max-height: 240px; overflow: auto">
+                            <p class="a-label" style="margin-bottom: 6px">Object metadata the rule saw</p>
+                            <template x-if="previewRows.length === 0">
+                              <p class="a-caption" style="margin: 0">This object carries no metadata fields.</p>
+                            </template>
+                            <template x-for="r in previewRows" :key="r.key">
+                              <div :style="'padding-left: ' + (r.depth * 14) + 'px'">
+                                <div style="display: flex; align-items: baseline; gap: 8px; padding: 2px 0">
+                                  <span class="a-caption a-mono" style="flex: none; color: var(--color-fg)" x-text="r.label"></span>
+                                  <span class="a-caption" style="flex: none">=</span>
+                                  <div style="flex: 1; min-width: 0">
+                                    <!-- Scalar: unchanged rendering — the JSON form, so a
+                                         string keeps its quotes. -->
+                                    <template x-if="r.kind === 'scalar'">
+                                      <span class="a-caption a-mono" style="display: block; overflow-x: auto; white-space: pre; color: var(--color-fg)"
+                                            x-text="r.text"></span>
+                                    </template>
+                                    <!-- Non-empty array: one chip per element, wrapping so a
+                                         long list grows downward inside the panel. -->
+                                    <template x-if="r.kind === 'array' && r.items.length > 0">
+                                      <span style="display: flex; flex-wrap: wrap; gap: 4px">
+                                        <template x-for="(item, i) in r.items" :key="i">
+                                          <span class="a-badge a-mono" style="max-width: 100%; overflow-x: auto; white-space: pre" x-text="item"></span>
+                                        </template>
+                                      </span>
+                                    </template>
+                                    <!-- Empty array / object header: the literal [] or {} (or
+                                         {…} when members follow below). -->
+                                    <template x-if="r.kind === 'object' || (r.kind === 'array' && r.items.length === 0)">
+                                      <span class="a-caption a-mono" style="color: var(--color-fg)" x-text="r.text"></span>
+                                    </template>
+                                  </div>
+                                  <span class="a-caption" style="flex: none" x-text="r.note"></span>
+                                </div>
+                              </div>
+                            </template>
+                            <details style="margin-top: 8px">
+                              <summary class="a-caption" style="cursor: pointer">Raw JSON</summary>
+                              <pre class="a-caption a-mono" style="margin: 4px 0 0; overflow-x: auto"
+                                   x-text="JSON.stringify(previewObject, null, 2)"></pre>
+                            </details>
+                          </div>
                         </template>
                       </div>
                     </template>

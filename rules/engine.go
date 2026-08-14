@@ -163,7 +163,25 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 		Account:   map[string]any{},
 		Action:    action,
 	}
-	return compiled.Eval(ctx, in)
+
+	// Fast path: no collector installed (Check, Enumerate), so evaluation records
+	// nothing and allocates nothing extra.
+	sink := NoteCollectorFrom(ctx)
+	if sink == nil {
+		return compiled.Eval(ctx, in)
+	}
+	// Explain installed a collector. Evaluate into a local sink so each note can
+	// be stamped with the rule reference that produced it before it is published
+	// — the collector spans every grant in the trace, so the reference is what
+	// tells two rules' notes apart.
+	local := &NoteCollector{}
+	selected, err := compiled.eval(in, local)
+	notes := local.Notes()
+	for i := range notes {
+		notes[i].Rule = rule
+	}
+	sink.Add(notes...)
+	return selected, err
 }
 
 // Compile validates, compiles, and caches an AST, returning the reusable program.

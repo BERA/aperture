@@ -56,8 +56,14 @@ const (
 // loads unchanged, and an export reloads through the very same Apply path. The
 // field set is additive-only so old seeds keep loading. Slices are emitted in a
 // stable order (sorted by id/name) so a round-trip is byte-stable and
-// human-diffable. Live host domain-object metadata is deliberately NOT part of
-// this shape — that is the provider cache, never source of truth.
+// human-diffable.
+//
+// Two sections are runtime WIRING rather than model state, and are the seed
+// FILE's own source of truth: Providers and Objects. BuildRegistry turns them
+// into a live *provider.Registry; Apply writes neither to storage, and because
+// Export reads the model back OUT of storage, neither is ever reproduced by an
+// export. Live host domain-object metadata is deliberately not exportable state —
+// that is the provider cache, derived and disposable, never source of truth.
 type Document struct {
 	Accounts    []Account    `yaml:"accounts" json:"accounts"`
 	Memberships []Membership `yaml:"memberships" json:"memberships"`
@@ -70,6 +76,7 @@ type Document struct {
 	Templates   []Template   `yaml:"templates" json:"templates"`
 	Rules       []Rule       `yaml:"rules" json:"rules"`
 	Providers   []Provider   `yaml:"providers,omitempty" json:"providers,omitempty"`
+	Objects     []Object     `yaml:"objects,omitempty" json:"objects,omitempty"`
 }
 
 // Account mirrors model.Account in declarative form.

@@ -48,19 +48,87 @@ func ParseFile(path string) (*Document, error) {
 	return Parse(data, formatFor(path))
 }
 
-// BuildRegistry constructs a live *provider.Registry from the document's
-// providers section. Relative file paths are resolved against baseDir (typically
-// the seed file's directory; pass "" to resolve against the process CWD). It
-// always returns a usable registry — empty when no providers are declared — so a
-// caller can wire it unconditionally. A malformed entry (missing object_type,
-// unknown kind, missing path, unparseable ttl, or a duplicate object_type) is an
-// APERTURE_CONFIG_INVALID / APERTURE_PROVIDER_INVALID coded error.
-func (d *Document) BuildRegistry(baseDir string) (*provider.Registry, error) {
+// BuildOption tunes how BuildRegistry resolves the document's two wiring
+// sections. It is Go-level wiring on purpose: the seed FILE stays a plain
+// declaration of what exists, and the decision to make an ambiguous one fatal is
+// taken by the host that builds the registry, where a reviewer sees it.
+type BuildOption func(*buildConfig)
+
+// buildConfig is the resolved set of BuildOptions.
+type buildConfig struct {
+	// strictProviderCollision refuses to build a document whose two wiring
+	// sections claim the same object type, instead of applying the default
+	// type-level precedence rule. See StrictProviderCollision.
+	strictProviderCollision bool
+}
+
+// StrictProviderCollision refuses to build a document that declares an object
+// type in BOTH the providers: and objects: sections, failing with
+// APERTURE_CONFIG_INVALID naming the colliding type(s), instead of applying the
+// default precedence rule.
+//
+// The rule it replaces is the DEFAULT, and it is TOTAL and TYPE-LEVEL: the
+// file-backed providers: entry wins, and EVERY inline objects: entry for that
+// type is discarded. There is no object-level merge, no field-level merge, and
+// no fallback — an inline id the file happens to lack is simply not resolvable,
+// exactly as if the entry had never been written. Field-level merging is the
+// most useful-sounding behaviour and the most impossible to debug: a rule
+// reading a field the CSV silently did not override is a support ticket nobody
+// can reproduce. Predictability wins.
+//
+// The discard is the default because adding a CSV for a type that also has
+// inline entries is a normal migration step, not a fault: a seed that booted
+// yesterday must not refuse to boot today because someone added a providers:
+// row. This option is for the host that would rather read the overlap as an
+// authoring mistake — a checked-in seed nobody is mid-migration on — and wants
+// the build to stop instead.
+//
+// The default is not silent either: Document.ProviderCollisions reports exactly
+// which types the build discards, so a host with a logger can say so at load.
+//
+// Every inline entry is validated either way — a malformed declaration fails the
+// load whether or not its type is ultimately discarded.
+func StrictProviderCollision() BuildOption {
+	return func(c *buildConfig) { c.strictProviderCollision = true }
+}
+
+// BuildRegistry constructs a live *provider.Registry from the document's two
+// wiring sections: providers (a declared implementation per object-type) and
+// objects (metadata declared inline, served by an in-memory provider.Static per
+// object-type). Relative file paths are resolved against baseDir (typically the
+// seed file's directory; pass "" to resolve against the process CWD). It always
+// returns a usable registry — empty when neither section is declared — so a
+// caller can wire it unconditionally.
+//
+// A malformed providers entry (missing object_type, unknown kind, missing path,
+// unparseable ttl, or a duplicate object_type) and a malformed objects entry
+// (missing id, a duplicate id, metadata that is not a mapping, or a value the
+// shared value model rejects) are both APERTURE_CONFIG_INVALID; a malformed id
+// passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice by two
+// providers entries is APERTURE_PROVIDER_INVALID.
+//
+// A type claimed by BOTH sections is not an error: the providers: entry wins and
+// every inline entry for that type is discarded entirely. The discarded types
+// are reported by Document.ProviderCollisions, and StrictProviderCollision turns
+// the collision back into an APERTURE_CONFIG_INVALID for hosts that want one.
+//
+// Neither section touches storage: Apply writes no row for either, and an export
+// reproduces neither.
+func (d *Document) BuildRegistry(baseDir string, opts ...BuildOption) (*provider.Registry, error) {
+	var cfg buildConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	reg := provider.NewRegistry()
+	// providers: is registered FIRST so the objects: section can see which types
+	// are already file-backed. That ordering IS the precedence rule.
 	for _, p := range d.Providers {
 		if err := registerProvider(reg, p, baseDir); err != nil {
 			return nil, err
 		}
+	}
+	if err := d.registerObjects(reg, cfg); err != nil {
+		return nil, err
 	}
 	return reg, nil
 }

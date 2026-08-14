@@ -18,7 +18,6 @@ import (
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/impersonation"
 	"github.com/frankbardon/aperture/internal/server"
-	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/service"
 
 	ucli "github.com/urfave/cli/v3"
@@ -87,51 +86,24 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 		return aerr.Wrap(aerr.APERTURE_BOOT, "cli: building the authenticator failed", err)
 	}
 
-	// Build the fully-wired facade so HTTP, Twirp, and CLI drive ONE mutation
-	// path: the engine for decisions + authority, the admin gate for tier checks,
-	// and the delegation / impersonation services for their own gated mutations.
-	//
-	// Wire the rules engine (E2-S3) over a storage-backed rule source so
-	// rule-backed scope strategies (E2-S1) resolve the SAME rules the node editor
-	// (E7) saves through PutRule — a saved rule takes effect on the next decision
-	// with no second rule store. Scope resolution falls back to literal pattern
-	// matching for grants with no strategy, so E1 behaviour is preserved. The
-	// storage source is also handed to the facade (WithRuleSource) so the editor's
-	// live what-if can preview an UNSAVED rule read-only.
-	// Build the object-metadata providers declared in the seed's `providers:`
-	// section (E-provider): each entry links an object-type to a real data source
-	// (a CSV file today, a database later) with no Go wiring. The same *Registry
-	// feeds BOTH the rules engine's metadata fetcher (so a rule can read
-	// object.category_id) AND the scope resolver's object lister (so implicit /
-	// exclusive scopes can enumerate a type's objects). When no providers are
-	// declared, both stay nil and the server behaves exactly as before.
-	providerDoc, err := seedDocument(cmd.String("seed"))
+	// Build the shared decision stack — object providers, the rules engine over a
+	// storage-backed rule source, and scope resolution — through the SAME builder
+	// `check` / `enumerate` / `identifiers` / `explain` use, so no surface can
+	// answer a question differently from another (see decision.go).
+	var engOpts []engine.Option
+	if cmd.Bool("enforce-membership") {
+		// Defence-in-depth, and serve-specific: a non-member of the active account
+		// is denied before any grant is read, which is what lets a single shared
+		// role (manager, analyst, ...) be reused across customer accounts without
+		// one customer's account-scoped grants leaking to another customer's
+		// members.
+		engOpts = append(engOpts, engine.WithMembershipEnforcement())
+	}
+	stack, err := buildDecisionStack(store, cmd.String("seed"), engOpts...)
 	if err != nil {
 		return err
 	}
-	reg, err := providerDoc.BuildRegistry(seedBaseDir(cmd.String("seed")))
-	if err != nil {
-		return aerr.Wrap(aerr.APERTURE_BOOT, "cli: building object providers failed", err)
-	}
-	var fetcher rules.MetadataFetcher // nil => empty object metadata (unchanged default)
-	scopeDeps := engine.ScopeDeps{}
-	if len(providerDoc.Providers) > 0 {
-		fetcher = lenientFetcher{reg: reg}
-		scopeDeps.Lister = reg
-	}
-
-	ruleSource := service.NewStorageRuleSource(store)
-	ruleEngine := rules.NewEngine(ruleSource, fetcher)
-	scopeDeps.Rules = ruleEngine
-	engOpts := []engine.Option{engine.WithScopeResolution(nil, scopeDeps)}
-	if cmd.Bool("enforce-membership") {
-		// Defence-in-depth: a non-member of the active account is denied before any
-		// grant is read, which is what lets a single shared role (manager,
-		// analyst, ...) be reused across customer accounts without one customer's
-		// account-scoped grants leaking to another customer's members.
-		engOpts = append(engOpts, engine.WithMembershipEnforcement())
-	}
-	eng := engine.New(store, engOpts...)
+	stack.reportCollisions(cmd.ErrWriter)
 
 	// Wire the append-only audit trail (E4-S2) through the same store so the
 	// mutation/impersonation/delegation record is durable and the E6-S4 audit
@@ -141,14 +113,20 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 	rec := audit.New(store, audit.WithSampleRate(1))
 	defer func() { _ = rec.Close() }()
 
-	svc := service.New(eng,
+	// Build the fully-wired facade so HTTP, Twirp, and CLI drive ONE mutation
+	// path: the engine for decisions + authority, the admin gate for tier checks,
+	// and the delegation / impersonation services for their own gated mutations.
+	// These are the serve-only extras layered on top of the shared stack; the
+	// rule source is handed over as well so the editor's live what-if can preview
+	// an UNSAVED rule read-only (E7-S3).
+	eng := stack.eng
+	svc := stack.newService(
 		service.WithStorage(store),
 		service.WithGate(authz.NewGate(eng)),
 		service.WithDelegation(delegation.New(store, eng)),
 		service.WithImpersonation(impersonation.New(store, eng)),
 		service.WithAudit(rec),
-		service.WithRuleSource(ruleSource, fetcher),
-		service.WithProviders(reg),
+		service.WithRuleSource(stack.ruleSource, stack.fetcher),
 	)
 
 	handler := server.Authenticate(authn, server.New(svc))

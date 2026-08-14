@@ -19,7 +19,9 @@
  *   window.blueprintEditor.fromAST(ast)   -> Promise (render an AST into the graph)
  *   window.blueprintEditor.validate()     -> [{ code, message, path }]  (client-side)
  *   window.blueprintEditor.getGraph()     -> plain { nodes, connections }
- *   window.blueprintEditor.addNode(kind)  -> Promise (palette add)
+ *   window.blueprintEditor.addNode(kind, data?) -> Promise (palette add; `data`
+ *                                         seeds the node's controls, e.g.
+ *                                         { op: "hasAll" } for a comparison)
  *   window.blueprintEditor.clear()        -> Promise
  *   window.blueprintEditor.destroy()
  *   window.blueprintEditor.onChange = fn  (set by the host; fires on any edit)
@@ -28,6 +30,91 @@
  * client-side validate() is structural/AST-shape only (mirrors ast.go Validate);
  * full type-checking is the engine's and runs server-side.
  */
+
+/*
+ * ---- Operator spellings ----------------------------------------------------
+ *
+ * The AST stores an operator as its TOKEN (`hasAll`, `isNotEmpty`, …) — that is
+ * what `rules/ast.go` marshals and what the serializer's OP_SPECS is keyed by.
+ * Those tokens are terrible to read on a canvas, so the editor shows a readable
+ * SPELLING ("has all", "is not empty") everywhere an author sees an operator:
+ * the palette entry and the comparison node's own operator control. The spelling
+ * is presentation only — it is resolved back to the token the moment the graph
+ * is read (reteToGraph), so nothing downstream ever sees it.
+ *
+ * OP_LABELS is a spelling table, NOT a second operator list: membership and
+ * ORDER both come from the serializer's OP_SPECS (the mirror of Go's `opSpecs`),
+ * so an operator added there shows up in the editor with no edit here — labelled
+ * by its bare token until someone gives it a spelling. That is deliberate: the
+ * operator set is already written down twice (Go + the serializer) and a third
+ * hand-maintained copy is exactly how the three drift apart.
+ */
+const OP_LABELS = {
+  eq: "equals",
+  ne: "not equals",
+  lt: "less than",
+  le: "less or equal",
+  gt: "greater than",
+  ge: "greater or equal",
+  in: "in",
+  nin: "not in",
+  has: "has member",
+  hasAll: "has all",
+  hasAny: "has any",
+  hasNone: "has none",
+  subsetOf: "subset of",
+  hasKey: "has key",
+  isEmpty: "is empty",
+  isNotEmpty: "is not empty",
+  exists: "exists",
+};
+
+// opSpecs returns the serializer's operator registry, or an empty table when the
+// serializer has not loaded. Every reader below tolerates the empty case so a
+// missing script degrades to an editor without operator affordances rather than
+// a component that throws while Alpine is initialising it (mount() reports the
+// missing serializer properly).
+function opSpecs() {
+  const S = typeof window !== "undefined" ? window.RuleSerializer : null;
+  return (S && S.OP_SPECS) || {};
+}
+
+// opLabel renders an operator token as its readable spelling.
+function opLabel(op) {
+  const token = String(op === undefined || op === null ? "" : op);
+  return OP_LABELS[token] || token;
+}
+
+// opFromLabel is the inverse: it maps a readable spelling back to its AST token.
+// A raw token is accepted as-is (so a hand-typed `hasAll` still works), matching
+// is whitespace- and case-insensitive, and anything unrecognised is returned
+// VERBATIM so the validator reports "unknown comparison operator: <what you
+// typed>" rather than this silently substituting something plausible.
+function opFromLabel(text) {
+  const raw = String(text === undefined || text === null ? "" : text).trim();
+  const specs = opSpecs();
+  if (Object.prototype.hasOwnProperty.call(specs, raw)) return raw;
+  const norm = raw.toLowerCase().replace(/\s+/g, " ");
+  const tokens = Object.keys(specs);
+  for (let i = 0; i < tokens.length; i++) {
+    if (opLabel(tokens[i]).toLowerCase() === norm) return tokens[i];
+  }
+  return raw;
+}
+
+// opListSeq numbers the per-editor <datalist> so two mounted editors (the shell
+// re-creates the section on navigation) never share an element id.
+let opListSeq = 0;
+
+// operatorEntries lists every comparison operator once, in OP_SPECS order (which
+// is ast.go's Op* order: the scalar/membership operators, then the collection
+// ones). It is the single source both the palette and the node's operator
+// dropdown are built from.
+function operatorEntries() {
+  return Object.keys(opSpecs()).map(function (op) {
+    return { op: op, label: opLabel(op) };
+  });
+}
 
 // createBlueprintEditor mounts the Rete editor into `container` and returns the
 // blueprintEditor hook object. `mod` is the vendored Rete bundle namespace and
@@ -137,11 +224,17 @@ async function createBlueprintEditor(container, mod, S) {
     node.addOutput("out", new ClassicPreset.Output(socket, spec.out));
 
     if (kind === S.TYPES.COMPARE) {
+      // `node.op` is the resolved AST TOKEN; the control shows the readable
+      // spelling. Keeping the token on the node means the pin-shape logic never
+      // has to re-parse the control's text.
+      node.op = opFromLabel(d.op || "eq");
       node.addControl(
         "op",
         new ClassicPreset.InputControl("text", {
-          initial: d.op || "eq",
-          change: fireChange,
+          initial: opLabel(node.op),
+          change: function (v) {
+            onOpChange(node, v);
+          },
         })
       );
     }
@@ -173,12 +266,17 @@ async function createBlueprintEditor(container, mod, S) {
       );
     }
 
-    // Inputs.
+    // Inputs. A comparison's pins come from the serializer's inputKeys() rather
+    // than a hardcoded left/right pair: that is what makes the three unary
+    // operators (isEmpty / isNotEmpty / exists) render as SINGLE-input nodes.
+    // The `right` pin is never created for them, so there is no unusable socket
+    // to wire and no wire for graphToAST to reject.
     if (spec.inputs === "child") {
       node.addInput("in", new ClassicPreset.Input(socket, ""));
     } else if (spec.inputs === "leftright") {
-      node.addInput("left", new ClassicPreset.Input(socket, "left"));
-      node.addInput("right", new ClassicPreset.Input(socket, "right"));
+      S.inputKeys(kind, 0, node.op).forEach(function (key) {
+        node.addInput(key, new ClassicPreset.Input(socket, key));
+      });
     } else if (spec.inputs === "variadic") {
       const arity = Math.max(minArity(kind), d.arity || 0);
       node.arity = 0;
@@ -234,12 +332,128 @@ async function createBlueprintEditor(container, mod, S) {
     fireChange();
   }
 
+  // onOpChange runs on every edit of a comparison node's operator control. It
+  // resolves the readable spelling back to the AST token and re-shapes the
+  // node's pins, so the canvas matches the operator's ARITY the moment it is
+  // chosen — switching to `is empty` collapses the node to one input, switching
+  // back to a binary operator restores the second.
+  function onOpChange(node, text) {
+    node.op = opFromLabel(text);
+    syncCompareInputs(node, node.op);
+  }
+
+  // syncCompareInputs serialises the re-shape per node. The control fires on
+  // every keystroke, and applyCompareInputs awaits (connection removal, area
+  // update), so two edits in flight could otherwise interleave and add the same
+  // pin twice. Chaining on the node keeps them strictly ordered; a rejected link
+  // must not stall the chain, hence the same handler for both outcomes.
+  function syncCompareInputs(node, op) {
+    const apply = function () {
+      return applyCompareInputs(node, op);
+    };
+    node.opSync = (node.opSync || Promise.resolve()).then(apply, apply);
+    return node.opSync;
+  }
+
+  // applyCompareInputs makes the node's pin set equal inputKeys() for `op`. It
+  // is a diff, not a rebuild: pins that survive keep their identity and their
+  // wires, so switching operators among the binary ones disturbs nothing. A pin
+  // that goes away has its incoming connection REMOVED first — leaving it would
+  // strand a wire pointing at a socket that no longer exists, which is the
+  // dangling-`right` bug this replaces.
+  async function applyCompareInputs(node, op) {
+    const want = S.inputKeys(node.kind, node.arity || 0, op);
+    const have = Object.keys(node.inputs || {});
+    const drop = have.filter(function (k) {
+      return want.indexOf(k) < 0;
+    });
+    const add = want.filter(function (k) {
+      return have.indexOf(k) < 0;
+    });
+    if (drop.length === 0 && add.length === 0) {
+      fireChange(); // the operator still changed, even if its arity did not
+      return;
+    }
+    for (const key of drop) {
+      const stale = editor.getConnections().filter(function (c) {
+        return c.target === node.id && c.targetInput === key;
+      });
+      for (const c of stale) {
+        await editor.removeConnection(c.id);
+      }
+      node.removeInput(key);
+    }
+    for (const key of add) {
+      node.addInput(key, new ClassicPreset.Input(socket, key));
+    }
+    await area.update("node", node.id);
+    fireChange();
+  }
+
+  /*
+   * ---- The operator dropdown ----------------------------------------------
+   *
+   * Rete's classic control set is text/number only, and the React renderer that
+   * draws the nodes is a COMMITTED VENDORED BLOB (vendor/rete/rete.min.js) that
+   * this repo never rebuilds — so there is no custom <select> control to
+   * register without a node build. The operator control is therefore a text
+   * input bound to a native <datalist>: the browser turns it into a dropdown of
+   * every operator's readable spelling, typing narrows it, and the field still
+   * accepts a raw token. No framework, no dependency, no vendor change.
+   *
+   * The list is attached by DELEGATION rather than at node-build time because
+   * the input element belongs to the renderer: it is created (and re-created) by
+   * React, out of reach of the node model. Tagging it on pointerdown/focusin —
+   * before the browser opens the list — is idempotent and survives any re-render.
+   */
+  const opListId = "a-rule-ops-" + ++opListSeq;
+  const opList = document.createElement("datalist");
+  opList.id = opListId;
+  operatorEntries().forEach(function (entry) {
+    const option = document.createElement("option");
+    option.value = entry.label;
+    opList.appendChild(option);
+  });
+  container.appendChild(opList);
+
+  function attachOpList(ev) {
+    const el = ev.target;
+    if (!el || el.tagName !== "INPUT") return;
+    if (el.getAttribute("list") === opListId) return;
+    if (!isCompareControl(el)) return;
+    el.setAttribute("list", opListId);
+  }
+
+  // isCompareControl reports whether `el` is the control of a comparison node.
+  // A compare node carries exactly one control (the operator), so its node view
+  // containing the input is enough to identify it — no renderer internals are
+  // relied on beyond the area's node views, and a miss is a silent no-op.
+  function isCompareControl(el) {
+    try {
+      const nodes = editor.getNodes();
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i].kind !== S.TYPES.COMPARE) continue;
+        const view = area.nodeViews.get(nodes[i].id);
+        if (view && view.element && view.element.contains(el)) return true;
+      }
+    } catch (_) {
+      /* best-effort affordance: never break editing over it */
+    }
+    return false;
+  }
+
+  container.addEventListener("pointerdown", attachOpList, true);
+  container.addEventListener("focusin", attachOpList, true);
+
   // reteToGraph reads the live Rete editor into the serializer's plain graph
   // model — the ONLY bridge between the runtime and the pure serializer.
   function reteToGraph() {
     const nodes = editor.getNodes().map(function (n) {
       const g = { id: n.id, type: n.kind };
-      if (n.controls.op) g.op = n.controls.op.value;
+      // The control holds the readable spelling; the AST wants the token. An
+      // unrecognised spelling passes through verbatim so the validator can name
+      // exactly what the author typed.
+      if (n.controls.op) g.op = opFromLabel(n.controls.op.value);
       if (n.kind === S.TYPES.VAR || n.kind === S.TYPES.CALL) {
         g.name = n.controls.name ? n.controls.name.value : "";
       }
@@ -310,10 +524,12 @@ async function createBlueprintEditor(container, mod, S) {
   }
 
   // addNode drops a fresh palette node onto the canvas near the origin, staggered
-  // so successive adds do not stack exactly.
+  // so successive adds do not stack exactly. `data` seeds the node's controls —
+  // the operator palette passes { op: … } so the node arrives already set to the
+  // operator that was clicked, with the pin set that operator's arity demands.
   let addOffset = 0;
-  async function addNode(kind) {
-    const node = makeNode(kind, {});
+  async function addNode(kind, data) {
+    const node = makeNode(kind, data || {});
     await editor.addNode(node);
     const x = 40 + (addOffset % 5) * 30;
     const y = 40 + (addOffset % 5) * 30;
@@ -350,6 +566,9 @@ async function createBlueprintEditor(container, mod, S) {
     return S.validateAST(ast);
   };
   hook.destroy = function () {
+    container.removeEventListener("pointerdown", attachOpList, true);
+    container.removeEventListener("focusin", attachOpList, true);
+    if (opList.parentNode) opList.parentNode.removeChild(opList);
     area.destroy();
   };
 
@@ -393,6 +612,148 @@ async function ruleRpc(method, body) {
   return data || {};
 }
 
+/*
+ * ---- What-if preview: rendering the metadata snapshot ----------------------
+ *
+ * The preview shows the metadata the rule ACTUALLY saw, straight off the
+ * provider. It stays strictly read-only: nothing below is an input, and there is
+ * no path by which the client supplies metadata — the snapshot only ever arrives
+ * on the EvaluateRule response.
+ *
+ * The value shape is closed, so these helpers render against a known model
+ * rather than defending against arbitrary JSON. A field value is:
+ *
+ *   - a SCALAR (null, boolean, string, number), or
+ *   - an ARRAY of scalars — an empty list cell produces a real `[]`, or
+ *   - an OBJECT whose members are scalars, scalar arrays, or ONE further object
+ *     level (the depth cap is 2).
+ *
+ * Arrays of objects are impossible: the provider rejects them at load, so an
+ * array element is never a container.
+ *
+ * A field that was ABSENT from the object simply has no row. That is a real
+ * semantic difference from an empty list or an empty object, which DO get a row
+ * (`[]` / `{}` plus an "empty list" / "empty object" note), because an author
+ * debugging an `in` comparison has to tell "the field is missing" apart from
+ * "the field is there and holds nothing".
+ */
+
+// formatMetadataScalar renders one scalar the way the previous single-line
+// JSON.stringify preview did — strings keep their quotes, everything else shows
+// its JSON form. The quotes are not decoration: they distinguish the string
+// "42" from the number 42, which is exactly the mismatch the preview exists to
+// expose.
+function formatMetadataScalar(value) {
+  if (value === undefined) return "undefined"; // unreachable over JSON; total anyway
+  const text = JSON.stringify(value);
+  return text === undefined ? String(value) : text;
+}
+
+// metadataRows flattens a metadata snapshot into the ordered, indented row list
+// the preview panel renders. Flattening (rather than nesting templates) keeps
+// the markup down to a single x-for, which the depth cap of 2 makes sufficient.
+//
+// Field order is whatever the server sent; Go marshals a map with its keys
+// sorted, so the listing is already alphabetical and stable between runs.
+function metadataRows(metadata) {
+  const rows = [];
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return rows;
+  }
+  Object.keys(metadata).forEach(function (name) {
+    pushMetadataRows(rows, name, name, metadata[name], 0);
+  });
+  return rows;
+}
+
+// pushMetadataRows appends the row(s) for one value. A scalar or an array is a
+// single row; an object is a header row followed by one row per member, indented
+// one level. `path` is the dotted path from the field root and is used only as
+// the x-for key, so it must stay unique.
+function pushMetadataRows(rows, path, label, value, depth) {
+  if (Array.isArray(value)) {
+    // Elements are always scalars, so each renders as its own chip and a long
+    // array wraps inside the panel instead of stretching it.
+    rows.push({
+      key: path,
+      depth: depth,
+      label: label,
+      kind: "array",
+      text: value.length === 0 ? "[]" : "",
+      items: value.map(formatMetadataScalar),
+      note: value.length === 0 ? "empty list" : countNote(value.length, "item"),
+    });
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    rows.push({
+      key: path,
+      depth: depth,
+      label: label,
+      kind: "object",
+      text: keys.length === 0 ? "{}" : "{…}",
+      items: [],
+      note: keys.length === 0 ? "empty object" : countNote(keys.length, "field"),
+    });
+    keys.forEach(function (k) {
+      pushMetadataRows(rows, path + "." + k, k, value[k], depth + 1);
+    });
+    return;
+  }
+  rows.push({
+    key: path,
+    depth: depth,
+    label: label,
+    kind: "scalar",
+    text: formatMetadataScalar(value),
+    items: [],
+    note: "",
+  });
+}
+
+// countNote renders "1 item" / "3 items" — a plain count, no emoji, sentence
+// case, per the shell's copy rules.
+function countNote(n, noun) {
+  return n + " " + noun + (n === 1 ? "" : "s");
+}
+
+// buildPalette assembles the node palette the shell renders (index.html walks
+// `palette` -> `grp.items` and calls add(item.kind)). The Logic / Operands /
+// Pulse groups are fixed — one entry per AST node type — but the Compare group
+// is GENERATED from the serializer's OP_SPECS, one clickable entry per operator,
+// so every operator is authorable without typing one and the group can never
+// fall behind the AST.
+//
+// `kind` doubles as the template's x-for key, so it must stay unique; a
+// comparison entry therefore carries a COMPOUND kind ("compare:hasAll") that
+// rules().add() splits back into a node kind plus a seed operator. That keeps
+// the operator out of the shared template and off the editor hook's signature.
+function buildPalette() {
+  const comparisons = operatorEntries().map(function (entry) {
+    return { kind: "compare:" + entry.op, label: entry.label };
+  });
+  return [
+    { group: "Logic", items: [
+      { kind: "and", label: "And" },
+      { kind: "or", label: "Or" },
+      { kind: "not", label: "Not" },
+    ] },
+    // The plain Compare entry is the fallback for a shell whose serializer did
+    // not load: without OP_SPECS there are no operator entries, and the palette
+    // must still be able to place a comparison node.
+    { group: "Compare", items: comparisons.length ? comparisons : [{ kind: "compare", label: "Compare" }] },
+    { group: "Operands", items: [
+      { kind: "var", label: "Variable" },
+      { kind: "literal", label: "Literal" },
+    ] },
+    { group: "Pulse", items: [
+      { kind: "list", label: "List" },
+      { kind: "call", label: "Call" },
+    ] },
+  ];
+}
+
 // A small starter rule so the canvas is not blank on first open; also exercises
 // fromAST end to end. object.classification == "public".
 const STARTER_AST = {
@@ -434,27 +795,16 @@ function rules() {
     previewError: null,
     previewResult: null, // true | false | null (not yet run)
     previewObject: null, // the object metadata snapshot the rule saw
+    // previewRows is that snapshot flattened for display by metadataRows():
+    // one row per field, plus one indented row per member of an object-valued
+    // field. Derived on evaluate rather than on every render so the panel does
+    // not re-walk the snapshot on unrelated Alpine updates.
+    previewRows: [],
     // The node palette, grouped by category. Covers the whole AST: logical
     // combinators, comparisons over variables/literals, and the Pulse building
-    // blocks (list/call) from E2-S3.
-    palette: [
-      { group: "Logic", items: [
-        { kind: "and", label: "And" },
-        { kind: "or", label: "Or" },
-        { kind: "not", label: "Not" },
-      ] },
-      { group: "Compare", items: [
-        { kind: "compare", label: "Compare" },
-      ] },
-      { group: "Operands", items: [
-        { kind: "var", label: "Variable" },
-        { kind: "literal", label: "Literal" },
-      ] },
-      { group: "Pulse", items: [
-        { kind: "list", label: "List" },
-        { kind: "call", label: "Call" },
-      ] },
-    ],
+    // blocks (list/call) from E2-S3. The Compare group is generated from the
+    // operator registry — see buildPalette().
+    palette: buildPalette(),
     _editor: null,
 
     init() {
@@ -534,6 +884,7 @@ function rules() {
       this.preview.objects = [];
       this.previewResult = null;
       this.previewObject = null;
+      this.previewRows = [];
       this.previewError = null;
       if (!this.preview.objectType) return;
       try {
@@ -668,6 +1019,7 @@ function rules() {
       this.previewError = null;
       this.previewResult = null;
       this.previewObject = null;
+      this.previewRows = [];
       if (!this.preview.objectId) {
         this.previewError = { code: "APERTURE_INVALID_INPUT", msg: "Select an object to evaluate the rule against." };
         return;
@@ -681,6 +1033,7 @@ function rules() {
         });
         this.previewResult = !!resp.result;
         this.previewObject = resp.object_json ? JSON.parse(resp.object_json) : null;
+        this.previewRows = metadataRows(this.previewObject);
       } catch (e) {
         this.previewError = { code: e.code || "APERTURE_ERROR", msg: e.message };
       } finally {
@@ -701,10 +1054,20 @@ function rules() {
       }
     },
 
+    // add places a palette entry on the canvas. A comparison entry carries its
+    // operator in a compound kind ("compare:hasAll") — see buildPalette() — so
+    // it is split here into the node kind and the seed operator the new node
+    // opens with.
     add(kind) {
-      if (window.blueprintEditor) {
+      if (!window.blueprintEditor) return;
+      const sep = String(kind).indexOf(":");
+      if (sep < 0) {
         window.blueprintEditor.addNode(kind);
+        return;
       }
+      window.blueprintEditor.addNode(String(kind).slice(0, sep), {
+        op: String(kind).slice(sep + 1),
+      });
     },
 
     async clearCanvas() {
@@ -738,3 +1101,7 @@ function rules() {
 
 window.rules = rules;
 window.createBlueprintEditor = createBlueprintEditor;
+// Exported so the preview's snapshot rendering can be exercised directly from a
+// console against a real EvaluateRule payload; the panel itself reads
+// previewRows off the Alpine component.
+window.metadataRows = metadataRows;

@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/scope"
 )
 
@@ -34,6 +38,16 @@ type Trace struct {
 	// MaxSpecificity is the top specificity among the covering candidates, the
 	// tier the deny-overrides tiebreak resolved at. Zero when nothing covered.
 	MaxSpecificity int
+	// Notes are the diagnostic observations rule evaluation recorded while
+	// resolving this decision — today, deny-safe shape mismatches and matches
+	// produced by an absent field. They explain a verdict that is otherwise
+	// silent: a rule that evaluated false because a metadata field was the wrong
+	// shape looks identical to one that simply did not match. Empty on any
+	// decision that evaluated no rule.
+	//
+	// Notes are DIAGNOSTIC ONLY: they never influence the verdict, and Check /
+	// Enumerate do not collect them at all.
+	Notes []EvaluationNote
 	// Decision is the final verdict, reason, and deciding grant ids — identical
 	// to what Check returns for the same request.
 	Decision Decision
@@ -77,6 +91,59 @@ type GrantEvaluation struct {
 	Deciding bool
 	// Outcome is a short human-readable note on this grant's disposition.
 	Outcome string
+}
+
+// EvaluationNote is one diagnostic observation a rule evaluation recorded while
+// a grant's scope was being resolved, tied back to the grant that triggered it.
+//
+// It is the decision-surface projection of rules.Note: a flat, self-describing
+// record every surface can serialize (the Twirp trace JSON and the MCP explain
+// tool both carry Trace verbatim) without importing the rules package's types.
+//
+// SHAPE AND PATH ONLY. A note names the variable path, the shape expected and the
+// shape found. It NEVER carries a metadata value, an object id, or anything else
+// that could leak data across accounts — Explain output crosses account
+// boundaries the same way an error message does.
+type EvaluationNote struct {
+	// GrantID is the grant whose scope resolution recorded the note.
+	GrantID string
+	// Rule is the rule reference that was evaluated.
+	Rule string
+	// Kind classifies the observation ("shape_mismatch", "absent_field").
+	Kind string
+	// Op is the comparison operator that made the observation ("hasAll", ...).
+	Op string
+	// Path is the dotted variable path of the operand ("object.tags"), or empty
+	// when the operand was not a plain variable reference.
+	Path string
+	// Expected is the shape the operator requires ("collection", "array", ...).
+	Expected string
+	// Actual is the shape actually found ("string", "number", "absent", ...).
+	Actual string
+	// Message is the one-line rendering surfaces print.
+	Message string
+}
+
+// evaluationNotes projects the rules package's notes onto the trace's own type,
+// stamping each with the grant whose resolution produced it.
+func evaluationNotes(grantID string, notes []rules.Note) []EvaluationNote {
+	if len(notes) == 0 {
+		return nil
+	}
+	out := make([]EvaluationNote, len(notes))
+	for i, n := range notes {
+		out[i] = EvaluationNote{
+			GrantID:  grantID,
+			Rule:     n.Rule,
+			Kind:     string(n.Kind),
+			Op:       n.Op,
+			Path:     n.Path,
+			Expected: n.Expected,
+			Actual:   n.Actual,
+			Message:  n.String(),
+		}
+	}
+	return out
 }
 
 // Explain resolves the request exactly as Check does but records the full
@@ -153,10 +220,16 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 			tr.Considered = append(tr.Considered, ev)
 			continue
 		}
-		covered, spec, err := e.coverer.cover(ctx, req, g, perm, object)
+		// Explain — and only Explain — installs an evaluation-notes collector, so
+		// a rule-backed scope resolver's diagnostics travel back up through the
+		// scope seam without widening any of its interfaces. One collector per
+		// grant is what ties each note to the grant that produced it.
+		noteCtx, collector := rules.WithNoteCollector(ctx)
+		covered, spec, err := e.coverer.cover(noteCtx, req, g, perm, object)
 		if err != nil {
 			return Trace{}, err
 		}
+		tr.Notes = append(tr.Notes, evaluationNotes(g.ID, collector.Notes())...)
 		ev.Covered = covered
 		ev.Specificity = spec
 		if covered {
@@ -208,8 +281,20 @@ func strategyOf(perm *model.Permission) string {
 	return spec.Strategy
 }
 
-// String renders the trace as an operator-readable, deterministic report: the
-// question, the subject set, each grant's disposition, and the verdict.
+// String renders the trace as an operator-readable, DETERMINISTIC report: the
+// question, the subject set, each grant's disposition, and the verdict. Two
+// String calls on two traces of the same decision produce byte-identical output,
+// so a trace can be diffed, snapshotted, or pasted into a bug report.
+//
+// That is not free, and it is why the three lists below are sorted here rather
+// than assumed ordered. Subjects come from Storage.GroupsForPrincipal and the
+// considered grants from Storage.GrantsForSubjects, neither of which promises an
+// order — storage/memory iterates a Go map, so the line order genuinely varied
+// run to run. The fix belongs here because the ORDER IS A RENDERING CONCERN:
+// Storage keeps its freedom, Trace keeps its documented storage order in the
+// struct (which the Twirp and MCP surfaces serialize verbatim), and only the
+// report is normalised. Sorting is done on copies for exactly that reason —
+// calling String must not reorder the caller's Trace.
 func (t Trace) String() string {
 	var b strings.Builder
 	verdict := "DENY"
@@ -219,21 +304,84 @@ func (t Trace) String() string {
 	fmt.Fprintf(&b, "Explain %s/%s on %s in account %s\n",
 		t.Request.Principal, t.Request.Action, t.Request.Object, t.Request.Account)
 
+	// "kind:id" is the subject's whole identity, so sorting the rendered form is
+	// a total order: two subjects that compare equal ARE the same subject.
 	subjects := make([]string, len(t.Subjects))
 	for i, s := range t.Subjects {
 		subjects[i] = string(s.Kind) + ":" + s.ID
 	}
+	sort.Strings(subjects)
 	fmt.Fprintf(&b, "  subjects: %s\n", strings.Join(subjects, ", "))
 
 	fmt.Fprintf(&b, "  grants considered (%d):\n", len(t.Considered))
-	for _, ev := range t.Considered {
+	for _, ev := range sortedEvaluations(t.Considered) {
 		marker := " "
 		if ev.Deciding {
 			marker = "*"
 		}
 		fmt.Fprintf(&b, "   %s %s [%s %s] %s\n", marker, ev.GrantID, ev.Effect, ev.ObjectPattern, ev.Outcome)
 	}
+	// Evaluation notes come after the grants and before the verdict: they explain
+	// how a grant's rule behaved, which is what an operator reads next when a
+	// covering grant unexpectedly did not cover.
+	if len(t.Notes) > 0 {
+		fmt.Fprintf(&b, "  evaluation notes (%d):\n", len(t.Notes))
+		for _, n := range sortedNotes(t.Notes) {
+			fmt.Fprintf(&b, "     %s [rule %s]: %s\n", n.GrantID, n.Rule, n.Message)
+		}
+	}
+
 	fmt.Fprintf(&b, "  verdict: %s (top specificity %d)\n", verdict, t.MaxSpecificity)
 	fmt.Fprintf(&b, "  reason: %s\n", t.Decision.Reason)
 	return b.String()
+}
+
+// sortedEvaluations returns a copy of the considered grants in a total order.
+//
+// GrantID alone would do — a grant is loaded at most once per decision, so no
+// two evaluations in one trace can share an id — but leaning on that would make
+// the report's determinism depend on a storage invariant rather than on this
+// function. The key therefore continues through every remaining field, which
+// makes ties possible only between records that are equal in full and so render
+// identically either way. Deciding is not compared for the same reason: it is
+// derived from GrantID, so equal ids already imply equal markers.
+func sortedEvaluations(in []GrantEvaluation) []GrantEvaluation {
+	out := slices.Clone(in)
+	slices.SortFunc(out, func(a, b GrantEvaluation) int {
+		return cmp.Or(
+			strings.Compare(a.GrantID, b.GrantID),
+			strings.Compare(string(a.Subject.Kind), string(b.Subject.Kind)),
+			strings.Compare(a.Subject.ID, b.Subject.ID),
+			strings.Compare(a.PermissionID, b.PermissionID),
+			strings.Compare(string(a.Effect), string(b.Effect)),
+			strings.Compare(a.ObjectPattern, b.ObjectPattern),
+			strings.Compare(a.Action, b.Action),
+			strings.Compare(a.Strategy, b.Strategy),
+			strings.Compare(a.Outcome, b.Outcome),
+		)
+	})
+	return out
+}
+
+// sortedNotes returns a copy of the evaluation notes in a total order.
+//
+// Notes inherit the considered grants' order, so they were nondeterministic for
+// the same reason. The key spans EVERY field of EvaluationNote — a note carries
+// no id of its own, and one grant can legitimately record several — so records
+// that tie are identical records and render the same line.
+func sortedNotes(in []EvaluationNote) []EvaluationNote {
+	out := slices.Clone(in)
+	slices.SortFunc(out, func(a, b EvaluationNote) int {
+		return cmp.Or(
+			strings.Compare(a.GrantID, b.GrantID),
+			strings.Compare(a.Rule, b.Rule),
+			strings.Compare(a.Kind, b.Kind),
+			strings.Compare(a.Op, b.Op),
+			strings.Compare(a.Path, b.Path),
+			strings.Compare(a.Expected, b.Expected),
+			strings.Compare(a.Actual, b.Actual),
+			strings.Compare(a.Message, b.Message),
+		)
+	})
+	return out
 }

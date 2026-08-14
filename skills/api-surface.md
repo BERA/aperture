@@ -47,8 +47,12 @@ Full surface:
   `Principal`, `Role`, `Group`, `Account`; `Put/Delete` for `Membership`;
   `Put/Get/List/Delete` for `Grant`.
 - **Object identifiers (read)**: `ObjectIdentifiers(objectType, exclude...)`
-  enumerates a type's INSTANCE ids from its provider (the `providers:` section a
-  seed declares, wired with `WithProviders`) — the complete, unbounded set, minus
+  enumerates a type's INSTANCE ids from its provider (the `providers:` or
+  `objects:` section a seed declares, wired with `WithProviders`; when both
+  sections claim a type the file-backed `providers:` entry wins the type outright
+  by default and every inline entry for it is discarded, so the ids enumerated are
+  the file's alone — see `skills/metadata-values.md`) — the complete,
+  unbounded set, minus
   any `exclude` ids. It materialises the positive allow-list an EXCLUSIVE
   allowance ("all objects of this type except these ids") expands to. An
   object-type with no declared provider → `APERTURE_PROVIDER_UNREGISTERED`; a

@@ -24,11 +24,25 @@
 //
 // Metadata is host-defined and map-like (Metadata = map[string]any), so the
 // rules engine can expose each field as an expression variable directly without
-// a translation layer. A cached Metadata value is treated as READ-ONLY by every
-// consumer: the cache stores the provider's map by reference and never copies it
-// on read (allocation-aware on the hot path), so mutating a returned map would
-// race other readers. Providers must therefore return a fresh map per object and
-// callers must not write to it.
+// a translation layer. Its VALUE SHAPE is not free-form, though: a field value
+// is a scalar, a []any of scalars, or a map[string]any whose values are scalars,
+// scalar arrays, or one further object level. See metadata.go for the model and
+// ValidateMetadata, the load-time entry point every loader calls.
+//
+// A cached Metadata value is treated as READ-ONLY by every consumer, and the
+// contract is TRANSITIVE. The cache stores the provider's map by reference and
+// never copies it on read (allocation-aware on the hot path), which means the
+// nested maps and slices inside that map are shared by reference too — reaching
+// through a returned Metadata to append to a []any or write a key into a nested
+// map[string]any races every other reader exactly as writing the top-level map
+// would. So:
+//
+//   - a provider returns a FRESH map per object, with fresh nested containers —
+//     it must not hand out a value it also retains and mutates, and reloading a
+//     source builds a new value rather than editing the old one in place;
+//   - no holder — engine, rules, scope, CLI, server, host code — writes to a
+//     Metadata it was given, at ANY depth;
+//   - a consumer that needs to modify metadata copies it (deeply) first.
 //
 // Dependencies stay minimal: provider imports only identity and errors, never
 // scope/engine/model, so it remains a leaf those layers adapt to.
@@ -42,8 +56,12 @@ import (
 
 // Metadata is a host-defined, map-like bag of an object's attributes. It is an
 // alias for map[string]any so the rules engine (E2-S3) can read fields straight
-// into its expression environment with no conversion. A Metadata value handed
-// back by the cache is read-only; see the package doc.
+// into its expression environment with no conversion — keep it an alias.
+//
+// Legal field values are constrained by the shared value model (metadata.go);
+// loaders enforce it with ValidateMetadata. A Metadata value handed back by the
+// cache is read-only, transitively down through its nested containers; see the
+// package doc.
 type Metadata = map[string]any
 
 // Object pairs an object's identity with its metadata. Providers return Objects
@@ -60,16 +78,45 @@ type Object struct {
 
 // Filter is the criteria an ObjectProvider.Query selects on. Every field is
 // optional; the zero Filter selects every object of the type (equivalent to
-// List). The host provider interprets Fields; Aperture additionally enforces
+// List). The host provider evaluates Fields; Aperture additionally enforces
 // Pattern and Limit on the results it returns, so a provider that ignores them
 // is still correct, only less efficient.
+//
+// # The Fields contract
+//
+// Fields is evaluated by the provider, but its MEANING is fixed here, and every
+// implementation owes callers the same answer — Query is how scope enumeration
+// bounds itself, so a provider that filters differently is a provider that
+// authorizes differently. An implementation either calls MatchFields or
+// reproduces it exactly (e.g. by pushing the predicate into SQL):
+//
+//   - EVERY predicate must hold (the map is an AND), and an empty or nil Fields
+//     selects every object.
+//   - A field ABSENT from an object never matches — not even against a nil want.
+//   - A COLLECTION field ([]any) matches by MEMBERSHIP: Fields{"tags":
+//     "premium"} selects every object whose tags array CONTAINS "premium".
+//     Equality against a whole array is never what a caller filtering on a tag
+//     list means.
+//   - Every other field — scalar or object (map[string]any) — matches by
+//     EQUALITY. An object field is deliberately NOT key membership, so a scalar
+//     want against one is simply false rather than a panic or an accidental
+//     string-rendering match.
+//   - A want that is itself a container compares by equality at both ends, since
+//     no element of a legal array could ever equal one.
+//   - Comparison is TYPED, never a string rendering: numbers compare across Go
+//     numeric types by value (int(5) == int64(5) == float64(5)), but a number
+//     never equals its string spelling ("5" != 5), and a string equals only a
+//     string. These are the rules engine's own comparison semantics
+//     (expr-lang's), so Enumerate cannot select an object that Check then denies
+//     over the same value. See ValuesEqual.
 type Filter struct {
 	// Pattern, when non-nil, restricts results to identities it matches. The
 	// Registry's scope-lister adapter sets this to bound enumeration to a grant's
 	// scope.
 	Pattern *identity.Pattern
-	// Fields are host-interpreted metadata predicates (equality by default). The
-	// provider decides their semantics; Aperture passes them through untouched.
+	// Fields are metadata predicates: membership for a collection field,
+	// equality for everything else, per the contract on Filter. Aperture passes
+	// them to the provider untouched; MatchFields is the shared implementation.
 	Fields map[string]any
 	// Limit bounds the number of results; <= 0 means the provider's own default.
 	Limit int

@@ -6,6 +6,7 @@ import (
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/provider"
+	"github.com/frankbardon/aperture/seed"
 )
 
 // lenientFetcher adapts a *provider.Registry to rules.MetadataFetcher so an
@@ -31,4 +32,18 @@ func (f lenientFetcher) Fetch(ctx context.Context, id identity.Identity) (map[st
 		}
 	}
 	return md, nil
+}
+
+// hasObjectSources reports whether a seed document declares any object-metadata
+// source at all. BOTH wiring sections count: `providers:` (a file- or
+// database-backed ObjectProvider per type) and `objects:` (metadata declared
+// inline and served from memory). BuildRegistry populates one *Registry from
+// both, so gating the rules fetcher and the scope lister on `providers:` alone
+// left a seed that used only `objects:` with a populated registry nothing ever
+// read — inline metadata was invisible to rules and to scope enumeration.
+func hasObjectSources(doc *seed.Document) bool {
+	if doc == nil {
+		return false
+	}
+	return len(doc.Providers) > 0 || len(doc.Objects) > 0
 }
