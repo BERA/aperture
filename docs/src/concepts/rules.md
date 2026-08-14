@@ -156,6 +156,7 @@ Each operator makes a deliberate choice:
 | Native, flipped `in` | `has`, `hasKey` | `(right in left)` |
 | Native nil test | `exists` | `(left != nil)` |
 | Registered pure function | `hasAll` `hasAny` `hasNone` `subsetOf` `isEmpty` `isNotEmpty` | `hasAll(left, right)`, `isEmpty(left)`, … |
+| **Guarded dispatcher** | any collection operator over a non-literal operand | `$op("hasAll", __notes, "object.tags", object?.tags, "", ["a"])` |
 
 `has` and `hasKey` need no new machinery because expr's `in` is element
 membership over an array **and key membership over a map** — `"dept" in
@@ -167,6 +168,20 @@ rather than a runtime error when `owner` is missing.
 The six with no native spelling are backed by functions in the curated pure set.
 Each is deterministic and side-effect-free, so the purity guarantee holds: they
 read their arguments and nothing else.
+
+The **guarded** row overrides the other four. A collection operator whose
+collection operand is not statically known to be a collection — anything but a
+list literal, so in practice any operand that reads metadata — renders to the
+internal dispatcher `$op` instead, which applies the [shape
+policy](#wrong-shaped-fields-deny-and-are-recorded) and records a note. The
+common `object.region in ["us","eu"]` keeps its native `in`: a list literal is an
+array by construction and cannot mismatch, so the decision path pays nothing for
+a guard it does not need.
+
+Neither `$op` nor the `__notes` sink it reads is reachable from a rule. `$` is
+outside the identifier grammar `Validate` enforces for a `call` name, and
+`__notes` is not one of the four exposed context roots — so the guard is
+compiler-only *by construction*, with no denylist to keep in sync.
 
 ### Predicate builtins are denied
 
@@ -258,11 +273,80 @@ rules.And(
 )
 ```
 
-Deny-safety covers **missing** data, not **mistyped** data. A field of the wrong
-shape — `hasAll` over a string, `isEmpty` over a number, `has` over a number — is
-still an `APERTURE_RULE_EVAL` runtime error, matching expr's own
-`operator "in" not defined on string`. That is the argument for validating the
-value model at load time rather than at `Check` time.
+### Wrong-shaped fields deny, and are recorded
+
+A field of the **wrong shape** — `has` over a string, `hasAll` over a number,
+`isEmpty` over a bool — makes the comparison **`false`**. Every collection
+operator, no exceptions, *including the negative ones*: `nin` over a string is
+`false`, not `true`. A mismatch never matches, whatever the operator's polarity,
+so mistyped data can only ever deny.
+
+expr-lang on its own is not like this. `"a" in object.missing` is `false`, but
+`"a" in object.title` is the runtime error `operator "in" not defined on string`
+— so inheriting expr's behavior would mean one mistyped field breaks **every**
+`Check` that touches it. Load-time validation of the [value
+model](./providers.md) stops mistyped data from the CSV and inline loaders, but
+it cannot cover a host-implemented `ObjectProvider` or the `principal` attribute
+bag, which bypass loaders entirely. Hence a runtime policy as well.
+
+Note the asymmetry with the absent-field table above, and that it is deliberate:
+
+| operand | policy |
+|---|---|
+| absent (`nil`) | reads as an **empty collection**; the operator's own semantics decide, so the negative ops match |
+| wrong shape | the comparison is **`false`**, whatever the operator |
+
+Treating a mismatch as an empty collection would have been more uniform, but it
+would make `nin` / `hasNone` / `subsetOf` **grant** on mistyped data. Deny-safety
+wins the tiebreak.
+
+Which shapes each operator accepts:
+
+| operators | accepts |
+|---|---|
+| `in` `nin` `has` `hasKey` | array (elements) or object (keys) |
+| `hasAll` `hasAny` `hasNone` `subsetOf` | array |
+| `isEmpty` `isNotEmpty` | array, object, or string |
+| `exists` | anything — a nil test cannot mismatch |
+
+#### Evaluation notes
+
+A silent `false` is how an access-control bug hides. So the mismatch is
+**recorded** and surfaced in `Explain`, on every decision surface:
+
+```
+Explain alice/read on account:acme/document:9 in account acme
+  subjects: principal:alice
+  grants considered (1):
+     g-doc [allow account:acme/**] inclusive scope does not cover the object
+  evaluation notes (1):
+     g-doc [rule tagged]: object.tags: expected collection, got string
+  verdict: DENY (top specificity 0)
+```
+
+A second kind of note covers the other invisible case: an operator that
+**matched because the field is missing** — the `nin` / `hasNone` / `subsetOf` /
+`isEmpty` grant described above.
+
+```
+     g-doc [rule tagged]: object.tags: absent; hasNone matched because the field is missing
+```
+
+Notes carry **shape and path only — never a metadata value**, because a trace
+crosses account boundaries the same way an error message does. They are
+diagnostic only and never influence a verdict, and only `Explain` collects them:
+`Check` and `Enumerate` install no collector, so the decision hot path records
+nothing and allocates nothing.
+
+Library callers reach the same channel directly:
+
+```go
+ctx, notes := rules.WithNoteCollector(ctx)
+allowed, err := compiled.Eval(ctx, in)
+for _, n := range notes.Notes() {
+    log.Println(n) // object.tags: expected collection, got string
+}
+```
 
 ### Other missing-field behavior
 
@@ -270,8 +354,6 @@ value model at load time rather than at `Check` time.
 - **Ordered comparison** (`lt le gt ge`) against a missing field is a **runtime
   error** — `APERTURE_RULE_EVAL`. The rule assumes a field the object does not
   carry; the scope resolver treats that as a non-decision, not a silent select.
-- **Type mismatch** is likewise a runtime error: `in` over a string or a number
-  (rather than a list or a map) is not defined in expr-lang.
 
 ## Validation
 

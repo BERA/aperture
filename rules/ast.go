@@ -153,6 +153,13 @@ type opSpec struct {
 //     genuinely disabled (len) or reachable only through a `#` pointer this AST
 //     cannot emit — and which validateCall explicitly denies. Each is backed by a
 //     deterministic, side-effect-free func in defaultFunctions().
+//
+// GUARDING OVERRIDES ALL OF THE ABOVE (E5-S1). Whenever an operator's collection
+// operand is not statically known to be a collection — i.e. anything but a list
+// literal — the comparison renders instead to the guarded dispatcher `$op`
+// (renderGuarded), which applies the deny-safe shape policy in shape.go and
+// records a note. The forms above are what a comparison renders to when no
+// operand can be the wrong shape; the runtime contract lives in collOps.
 var opSpecs = map[string]opSpec{
 	OpEq:         {shape: rightAny, kind: renderInfix, text: "=="},
 	OpNe:         {shape: rightAny, kind: renderInfix, text: "!="},
@@ -507,11 +514,18 @@ func (n *Node) render(b *bytes.Buffer) error {
 // Each branch is documented at opSpecs; the short version is that has/hasKey flip
 // to expr's element-first `in`, exists becomes a nil test, and the six operators
 // with no native spelling call a registered backing function.
+//
+// GUARDING (E5-S1) comes first. A collection operator whose collection operand
+// could be the wrong shape at runtime renders to the guarded dispatcher instead —
+// see renderGuarded — so a mistyped field denies with a note rather than raising.
 func (n *Node) renderCompare(b *bytes.Buffer) error {
 	spec, ok := opSpecs[n.Op]
 	if !ok {
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: cannot render unknown comparison operator", map[string]any{"op": n.Op})
+	}
+	if cspec, ok := collOps[n.Op]; ok && guardNeeded(n, cspec) {
+		return n.renderGuarded(b)
 	}
 	switch spec.kind {
 	case renderInfix:
@@ -569,6 +583,80 @@ func (n *Node) renderCompare(b *bytes.Buffer) error {
 		b.WriteByte(')')
 		return nil
 	}
+}
+
+// guardNeeded reports whether a collection comparison must render to the guarded
+// dispatcher rather than to its native/backing-function form.
+//
+// The only operand that can be the wrong shape at runtime is one whose value is
+// not known statically. A LIST LITERAL is an array by construction, so a rule of
+// the overwhelmingly common form `object.region in ["us", "eu"]` keeps its native
+// `in` render: the element on the left carries no shape contract, the collection
+// on the right cannot mismatch, and the decision path pays nothing. Anything else
+// — a variable, a function call — is guarded.
+func guardNeeded(n *Node, spec collOp) bool {
+	if spec.left != expectNone && !alwaysCollection(n.Left) {
+		return true
+	}
+	if spec.right != expectNone && !alwaysCollection(n.Right) {
+		return true
+	}
+	return false
+}
+
+// alwaysCollection reports whether a node's value is statically guaranteed to be
+// a collection. Only a list literal qualifies.
+func alwaysCollection(n *Node) bool { return n != nil && n.Type == NodeList }
+
+// renderGuarded writes a collection comparison as a call to the guarded
+// dispatcher:
+//
+//	$op("hasAll", __notes, "object.tags", object?.tags, "", ["a", "b"])
+//
+// The arguments are, in order: the operator; the evaluation-notes sink; the left
+// operand's dotted variable PATH (for the note; empty when the operand is not a
+// plain variable) and its value; then the same pair for the right operand, which
+// renders as ""/nil for a unary operator.
+//
+// Neither name is reachable from a rule. `$op` contains a character varPath
+// rejects, so no NodeCall can ever name it; `__notes` is not one of allowedRoots,
+// so no NodeVar can reference it. The guard is therefore structurally
+// compiler-only rather than protected by a denylist that could drift.
+//
+// The dispatcher returns a bool, so a guarded comparison composes exactly like
+// the native form — including as a whole rule under expr.AsBool.
+func (n *Node) renderGuarded(b *bytes.Buffer) error {
+	b.WriteString(fnCollectionOp)
+	b.WriteByte('(')
+	b.WriteString(strconv.Quote(n.Op))
+	b.WriteString(", ")
+	b.WriteString(notesVar)
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(varPathOf(n.Left)))
+	b.WriteString(", ")
+	if err := n.Left.render(b); err != nil {
+		return err
+	}
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(varPathOf(n.Right)))
+	b.WriteString(", ")
+	if n.Right == nil {
+		b.WriteString("nil")
+	} else if err := n.Right.render(b); err != nil {
+		return err
+	}
+	b.WriteByte(')')
+	return nil
+}
+
+// varPathOf returns the dotted path a note should name an operand by: the
+// variable path when the operand is a plain variable reference, and "" otherwise
+// (a note renders that as "(expression)").
+func varPathOf(n *Node) string {
+	if n == nil || n.Type != NodeVar {
+		return ""
+	}
+	return n.Name
 }
 
 // renderVar writes a variable reference with optional chaining on every segment

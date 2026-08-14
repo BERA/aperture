@@ -27,6 +27,12 @@ returns a `service.Result` and renders engine errors fail-closed:
 
 The Twirp service in E4-S1 calls this same facade, inheriting the policy.
 
+**A rule-backed grant whose metadata is the wrong shape denies; it does not
+fail.** A collection operator applied to a non-collection evaluates to `false`
+rather than raising `APERTURE_RULE_EVAL`, so one mistyped field cannot break
+every `Check` that touches it. `Check` says only "deny" — the reason is recorded
+as an evaluation note and shown by `aperture explain` (see `decision-api`).
+
 ## CLI: `aperture check <principal> <action> <object>`
 
 Prints `allow` or `deny` plus the reason. Exit code reflects the decision:

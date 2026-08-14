@@ -170,6 +170,7 @@ type Trace struct {
 	Subjects       []model.Subject       // the principal's expanded subject set (itself, roles, groups)
 	Considered     []GrantEvaluation     // every grant loaded, each tagged with how it fared
 	MaxSpecificity int                   // top specificity among covering candidates; 0 when nothing covered
+	Notes          []EvaluationNote      // diagnostics rule evaluation recorded; empty when no rule ran
 	Decision       Decision              // the final verdict — identical to what Check returns
 	Impersonation  *ImpersonationContext // non-nil only under an active impersonation session
 }
@@ -181,6 +182,37 @@ action matched, whether it covered the object and at what specificity, which
 scope strategy it used, whether it was a deciding grant, and a short
 human-readable `Outcome`. A grant that failed the action match is still listed
 (with `ActionMatched: false`) so the trace shows what was ruled out.
+
+### Evaluation notes
+
+`Notes` is where a rule-backed scope explains itself. A rule can decide `false`
+for a reason the verdict never shows — the metadata field it reads is the **wrong
+shape** (a string where an array was meant), or it **matched only because the
+field is absent**. Both are deny-safe by policy: a collection operator over a
+non-collection evaluates to `false` rather than raising `APERTURE_RULE_EVAL`, so
+one mistyped field cannot break every decision that touches it. See
+[Rules](../concepts/rules.md#wrong-shaped-fields-deny-and-are-recorded).
+
+```go
+type EvaluationNote struct {
+	GrantID  string // the grant whose scope resolution recorded it
+	Rule     string // the rule reference that was evaluated
+	Kind     string // "shape_mismatch" | "absent_field"
+	Op       string // the comparison operator ("hasAll", …)
+	Path     string // the dotted variable path ("object.tags")
+	Expected string // the shape the operator requires ("collection")
+	Actual   string // the shape found ("string")
+	Message  string // "object.tags: expected collection, got string"
+}
+```
+
+Three rules govern them:
+
+1. **Diagnostic only** — a note never influences a verdict.
+2. **`Explain` only** — `Check` and `Enumerate` install no collector, so they
+   record nothing, allocate nothing, and behave exactly as before.
+3. **Shape and path only** — never a metadata value, never anything that could
+   cross an account boundary, the same discipline error messages follow.
 
 `Trace` implements `String()`, which renders an operator-readable, deterministic
 report:
