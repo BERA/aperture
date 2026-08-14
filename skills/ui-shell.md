@@ -61,15 +61,16 @@ The rule editor has **no** rule format of its own. `js/rules-serializer.js`
 carries a hand-maintained JS mirror of `rules/ast.go`, and the two must move
 together:
 
-| JS (`rules-serializer.js`) | Go (`rules/ast.go`) |
-|---|---|
-| `TYPES` | `NodeType` consts |
-| `OP_SPECS` / `OPS` (derived) | `opSpecs` / `Op*` consts |
-| `RIGHT` | `rightShape` |
-| `ROOTS` | `allowedRoots` |
-| `BLOCKED_CALLS` | `blockedCallNames` |
-| `VAR_PATH` | `varPath` |
-| `validateAST` | `(*Node).Validate` |
+| JS (`rules-serializer.js`) | Go | Compared by |
+|---|---|---|
+| `TYPES` | `NodeType` consts (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
+| `OP_SPECS` / `OPS` (derived) | `opSpecs` / `Op*` consts (`rules/ast.go`) | `TestEditorOperatorTablesAgree` |
+| `RIGHT` | `rightShape` (`rules/ast.go`) | `TestEditorOperatorTablesAgree` |
+| `ROOTS` | `allowedRoots` (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
+| `BLOCKED_CALLS` | `blockedCallNames` (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
+| `FUNCTIONS` | `defaultFunctions` (`rules/compiler.go`) | `TestEditorVocabularyTablesAgree` |
+| `VAR_PATH` | `varPath` (`rules/ast.go`) | — (identical literal, by eye) |
+| `validateAST` | `(*Node).Validate` (`rules/ast.go`) | `TestEditorValidationMessagesAgree` |
 
 `OP_SPECS` is the single registry both directions and the validator read, so a
 new operator is one entry, never a scattered conditional. It records each
@@ -98,11 +99,37 @@ Run the round-trip test with plain node, no dependencies and no build step:
 node internal/server/static/js/rules-serializer.test.js   # exit 0 = pass
 ```
 
-**CI is node-free, so that test never runs in the pipeline.**
-`rules/editor_contract_test.go` is the CI-guarded half of the same invariant: it
-parses the identical AST JSON strings through `rules.Node` and asserts each is
-valid and byte-stable. A new operator lands in `OP_SPECS`, in the JS test, **and**
-in that Go contract test, or the two sides drift silently.
+**CI is node-free, so that test never runs in the pipeline.** Two Go test files
+are the CI-guarded half of the invariant, and they do different jobs:
+
+- **`rules/editor_contract_test.go`** pins the AST JSON the editor emits:
+  `TestEditorASTContract` parses the identical strings through `rules.Node` and
+  asserts each is valid and **byte-stable** under marshal→unmarshal→marshal.
+  `TestEditorASTContractCoversEveryOperator` drives that same assertion off
+  `opSpecs` itself, so a new operator is round-trip-covered the moment it lands
+  and the arity rule is pinned both ways (a unary with a `right` is rejected, a
+  binary without one is rejected).
+- **`rules/editor_js_contract_test.go`** actually **READS
+  `rules-serializer.js` from disk** and compares its tables against the Go
+  originals, entry for entry — that is what makes an operator added to ONE side
+  fail. It scans the JS with a small hand-rolled scanner (no JS-parser
+  dependency, no new module, **node is never invoked**), and a missing or
+  renamed table **fails**, never skips.
+
+The table above names which test compares each pair. A failure names the
+operator and the side it is missing from:
+
+```
+operator "hasNone" is in Go opSpecs (rules/ast.go) but MISSING from JS
+OP_SPECS (…/rules-serializer.js): add `hasNone: { right: RIGHT.COLLECTION },`
+to the JS table (and a case to rules-serializer.test.js)
+```
+
+So a new operator lands in `opSpecs`, in `OP_SPECS`, and in
+`rules-serializer.test.js` — the first two are enforced, the third stays manual
+discipline because nothing runs node. Keep `OP_SPECS` entries in the literal
+`{ right: RIGHT.X }` form and `OPS` derived as `Object.keys(OP_SPECS)`; both are
+asserted, because the comparison is only as good as the table's readability.
 
 ## Authoring operators (rule editor palette + comparison node)
 
