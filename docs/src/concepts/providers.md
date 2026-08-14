@@ -13,7 +13,9 @@ A load-bearing rule: **Aperture never persists provider data as a source of
 truth.** The host owns it; Aperture only ever caches a copy. Cached metadata is
 handed back **by reference and treated read-only** — the cache never copies a map
 on read (allocation matters on the `Check` hot path), so a provider must return a
-fresh map per object and callers must never write to a returned map.
+fresh map per object and callers must never write to a returned map. Because a
+value may nest, that contract is **transitive**; see
+[the read-only contract](#the-read-only-contract-is-transitive) below.
 
 ## `ObjectProvider`: the host seam
 
@@ -40,6 +42,101 @@ type ObjectProvider interface {
 engine reads each field straight into its expression environment with no
 conversion layer. An `Object` pairs an identity with its metadata; the identity's
 terminal segment type is the object-type the provider is registered under.
+
+## The metadata value model
+
+`Metadata` is an alias, so the *type* constrains nothing. The **shape** of a field
+value is constrained anyway, and deliberately so: metadata goes into the
+expression evaluator untranslated, which means a wrong shape is not a `false`
+decision — it is a *runtime evaluation error* on the `Check` hot path
+(`operator "in" not defined on string`). Catching that at load is the whole point
+of the model.
+
+A field value is one of:
+
+| Kind | Go type | Example |
+|---|---|---|
+| **scalar** | `nil`, `bool`, `string`, any Go integer/float, `json.Number` | `classification: "secret"` |
+| **array** | `[]any` whose elements are **all scalars** | `tags: ["eng", "oncall"]` |
+| **object** | `map[string]any` of scalars, scalar arrays, or one further object level | `owner: {dept: "eng"}` |
+
+Two rules bound it:
+
+- **Arrays of objects are rejected at any position.** Rule authors compare against
+  arrays with `in` / `not in`, which has no useful meaning over a list of maps.
+  Nested arrays (`[["a"]]`) are rejected for the same reason.
+- **Typed containers are rejected** — `[]string`, `map[string]string`, structs.
+  The model is spelled in the two types the expression environment and JSON share,
+  so a loader normalises once instead of every consumer type-switching.
+
+`time.Time` is deliberately **not** a scalar: a rule literal is a JSON scalar and
+could never be compared against one, so a loader formats timestamps as RFC 3339
+strings.
+
+### Depth, counted below the field root
+
+`provider.ValueDepth(v)` reports a value's container depth: every array or object
+entered adds one level, so a scalar is `0` and an empty container is `1`. The cap
+is **2** by default.
+
+| Value | Depth | Legal? |
+|---|---|---|
+| `tags: ["a", "b"]` | 1 | yes |
+| `owner: {dept: "eng"}` | 1 | yes |
+| `owner: {lead: {name: "x"}}` | 2 | yes |
+| `owner: {tags: ["a"]}` | 2 | yes |
+| `owner: {a: {b: {c: "x"}}}` | 3 | no — past the depth cap |
+| `owner: {members: [{id: 1}]}` | 3 | no — array of objects |
+| `tags: [{name: "a"}]` | 2 | no — array of objects |
+
+### Size, measured structurally
+
+`provider.ValueBytes(v)` measures a value without serialising it (nothing is
+allocated on a load path): a string costs its length in **bytes**, a number 8, a
+bool 1, `nil` 0, an array the sum of its elements, and an object the sum of
+`len(key) + value` per entry. Container framing costs nothing. The cap is **64
+KiB per field value** by default.
+
+### Validating at load
+
+Validation is **load-time**, in one place, called by every loader — CSV today,
+the inline seed next, a database-backed provider later. That is what lets a new
+loader inherit the semantics instead of renegotiating them.
+
+```go
+// defaults: depth 2, 64KiB per value
+if err := provider.ValidateMetadata(md); err != nil { return err }
+
+// or tune the caps — the zero ValueLimits means "the defaults", and any
+// field left zero keeps its default
+limits := provider.ValueLimits{MaxDepth: 3}
+if err := limits.ValidateMetadata(md); err != nil { return err }
+
+// one field at a time, for a loader that reports per-column
+err := provider.ValidateField("tags", []any{"eng", "oncall"})
+```
+
+A violation is `APERTURE_METADATA_INVALID`. Its context carries the **field
+name**, the **path within the value** (`owner.members[0]`), and the offending Go
+**type** — never the value itself, so a validation failure can be logged and
+surfaced without leaking one account's data into another's diagnostics. Fields
+and object keys are walked in sorted order, so a document with several offenders
+always reports the same one.
+
+### The read-only contract is transitive
+
+Once a value can nest, "cached metadata is read-only" has to reach all the way
+down. The cache stores the provider's map **by reference** and never copies it on
+read, so the nested maps and slices inside it are shared too — appending to a
+`[]any` you got back races every other reader exactly as writing the top-level
+map would.
+
+- A provider returns a **fresh** map per object, with fresh nested containers. It
+  must not hand out a value it also retains and mutates, and reloading a source
+  builds a new value rather than editing the old one in place.
+- **No holder** — engine, rules, scope, CLI, server, host code — writes to a
+  `Metadata` it was given, **at any depth**.
+- A consumer that needs to modify metadata copies it (deeply) first.
 
 ## The Registry: binding, cache, invalidation
 
