@@ -76,11 +76,22 @@ non-skippable CI failure. The rule itself is documented in
 | An Aperture error code | `errors/codes.go` (`AllCodes` + `Registry` entry with Message + Fixups) | `TestCodesHaveFixups` |
 | A `skills/*.md` doc | its YAML frontmatter (`name` matching the file stem + `description`) | `TestEverySkillHasFrontmatter` |
 | The Update-Demand rule | `skills/update-demand.md` (must remain present with frontmatter) | `TestUpdateDemandDocPresent` |
+| A rule operator (`Op*` / `opSpecs` in `rules/ast.go`) | `OP_SPECS` in `internal/server/static/js/rules-serializer.js`, the palette in `rules.js`, and `skills/rules-engine.md` | `TestEditorOperatorTablesAgree`, `TestEditorASTContractCoversEveryOperator` |
+| A collection operator's shape expectation (`collOps` in `rules/shape.go`) | the matching `opSpecs` entry in `rules/ast.go` | `TestCollectionOperatorTablesAgree` |
+| A callable rule function (`defaultFunctions` in `rules/compiler.go`) or a blocked builtin (`blockedCallNames`) | `FUNCTIONS` / `BLOCKED_CALLS` in `rules-serializer.js` | `TestEditorVocabularyTablesAgree` |
+| An AST node type, variable root, or var-path grammar | `TYPES` / `ROOTS` / `VAR_PATH` in `rules-serializer.js` | `TestEditorVocabularyTablesAgree` |
+| The metadata value model (`provider/metadata.go`: legal shapes, depth cap, size cap) | `skills/metadata-values.md` and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/metadata_test.go` |
+| A loader's spelling of the value model (CSV column suffix, seed `objects:`) | `skills/metadata-values.md` ("How each loader spells the model") | reviewed; no registry gate |
 
-As real surfaces land (identity, model, engine, scope, provider, rules, account,
-auth, audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage
-gate in `skills/skills_test.go` that walks the surface's registry, then a row
-here.
+The Go↔JS rows matter more than they look: **CI is node-free**, so
+`rules-serializer.test.js` never runs in the pipeline.
+`rules/editor_js_contract_test.go` is what actually enforces parity — it reads
+the JS file from disk and diffs the tables, and it **fails** rather than skips if
+that file moves.
+
+As the remaining surfaces land (identity, model, engine, scope, account, auth,
+audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage gate in
+`skills/skills_test.go` that walks the surface's registry, then a row here.
 
 ## Non-skippable CI gates
 
@@ -93,6 +104,23 @@ here.
   frontmatter.
 - `TestEverySkillHasFrontmatter` — every `skills/*.md` has a `name` (matching its
   file stem) and a `description`.
+- `TestEditorOperatorTablesAgree` / `TestEditorVocabularyTablesAgree` /
+  `TestEditorUnaryOperatorsAgree` / `TestEditorValidationMessagesAgree` — the Go
+  rule AST and the JS serializer expose the same operators, operand shapes, node
+  types, roots, functions, blocked builtins, and validation wording. Reads
+  `rules-serializer.js` from disk; fails (never skips) if it is missing.
+- `TestEditorASTContractCoversEveryOperator` — every operator in `opSpecs` has a
+  byte-stable AST JSON case, so coverage cannot fall behind the registry.
+- `TestCollectionOperatorTablesAgree` — `collOps` (`rules/shape.go`) stays in
+  lockstep with `opSpecs` (`rules/ast.go`).
+
+Gated, NOT in `make test` (a loaded runner would flake them):
+
+- `APERTURE_BENCH_ASSERT=1 go test -run TestCheckNFR ./bench/` — cached `Check`
+  p99 < 1ms and ≥ 10k checks/sec, including the collection and nested-access
+  fixtures.
+- `node internal/server/static/js/rules-serializer.test.js` — CI is node-free, so
+  this is a manual development aid; the Go contract tests above are the real gate.
 
 ## What NOT to do
 
