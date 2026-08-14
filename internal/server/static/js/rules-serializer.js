@@ -12,8 +12,9 @@
  *   graphToAST(astToGraph(ast))  deep-equals  ast.
  * There is NO second rule format — the AST here is byte-for-byte the same shape
  * `rules/ast.go` marshals (fields: type, op, name, value, left, right,
- * children, items; all others omitted). The Rete UI (rules.js) is only an
- * editing surface that produces/consumes this plain graph model.
+ * children, items; all others omitted, including `right` on the three UNARY
+ * comparison operators). The Rete UI (rules.js) is only an editing surface that
+ * produces/consumes this plain graph model.
  *
  * Because it is pure it is unit-testable under `node` with no browser — see
  * rules-serializer.test.js (run: `node internal/server/static/js/rules-serializer.test.js`).
@@ -47,8 +48,66 @@
     CALL: "call",
   };
 
-  // Comparison operators carried in a compare node's `op`.
-  const OPS = ["eq", "ne", "lt", "le", "gt", "ge", "in", "nin"];
+  // RIGHT is the shape a comparison's right operand must take — the JS mirror of
+  // `rightShape` in ast.go, and the operand-shape half of an operator's
+  // contract:
+  //
+  //   ANY         any operand node (the scalar comparisons)
+  //   COLLECTION  a `list` literal or a `var`: the right operand is itself a
+  //               collection (in, nin, hasAll, hasAny, hasNone, subsetOf)
+  //   ELEMENT     a single element — anything but a `list`. A set on the right
+  //               is hasAll/hasAny/hasNone, not has (has, hasKey)
+  //   NONE        no right operand at all: the unary operators, whose compare
+  //               node carries NO `right` key
+  const RIGHT = { ANY: "any", COLLECTION: "collection", ELEMENT: "element", NONE: "none" };
+
+  // OP_SPECS is the closed comparison-operator registry, mirroring `opSpecs` in
+  // rules/ast.go one entry for one entry. Go keeps the operand shape and the
+  // render strategy in a single table so Validate and render cannot disagree.
+  // This side needs only the shape — rendering to expr-lang is the server's job
+  // — but it keeps the SAME table structure so the two files stay comparable at
+  // a glance, and so validateAST is a table lookup rather than a pile of per-op
+  // conditionals that drift one operator at a time.
+  //
+  // The first eight are the scalar/membership operators; the nine that follow
+  // are the collection operators. Three of those (isEmpty, isNotEmpty, exists)
+  // are UNARY: they reuse a `compare` node with `right` OMITTED rather than
+  // introducing a new node type, so the editor gains nine operators and no new
+  // palette primitive. OMITTING the key — never emitting `right: null` — is what
+  // keeps the AST byte-identical across a round-trip through the editor.
+  const OP_SPECS = {
+    eq: { right: RIGHT.ANY }, // ==
+    ne: { right: RIGHT.ANY }, // !=
+    lt: { right: RIGHT.ANY }, // <
+    le: { right: RIGHT.ANY }, // <=
+    gt: { right: RIGHT.ANY }, // >
+    ge: { right: RIGHT.ANY }, // >=
+    in: { right: RIGHT.COLLECTION }, // object.region in ["us", "eu"]
+    nin: { right: RIGHT.COLLECTION }, // not in
+
+    has: { right: RIGHT.ELEMENT }, // object.tags has "x"          (array)
+    hasAll: { right: RIGHT.COLLECTION }, // object.tags has all [a, b]  (array)
+    hasAny: { right: RIGHT.COLLECTION }, // object.tags has any [a, b]  (array)
+    hasNone: { right: RIGHT.COLLECTION }, // object.tags has none [a, b] (array)
+    subsetOf: { right: RIGHT.COLLECTION }, // object.tags subset of [a,b] (array)
+    hasKey: { right: RIGHT.ELEMENT }, // object.owner has key "dept"  (object)
+    isEmpty: { right: RIGHT.NONE }, // object.tags is empty         — unary
+    isNotEmpty: { right: RIGHT.NONE }, // object.tags is not empty     — unary
+    exists: { right: RIGHT.NONE }, // object.owner.dept exists     — unary
+  };
+
+  // Comparison operators carried in a compare node's `op`, derived from the one
+  // registry above so the list can never fall behind it. Key insertion order is
+  // preserved, so this reads in the same order as the Op* consts in ast.go.
+  const OPS = Object.keys(OP_SPECS);
+
+  // isUnaryOp reports whether `op` takes NO right operand. Both serializer
+  // directions consult it: graphToAST must not emit a `right` key for one of
+  // these, and astToGraph must not wire a `right` input for one.
+  function isUnaryOp(op) {
+    const spec = OP_SPECS[op];
+    return !!spec && spec.right === RIGHT.NONE;
+  }
 
   // Context-variable roots a `var` may reference (allowedRoots in ast.go).
   const ROOTS = ["object", "principal", "account", "action"];
@@ -57,7 +116,36 @@
   // defaultFunctions). Advisory only for the palette — the server is the
   // authority (a host may register more), so validateAST does NOT reject an
   // unknown function name; it only checks the identifier shape, like ast.go.
-  const FUNCTIONS = ["lower", "upper", "contains", "startsWith", "endsWith", "len"];
+  //
+  // The last six back the collection operators, which have no native expr-lang
+  // spelling once builtins are disabled. They are callable by name as well as
+  // reachable through their operator, exactly as on the Go side.
+  const FUNCTIONS = [
+    "lower",
+    "upper",
+    "contains",
+    "startsWith",
+    "endsWith",
+    "len",
+    "hasAll",
+    "hasAny",
+    "hasNone",
+    "subsetOf",
+    "isEmpty",
+    "isNotEmpty",
+  ];
+
+  // BLOCKED_CALLS mirrors `blockedCallNames` in ast.go: expr-lang's PREDICATE
+  // builtins, which survive expr.DisableAllBuiltins because the parser matches a
+  // predicate name before it consults the disabled-builtin table. Nothing this
+  // AST emits reaches them today, but a `call` node renders `name(args...)`
+  // verbatim, so the Go validator denies the names structurally. The editor's
+  // save path denies the same names, so a rule the server would refuse is
+  // refused here first — before the round-trip to the API.
+  const BLOCKED_CALLS = [
+    "all", "none", "any", "one", "filter", "map", "count", "sum", "find",
+    "findIndex", "findLast", "findLastIndex", "groupBy", "sortBy", "reduce",
+  ];
 
   // Dotted-identifier-path matcher (varPath in ast.go). Each segment is a
   // Go-style identifier, which keeps the rendered expression injection-free.
@@ -86,7 +174,13 @@
   // inputKeys returns the ordered input-socket keys a node of `type` exposes
   // given how many variadic slots it currently has. The keys are the contract
   // between the graph model and both serializer directions.
-  function inputKeys(type, arity) {
+  //
+  // `op` is consulted only for a compare node, and only to drop the `right` pin
+  // for the three unary operators — a unary compare has one operand, so offering
+  // a second pin would invite a wire the AST has nowhere to put. It is optional
+  // and defaults to the binary shape, so callers that predate the collection
+  // operators keep their behaviour.
+  function inputKeys(type, arity, op) {
     const spec = NODE_SPECS[type];
     if (!spec) return [];
     switch (spec.inputs) {
@@ -95,7 +189,7 @@
       case "child":
         return ["in"];
       case "leftright":
-        return ["left", "right"];
+        return isUnaryOp(op) ? ["left"] : ["left", "right"];
       case "variadic": {
         const n = Math.max(0, arity || 0);
         const keys = [];
@@ -157,13 +251,27 @@
           return { type: type, children: orderedSources(inc).map(build) };
         case TYPES.NOT:
           return { type: TYPES.NOT, children: [build(requireSource(inc, "in", id))] };
-        case TYPES.COMPARE:
-          return {
-            type: TYPES.COMPARE,
-            op: n.op || "",
-            left: build(requireSource(inc, "left", id)),
-            right: build(requireSource(inc, "right", id)),
-          };
+        case TYPES.COMPARE: {
+          // Key order matters: the emitted object is compared against the Go
+          // marshalling (type, op, left, right), so `right` is assigned last.
+          const op = n.op || "";
+          const cmp = { type: TYPES.COMPARE, op: op, left: build(requireSource(inc, "left", id)) };
+          if (isUnaryOp(op)) {
+            // A unary compare emits NO `right` key at all. Setting it to null
+            // would round-trip as a literal null on the Go side and break the
+            // byte-identical guarantee, so a stray wire into `right` is an
+            // error rather than something silently dropped.
+            if (inc.right !== undefined) {
+              throw serErr(
+                "APERTURE_RULE_INVALID",
+                "node " + id + " uses the unary operator `" + op + "`, which takes no right operand"
+              );
+            }
+            return cmp;
+          }
+          cmp.right = build(requireSource(inc, "right", id));
+          return cmp;
+        }
         case TYPES.VAR:
           return { type: TYPES.VAR, name: n.name || "" };
         case TYPES.LITERAL:
@@ -244,11 +352,30 @@
         case TYPES.NOT:
           wire((node.children || [])[0], "in");
           break;
-        case TYPES.COMPARE:
+        case TYPES.COMPARE: {
           g.op = node.op;
           wire(node.left, "left");
+          // The unary operators have no right operand, so no `right` pin is
+          // wired — which is exactly what makes graphToAST omit the key on the
+          // way back. A `right` present on a unary op is a malformed AST (the
+          // Go Validate rejects it too) and is reported rather than dropped,
+          // because dropping it would silently change the rule.
+          const hasRight = node.right !== undefined && node.right !== null;
+          if (isUnaryOp(node.op)) {
+            if (hasRight) {
+              throw serErr(
+                "APERTURE_RULE_INVALID",
+                "unary operator takes no right operand: " + String(node.op)
+              );
+            }
+            break;
+          }
+          if (!hasRight) {
+            throw serErr("APERTURE_RULE_INVALID", "comparison requires a left and a right operand");
+          }
           wire(node.right, "right");
           break;
+        }
         case TYPES.VAR:
           g.name = node.name;
           break;
@@ -329,18 +456,7 @@
           });
           break;
         case TYPES.COMPARE:
-          if (OPS.indexOf(n.op) < 0) {
-            report("APERTURE_RULE_INVALID", "unknown comparison operator: " + String(n.op), path);
-          }
-          if (n.left === undefined || n.left === null || n.right === undefined || n.right === null) {
-            report("APERTURE_RULE_INVALID", "comparison requires a left and a right operand", path);
-          } else {
-            if ((n.op === "in" || n.op === "nin") && n.right.type !== TYPES.LIST && n.right.type !== TYPES.VAR) {
-              report("APERTURE_RULE_INVALID", "in/nin requires a list or variable on the right", path + ".right");
-            }
-            walk(n.left, path + ".left");
-            walk(n.right, path + ".right");
-          }
+          validateCompare(n, path, report, walk);
           break;
         case TYPES.VAR:
           validateVar(n.name, path, report);
@@ -356,6 +472,11 @@
         case TYPES.CALL:
           if (!n.name || !VAR_PATH.test(n.name)) {
             report("APERTURE_RULE_INVALID", "call has an invalid function name: " + String(n.name), path);
+          } else if (BLOCKED_CALLS.indexOf(n.name) >= 0) {
+            // expr's predicate builtins survive DisableAllBuiltins, so the Go
+            // validator denies them by name; deny them here too or the editor
+            // would happily save a rule the server refuses.
+            report("APERTURE_RULE_INVALID", "function is not callable from a rule: " + String(n.name), path);
           }
           (n.items || []).forEach(function (it, i) {
             walk(it, path + ".items[" + i + "]");
@@ -367,6 +488,69 @@
     }
     walk(ast, "$");
     return problems;
+  }
+
+  // validateCompare mirrors `validateCompare` in ast.go: the operator must be
+  // known, the operand ARITY must match it (a unary operator takes no right
+  // operand; every other one requires both), and the right operand's SHAPE must
+  // be something the operator can act on. Driving all three off OP_SPECS is what
+  // keeps this in step with the Go table.
+  //
+  // The arity rule is deliberately per-operator rather than blanket: exactly
+  // isEmpty / isNotEmpty / exists must omit `right`, and a `right` supplied for
+  // one of them is an ERROR rather than something silently ignored — otherwise
+  // the AST would have two spellings for the same rule and would stop
+  // round-tripping predictably.
+  //
+  // Messages and codes are the Go validator's, so a rule refused on the canvas
+  // reports what the server would have reported. Where the Go error carries an
+  // `op` context field, this appends it after a colon, matching the convention
+  // the rest of validateAST already uses.
+  function validateCompare(n, path, report, walk) {
+    let spec = OP_SPECS[n.op];
+    if (!spec) {
+      report("APERTURE_RULE_INVALID", "unknown comparison operator: " + String(n.op), path);
+      // Fall back to the loosest shape so the operand subtrees are still walked:
+      // an unknown operator should not hide a bad variable underneath it. The
+      // server rejects the node either way.
+      spec = { right: RIGHT.ANY };
+    }
+    const left = n.left;
+    const right = n.right;
+    if (left === undefined || left === null) {
+      report("APERTURE_RULE_INVALID", "comparison requires a left operand: " + String(n.op), path);
+    }
+
+    if (spec.right === RIGHT.NONE) {
+      if (right !== undefined && right !== null) {
+        report("APERTURE_RULE_INVALID", "unary operator takes no right operand: " + String(n.op), path + ".right");
+      }
+      if (left !== undefined && left !== null) walk(left, path + ".left");
+      return;
+    }
+
+    if (right === undefined || right === null) {
+      report("APERTURE_RULE_INVALID", "comparison requires a left and a right operand", path);
+      if (left !== undefined && left !== null) walk(left, path + ".left");
+      return;
+    }
+
+    if (spec.right === RIGHT.COLLECTION && right.type !== TYPES.LIST && right.type !== TYPES.VAR) {
+      report(
+        "APERTURE_RULE_INVALID",
+        "operator requires a list or variable on the right: " + String(n.op),
+        path + ".right"
+      );
+    }
+    if (spec.right === RIGHT.ELEMENT && right.type === TYPES.LIST) {
+      report(
+        "APERTURE_RULE_INVALID",
+        "operator requires a single element on the right; use hasAll/hasAny/hasNone for a set: " + String(n.op),
+        path + ".right"
+      );
+    }
+    if (left !== undefined && left !== null) walk(left, path + ".left");
+    walk(right, path + ".right");
   }
 
   function validateVar(name, path, report) {
@@ -428,11 +612,15 @@
   return {
     TYPES: TYPES,
     OPS: OPS,
+    OP_SPECS: OP_SPECS,
+    RIGHT: RIGHT,
     ROOTS: ROOTS,
     FUNCTIONS: FUNCTIONS,
+    BLOCKED_CALLS: BLOCKED_CALLS,
     SOCKET: SOCKET,
     NODE_SPECS: NODE_SPECS,
     VAR_PATH: VAR_PATH,
+    isUnaryOp: isUnaryOp,
     inputKeys: inputKeys,
     graphToAST: graphToAST,
     astToGraph: astToGraph,
