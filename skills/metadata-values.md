@@ -86,6 +86,46 @@ err = limits.ValidateMetadata(md)
 err = limits.ValidateField("tags", value)
 ```
 
+## How each loader spells the model
+
+The model is one thing; each loader's *syntax* for reaching it is its own. A
+loader normalises into the model — it never widens it.
+
+### `csvprovider`
+
+A header column carries `name:type[<elem>][(delim)]`:
+
+```text
+id,tier,seats:int,tags:list,ranks:list<int>,aliases:list(;)
+brand:1,gold,40,premium|launch,3|5,acme;acme-co
+brand:2,silver,,,,
+```
+
+| Suffix | Value |
+|---|---|
+| none / `:string`, `:int`, `:float`, `:bool` | a **scalar** (`int` → `int64`, `float` → `float64`) |
+| `:list` | an **array** of strings, split on `\|` |
+| `:list<int>` / `:list<float>` / `:list<bool>` | an array whose elements go through the **same** scalar coercion |
+| `:list(;)` | the delimiter override, for that column only |
+
+Three rules the value model does not impose, but the CSV encoding must:
+
+- **Element typing is mandatory for numeric membership.** expr does no
+  numeric/string coercion, so `5 in object.seats` is `false` against `["3","5"]`.
+  A silently wrong `false` is the worst failure mode here; `:list<int>` is what
+  prevents it.
+- **No escape syntax.** A value that must contain the delimiter needs a
+  per-column delimiter it does not contain. A stray, doubled, leading, or
+  trailing delimiter yields an empty element and is a **hard error at parse**
+  (`APERTURE_CONFIG_INVALID`, naming the column, the line, and the cell) — never
+  a silently mis-split row.
+- **An empty list cell is `[]`, not an absent field** — the one departure from
+  the scalar rule, so a membership rule gets a definite `false` instead of
+  evaluating against `nil`. Empty *scalar* cells still omit the field.
+
+Grammar and coercion failures are `APERTURE_CONFIG_INVALID`; the value-model
+check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
+
 ## Errors
 
 A violation is **`APERTURE_METADATA_INVALID`**. Its context carries:
@@ -126,6 +166,7 @@ Changing the value model means changing all of these in the same PR:
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
+| A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the
 value model must not change that.

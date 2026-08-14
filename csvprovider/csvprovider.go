@@ -18,17 +18,59 @@
 // object-type the provider is registered under. Every other column becomes a
 // metadata field keyed by the column name.
 //
-// A column name may carry a "name:type" suffix so its cells are coerced to a
-// typed value the rules engine reads as a real type rather than a bare string:
+// A column name may carry a type suffix so its cells are coerced to a typed
+// value the rules engine reads as a real type rather than a bare string. The
+// full grammar is:
+//
+//	name:type[<elem>][(delim)]
+//
+// Scalar types are string (the default, no suffix), int (stored as int64),
+// float (float64), and bool:
 //
 //	id,category_id,seats:int,active:bool,budget:float
 //
-// Supported types: string (the default, no suffix), int (stored as int64),
-// float (float64), and bool. An empty cell omits that field for the row, so a
-// rule can supply its own default. A missing "id" column, a duplicate id, a
-// wrong column count, or a value that will not coerce to its declared type is an
-// APERTURE_CONFIG_INVALID error; a malformed id passes through as the identity
-// package's APERTURE_IDENTITY_INVALID.
+// # Arrays
+//
+// The type "list" produces a real []any, which is what makes membership rules
+// ("premium" in object.tags) decide correctly instead of string-matching a
+// delimited blob — a blob match also matches "premium-trial" and grants access
+// it shouldn't:
+//
+//	id,tags:list,seats:list<int>,aliases:list(;)
+//	brand:1,premium|launch,3|5,acme;acme-co
+//
+// The optional <elem> coerces every element through the SAME scalar vocabulary
+// (list<int>, list<float>, list<bool>; list alone means list<string>). Element
+// typing is not decoration: the expression evaluator does no numeric/string
+// coercion, so 5 in object.seats is FALSE against the strings ["3","5"] — a
+// silent wrong answer, the worst failure mode an access-control engine has.
+//
+// The optional (delim) overrides the element separator for that column only;
+// the default is "|". There is NO escape syntax: a value that must contain the
+// delimiter needs a column delimiter that it does not contain. A stray, doubled,
+// leading, or trailing delimiter — which is what a delimiter inside a value
+// looks like to the parser — yields an empty element and is a hard error at
+// parse rather than a silently mis-split row.
+//
+// # Empty cells
+//
+// An empty cell in a SCALAR column omits that field for the row, so a rule can
+// supply its own default. An empty cell in a LIST column is the one departure:
+// it yields an empty list ([]any{}), not an absent field, so "x" in object.tags
+// is a definite false rather than an evaluation against nil.
+//
+// # Errors
+//
+// A missing "id" column, a duplicate id, a wrong column count, an unknown type
+// or malformed type suffix, a value that will not coerce to its declared type,
+// or a list cell with an empty element is an APERTURE_CONFIG_INVALID error
+// naming the column (and, for a cell, the line and the offending element). A
+// malformed id passes through as the identity package's
+// APERTURE_IDENTITY_INVALID. Every parsed value is additionally checked against
+// the shared metadata value model (provider.ValidateField) before it is stored,
+// so a shape, depth, or size violation fails the load as
+// APERTURE_METADATA_INVALID instead of surfacing as a runtime error on the
+// Check hot path.
 //
 // # Loading and the read-only contract
 //
@@ -36,7 +78,10 @@
 // memory; Reload re-reads it. Per the provider.Metadata contract every returned
 // map is owned by the provider and MUST be treated as read-only: the provider
 // never mutates a map in place — Reload builds a fresh set and swaps it in, so
-// maps already handed to (and cached by) the Registry stay immutable.
+// maps already handed to (and cached by) the Registry stay immutable. The
+// contract is transitive now that a value may be a slice: every list cell is
+// parsed into a slice allocated for that row alone, so no two rows (and no two
+// loads) ever share one.
 //
 // Dependencies stay minimal: csvprovider imports only errors, identity, and
 // provider, plus the standard library (pure-Go, CGO-free).
@@ -202,10 +247,31 @@ func matchFields(md provider.Metadata, fields map[string]any) bool {
 }
 
 // column describes one non-id header column and where to read it in each row.
+// elem and delim are set only for a list column; they stay empty for a scalar.
 type column struct {
 	name  string
-	typ   string
+	typ   string // "string", "int", "float", "bool", or "list"
+	elem  string // element type of a list column ("string" unless <elem> says otherwise)
+	delim string // element separator of a list column (defaultListDelim unless (delim) says otherwise)
 	index int
+}
+
+// typeList is the column type that yields a []any; the rest are scalars.
+const typeList = "list"
+
+// defaultListDelim separates the elements of a list cell unless the header
+// overrides it per column with a "(delim)" suffix.
+const defaultListDelim = "|"
+
+// isScalarType reports whether t is one of the scalar column types. The same set
+// doubles as the legal list element types, deliberately: reusing the scalar
+// vocabulary means an author who knows ":int" already knows ":list<int>".
+func isScalarType(t string) bool {
+	switch t {
+	case "string", "int", "float", "bool":
+		return true
+	}
+	return false
 }
 
 // parseFile opens path and parses it, wrapping an open failure as
@@ -266,14 +332,34 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 		md := make(provider.Metadata, len(cols))
 		for _, c := range cols {
 			cell := strings.TrimSpace(row[c.index])
-			if cell == "" {
-				continue // omit an empty field; a rule can default it
+			var val any
+			if c.typ == typeList {
+				// A list cell always produces a field, empty cell included:
+				// [] is a definite "member of nothing", where an absent field
+				// would leave the rule evaluating against nil.
+				list, err := splitList(cell, c, line)
+				if err != nil {
+					return nil, nil, err
+				}
+				val = list
+			} else {
+				if cell == "" {
+					continue // omit an empty scalar field; a rule can default it
+				}
+				v, err := coerce(cell, c.typ)
+				if err != nil {
+					return nil, nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+						"csvprovider: cannot coerce cell to its declared type",
+						map[string]any{"line": line, "field": c.name, "type": c.typ, "value": cell})
+				}
+				val = v
 			}
-			val, err := coerce(cell, c.typ)
-			if err != nil {
-				return nil, nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
-					"csvprovider: cannot coerce cell to its declared type",
-					map[string]any{"line": line, "field": c.name, "type": c.typ, "value": cell})
+			// The shared value model is the single authority on what a metadata
+			// value may be; the loader never re-implements those rules. A
+			// violation fails the load rather than reaching the Check hot path.
+			if err := provider.ValidateField(c.name, val); err != nil {
+				return nil, nil, aerr.Wrapf(aerr.APERTURE_METADATA_INVALID, err,
+					"csvprovider: line %d: metadata field %q rejected by the value model", line, c.name)
 			}
 			md[c.name] = val
 		}
@@ -307,20 +393,129 @@ func parseHeader(header []string) (cols []column, idCol int, err error) {
 			idCol = i
 			continue // the identity column, not a metadata field
 		}
-		switch typ {
-		case "string", "int", "float", "bool":
-		default:
-			return nil, -1, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
-				"csvprovider: unknown column type",
-				map[string]any{"name": name, "type": typ})
+		c, err := parseTypeSuffix(name, typ)
+		if err != nil {
+			return nil, -1, err
 		}
-		cols = append(cols, column{name: name, typ: typ, index: i})
+		c.index = i
+		cols = append(cols, c)
 	}
 	if idCol < 0 {
 		return nil, -1, aerr.New(aerr.APERTURE_CONFIG_INVALID,
 			`csvprovider: header has no "id" column`)
 	}
 	return cols, idCol, nil
+}
+
+// parseTypeSuffix parses the part of a header cell after the ":" into a column,
+// per the grammar type[<elem>][(delim)]. The optional groups are stripped from
+// the right in the order they must appear, so a reordered or unterminated suffix
+// leaves a stray bracket behind and is rejected rather than silently accepted.
+// Every failure is APERTURE_CONFIG_INVALID naming the column.
+func parseTypeSuffix(name, suffix string) (column, error) {
+	rest := suffix
+
+	// (delim) — the outermost optional group.
+	delim, delimSet := "", false
+	if strings.HasSuffix(rest, ")") {
+		open := strings.Index(rest, "(")
+		if open < 0 {
+			return column{}, malformedSuffix(name, suffix)
+		}
+		delim, delimSet = rest[open+1:len(rest)-1], true
+		rest = rest[:open]
+	}
+	if strings.ContainsAny(rest, "()") {
+		return column{}, malformedSuffix(name, suffix)
+	}
+
+	// <elem> — the inner optional group.
+	elem, elemSet := "", false
+	if strings.HasSuffix(rest, ">") {
+		open := strings.Index(rest, "<")
+		if open < 0 {
+			return column{}, malformedSuffix(name, suffix)
+		}
+		elem, elemSet = rest[open+1:len(rest)-1], true
+		rest = rest[:open]
+	}
+	if strings.ContainsAny(rest, "<>") {
+		return column{}, malformedSuffix(name, suffix)
+	}
+
+	typ := rest
+	if typ != typeList {
+		if !isScalarType(typ) {
+			return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+				"csvprovider: unknown column type",
+				map[string]any{"name": name, "type": typ})
+		}
+		if elemSet || delimSet {
+			return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+				"csvprovider: only a list column takes an element type or a delimiter",
+				map[string]any{"name": name, "type": typ, "suffix": suffix})
+		}
+		return column{name: name, typ: typ}, nil
+	}
+
+	if !elemSet {
+		elem = "string" // ":list" is ":list<string>"
+	}
+	if !isScalarType(elem) {
+		return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: unknown list element type; use string, int, float, or bool",
+			map[string]any{"name": name, "elem": elem})
+	}
+	if !delimSet {
+		delim = defaultListDelim
+	}
+	if delim == "" {
+		return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: list delimiter cannot be empty",
+			map[string]any{"name": name, "suffix": suffix})
+	}
+	return column{name: name, typ: typeList, elem: elem, delim: delim}, nil
+}
+
+// malformedSuffix is the one error for a type suffix that does not fit the
+// grammar (a reordered, unterminated, or stray bracket group).
+func malformedSuffix(name, suffix string) error {
+	return aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+		"csvprovider: malformed column type suffix; want name:type[<elem>][(delim)]",
+		map[string]any{"name": name, "suffix": suffix})
+}
+
+// splitList turns one list cell into its coerced elements. The slice it returns
+// is freshly allocated for this row — no two rows and no two loads ever share
+// one, which is what keeps the read-only metadata contract true at depth.
+//
+// An empty cell is an EMPTY list, not an absent field. An empty element (a
+// stray, doubled, leading, or trailing delimiter — how a delimiter inside a
+// value looks to the parser) is a hard error: there is no escape syntax, so the
+// fix is a per-column delimiter the data does not contain.
+func splitList(cell string, c column, line int) ([]any, error) {
+	if cell == "" {
+		return []any{}, nil
+	}
+	parts := strings.Split(cell, c.delim)
+	out := make([]any, 0, len(parts))
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+				"csvprovider: list cell has an empty element, so a value collides with the column delimiter; "+
+					`there is no escape syntax — give the column a delimiter its data does not contain, e.g. name:list(;)`,
+				map[string]any{"line": line, "field": c.name, "delimiter": c.delim, "index": i, "value": cell})
+		}
+		v, err := coerce(part, c.elem)
+		if err != nil {
+			return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+				"csvprovider: cannot coerce list element to its declared element type",
+				map[string]any{"line": line, "field": c.name, "elem": c.elem, "index": i, "value": part})
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // coerce converts a raw cell to the value for its declared column type. int is
