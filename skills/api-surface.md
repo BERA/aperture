@@ -48,7 +48,10 @@ Full surface:
   `Put/Get/List/Delete` for `Grant`.
 - **Object identifiers (read)**: `ObjectIdentifiers(objectType, exclude...)`
   enumerates a type's INSTANCE ids from its provider (the `providers:` or
-  `objects:` section a seed declares, wired with `WithProviders`) — the complete,
+  `objects:` section a seed declares, wired with `WithProviders`; when both
+  sections claim a type the file-backed `providers:` entry wins the type outright
+  and every inline entry for it is discarded, so the ids enumerated are the
+  file's alone — see `skills/metadata-values.md`) — the complete,
   unbounded set, minus
   any `exclude` ids. It materialises the positive allow-list an EXCLUSIVE
   allowance ("all objects of this type except these ids") expands to. An

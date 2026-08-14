@@ -2,6 +2,9 @@ package seed
 
 import (
 	"context"
+	goerrors "errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -287,16 +290,208 @@ func TestInlineObjects_ApplyWritesNothingAndExportOmitsThem(t *testing.T) {
 	}
 }
 
-// Until E3-S2 settles precedence, a type served by BOTH sections is a hard
-// registration conflict rather than a silent winner.
+// A type served by BOTH sections is a CONFIGURATION fault, not the incidental
+// duplicate-registration error it used to surface as: the precedence rule
+// discards every inline entry for the type, and a silent-by-default discard is
+// hostile, so the collision is refused by name.
 func TestInlineObjects_ConflictWithProvidersSection(t *testing.T) {
 	doc := &Document{
 		Providers: []Provider{{ObjectType: "brand", Kind: "csv", Path: "brands.csv"}},
 		Objects:   []Object{{ID: "brand:1"}},
 	}
 	_, err := doc.BuildRegistry("")
-	if aerr.CodeOf(err) != aerr.APERTURE_PROVIDER_INVALID {
-		t.Fatalf("code = %s, want APERTURE_PROVIDER_INVALID", aerr.CodeOf(err))
+	if aerr.CodeOf(err) != aerr.APERTURE_CONFIG_INVALID {
+		t.Fatalf("code = %s, want APERTURE_CONFIG_INVALID", aerr.CodeOf(err))
+	}
+	msg := err.Error()
+	// The colliding TYPE is named so the author can find the two declarations...
+	if !strings.Contains(msg, "brand") {
+		t.Errorf("error %q does not name the colliding object type", msg)
+	}
+	// ...and the object id is NOT, because an id can embed an account.
+	if strings.Contains(msg, "brand:1") {
+		t.Errorf("error %q leaks an object id", msg)
+	}
+	// The escape hatch is named in the error, not just in the docs.
+	if !strings.Contains(msg, "AllowProviderPrecedence") {
+		t.Errorf("error %q does not point at the override", msg)
+	}
+}
+
+// Every colliding type is reported at once, in a stable order, so one fix pass
+// clears the document.
+func TestInlineObjects_ConflictReportsEveryTypeSorted(t *testing.T) {
+	doc := &Document{
+		Providers: []Provider{
+			{ObjectType: "brand", Kind: "csv", Path: "brands.csv"},
+			{ObjectType: "app", Kind: "csv", Path: "apps.csv"},
+		},
+		Objects: []Object{{ID: "brand:1"}, {ID: "app:be"}},
+	}
+	_, err := doc.BuildRegistry("")
+	if aerr.CodeOf(err) != aerr.APERTURE_CONFIG_INVALID {
+		t.Fatalf("code = %s, want APERTURE_CONFIG_INVALID", aerr.CodeOf(err))
+	}
+	var ce *aerr.CodedError
+	if !goerrors.As(err, &ce) {
+		t.Fatalf("error is not a *CodedError: %v", err)
+	}
+	got, _ := ce.Context["object_types"].([]string)
+	if !reflect.DeepEqual(got, []string{"app", "brand"}) {
+		t.Errorf("object_types = %#v, want sorted [app brand]", ce.Context["object_types"])
+	}
+	// Sorted in the message too, so the text is stable across runs (the groups
+	// themselves come back in declaration order, which is brand-then-app here).
+	if !strings.Contains(err.Error(), "app, brand") {
+		t.Errorf("error %q does not list both types in a stable order", err.Error())
+	}
+}
+
+// With the override, precedence is TYPE-LEVEL and TOTAL: the file-backed
+// provider serves the whole type and every inline entry for it is discarded.
+// There is no merge at any granularity and no fallback — an inline id the CSV
+// does not carry is simply not resolvable, and a field only the inline entry
+// declared does not appear on the ids the CSV does carry.
+func TestInlineObjects_ProviderPrecedenceDiscardsInlineEntirely(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "brands.csv"),
+		[]byte("id,tier\nbrand:1,bronze\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Parse([]byte(`
+providers:
+  - {object_type: brand, kind: csv, path: brands.csv, ttl: "0"}
+objects:
+  - id: brand:1
+    metadata: {tier: gold, seats: 12}
+  - id: brand:2
+    metadata: {tier: silver}
+`), FormatYAML)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	reg, err := doc.BuildRegistry(dir, AllowProviderPrecedence())
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+
+	md, err := reg.Fetch(context.Background(), identity.MustParse("brand:1"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	// The file wins the value it does carry...
+	if md["tier"] != "bronze" {
+		t.Errorf("tier = %v, want bronze from the CSV", md["tier"])
+	}
+	// ...and does NOT gain the field only the inline entry declared: no
+	// field-level merge, which is the whole point of the rule.
+	if _, ok := md["seats"]; ok {
+		t.Errorf("metadata = %v, want no inline field merged in", md)
+	}
+	// An id the CSV lacks is not resolvable: no object-level fallback either.
+	if _, err := reg.Fetch(context.Background(), identity.MustParse("brand:2")); aerr.CodeOf(err) != aerr.APERTURE_NOT_FOUND {
+		t.Errorf("code = %s, want APERTURE_NOT_FOUND for an id only the inline section declared", aerr.CodeOf(err))
+	}
+	// Nor through enumeration — the discarded entries are gone, not hidden.
+	ids, err := reg.Identifiers(context.Background(), "brand")
+	if err != nil {
+		t.Fatalf("Identifiers: %v", err)
+	}
+	if len(ids) != 1 || ids[0].String() != "brand:1" {
+		t.Errorf("Identifiers = %v, want only the CSV's ids", ids)
+	}
+}
+
+// The discard is scoped to the colliding TYPE. Inline entries for a type with no
+// providers: entry are untouched, in the same document.
+func TestInlineObjects_NonCollidingTypesUnaffected(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "brands.csv"),
+		[]byte("id,tier\nbrand:1,bronze\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := Parse([]byte(`
+providers:
+  - {object_type: brand, kind: csv, path: brands.csv, ttl: "0"}
+objects:
+  - id: brand:1
+    metadata: {tier: gold}
+  - id: app:be
+    metadata: {tier: gold, seats: 3}
+`), FormatYAML)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	reg, err := doc.BuildRegistry(dir, AllowProviderPrecedence())
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	if !reg.Has("brand") || !reg.Has("app") {
+		t.Fatalf("registry keys = %v, want brand and app", reg.Keys())
+	}
+	md, err := reg.Fetch(context.Background(), identity.MustParse("app:be"))
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	want := map[string]any{"tier": "gold", "seats": int64(3)}
+	if !reflect.DeepEqual(map[string]any(md), want) {
+		t.Errorf("app metadata = %#v, want %#v", md, want)
+	}
+}
+
+// Validation runs over EVERY inline entry before precedence is applied, so a
+// malformed declaration still fails the load even when its type is about to be
+// discarded. Otherwise a document would silently stop being checked the day
+// someone added a CSV for one of its types.
+func TestInlineObjects_DiscardedTypeIsStillValidated(t *testing.T) {
+	cases := map[string]struct {
+		yaml string
+		want aerr.Code
+	}{
+		"value model violation": {
+			"objects:\n  - id: brand:1\n    metadata:\n      members: [{id: 1}]\n",
+			aerr.APERTURE_CONFIG_INVALID,
+		},
+		"duplicate id": {
+			"objects:\n  - id: brand:1\n  - id: brand:1\n",
+			aerr.APERTURE_CONFIG_INVALID,
+		},
+		"missing id": {
+			"objects:\n  - metadata: {tier: gold}\n",
+			aerr.APERTURE_CONFIG_INVALID,
+		},
+		"malformed id": {
+			"objects:\n  - id: \"not an identity\"\n",
+			aerr.APERTURE_IDENTITY_INVALID,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			doc, err := Parse([]byte(tc.yaml), FormatYAML)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			doc.Providers = []Provider{{ObjectType: "brand", Kind: "csv", Path: "brands.csv"}}
+			_, err = doc.BuildRegistry("", AllowProviderPrecedence())
+			if aerr.CodeOf(err) != tc.want {
+				t.Fatalf("code = %s, want %s (err=%v)", aerr.CodeOf(err), tc.want, err)
+			}
+		})
+	}
+}
+
+// The override changes nothing for a document that has no collision.
+func TestInlineObjects_ProviderPrecedenceIsANoOpWithoutCollision(t *testing.T) {
+	doc, err := Parse([]byte(inlineObjectsYAML), FormatYAML)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	reg, err := doc.BuildRegistry("", AllowProviderPrecedence())
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	if len(reg.Keys()) != 2 || !reg.Has("brand") || !reg.Has("app") {
+		t.Fatalf("registry keys = %v, want brand and app", reg.Keys())
 	}
 }
 
