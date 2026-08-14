@@ -12,9 +12,16 @@ place, by the model in `provider/metadata.go`.
 
 The reason is the hot path. Metadata reaches the expression evaluator with **no
 conversion** (`rules/compiler.go` puts it straight into the expr environment), so
-a value of the wrong shape is not a `false` decision — it is a *runtime* error
-during `Check` (`operator "in" not defined on string`). Validating shapes at
-**load** time is what keeps that error out of the decision path.
+a wrong-shaped value is a decision made on data nobody meant to write. The rules
+engine is deny-safe about it — a collection operator over a non-collection is
+`false`, plus an `Explain` note, never an `APERTURE_RULE_EVAL` error (see
+`rules-engine`) — but a silent deny is still a bug in the model. Validating
+shapes at **load** time is what turns it into a loud one, at the point the data
+enters, with the offending field named.
+
+Load-time validation cannot reach everything: a host-implemented `ObjectProvider`
+and the `principal` attribute bag bypass the loaders. That is why the runtime
+policy exists as well; the two are complements, not alternatives.
 
 ## The model
 

@@ -27,33 +27,60 @@ func collectionMetadata() map[string]any {
 }
 
 // TestCollectionOperatorRender pins the rendered expr-lang source for every new
-// operator, which is also the per-operator record of the native-vs-registered
-// choice: has/hasKey flip into expr's `in`, exists becomes a nil test, and the
-// other six call a backing function from defaultFunctions().
+// operator.
+//
+// E5-S1 changed what most of these render to. A comparison whose collection
+// operand is a VARIABLE could meet the wrong shape at runtime, so it renders to
+// the guarded dispatcher `$op` (ast.go renderGuarded) — that is what makes a
+// mistyped field deny with a note instead of raising APERTURE_RULE_EVAL. The
+// E4-S1 native/backing-function forms survive wherever no operand can mismatch:
+// a LIST LITERAL is an array by construction, so `x in ["us"]` keeps its native
+// `in`, and `hasAll([...], [...])` keeps its backing call. exists never guards —
+// a nil test has no shape contract.
 func TestCollectionOperatorRender(t *testing.T) {
 	cases := []struct {
 		name string
 		node *Node
 		want string
 	}{
-		{"has renders as a flipped in", Compare(OpHas, Var("object.tags"), Lit("x")),
-			`("x" in object?.tags)`},
-		{"hasKey renders as a flipped in (map keys)", Compare(OpHasKey, Var("object.owner"), Lit("dept")),
-			`("dept" in object?.owner)`},
-		{"hasAll calls its backing function", Compare(OpHasAll, Var("object.tags"), List(Lit("a"), Lit("b"))),
-			`hasAll(object?.tags, ["a", "b"])`},
-		{"hasAny calls its backing function", Compare(OpHasAny, Var("object.tags"), List(Lit("a"))),
-			`hasAny(object?.tags, ["a"])`},
-		{"hasNone calls its backing function", Compare(OpHasNone, Var("object.tags"), List(Lit("z"))),
-			`hasNone(object?.tags, ["z"])`},
-		{"subsetOf calls its backing function", Compare(OpSubsetOf, Var("object.tags"), Var("object.allowed")),
-			`subsetOf(object?.tags, object?.allowed)`},
-		{"isEmpty is unary", Unary(OpIsEmpty, Var("object.tags")),
-			`isEmpty(object?.tags)`},
+		{"has over a variable is guarded", Compare(OpHas, Var("object.tags"), Lit("x")),
+			`$op("has", __notes, "object.tags", object?.tags, "", "x")`},
+		{"hasKey over a variable is guarded", Compare(OpHasKey, Var("object.owner"), Lit("dept")),
+			`$op("hasKey", __notes, "object.owner", object?.owner, "", "dept")`},
+		{"hasAll over a variable is guarded", Compare(OpHasAll, Var("object.tags"), List(Lit("a"), Lit("b"))),
+			`$op("hasAll", __notes, "object.tags", object?.tags, "", ["a", "b"])`},
+		{"hasAny over a variable is guarded", Compare(OpHasAny, Var("object.tags"), List(Lit("a"))),
+			`$op("hasAny", __notes, "object.tags", object?.tags, "", ["a"])`},
+		{"hasNone over a variable is guarded", Compare(OpHasNone, Var("object.tags"), List(Lit("z"))),
+			`$op("hasNone", __notes, "object.tags", object?.tags, "", ["z"])`},
+		{"subsetOf carries both operand paths", Compare(OpSubsetOf, Var("object.tags"), Var("object.allowed")),
+			`$op("subsetOf", __notes, "object.tags", object?.tags, "object.allowed", object?.allowed)`},
+		{"isEmpty is unary (right renders as \"\"/nil)", Unary(OpIsEmpty, Var("object.tags")),
+			`$op("isEmpty", __notes, "object.tags", object?.tags, "", nil)`},
 		{"isNotEmpty is unary", Unary(OpIsNotEmpty, Var("object.owner")),
-			`isNotEmpty(object?.owner)`},
+			`$op("isNotEmpty", __notes, "object.owner", object?.owner, "", nil)`},
 		{"exists renders as a nil test through optional chaining", Unary(OpExists, Var("object.owner.dept")),
 			`(object?.owner?.dept != nil)`},
+
+		// No operand can be the wrong shape: the E4-S1 forms are kept.
+		{"in over a list literal keeps its native render", Compare(OpIn, Var("object.region"), List(Lit("us"))),
+			`(object?.region in ["us"])`},
+		{"nin over a list literal keeps its native render", Compare(OpNin, Var("principal.id"), List(Lit("a"))),
+			`(principal?.id not in ["a"])`},
+		{"has over a list literal keeps its flipped in", Compare(OpHas, List(Lit("a")), Lit("a")),
+			`("a" in ["a"])`},
+		{"hasAll over two list literals keeps its backing call", Compare(OpHasAll, List(Lit("a")), List(Lit("a"))),
+			`hasAll(["a"], ["a"])`},
+		{"isEmpty over a list literal keeps its backing call", Unary(OpIsEmpty, List()),
+			`isEmpty([])`},
+
+		// A variable on either side is enough to guard.
+		{"in over a variable collection is guarded", Compare(OpIn, Var("principal.id"), Var("object.editors")),
+			`$op("in", __notes, "principal.id", principal?.id, "object.editors", object?.editors)`},
+		{"nin over a variable collection is guarded", Compare(OpNin, Var("principal.id"), Var("object.blocklist")),
+			`$op("nin", __notes, "principal.id", principal?.id, "object.blocklist", object?.blocklist)`},
+		{"a non-variable operand has no path to report", Unary(OpIsEmpty, Call("lower", Var("object.title"))),
+			`$op("isEmpty", __notes, "", lower(object?.title), "", nil)`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -166,43 +193,9 @@ func TestCollectionOperatorEval(t *testing.T) {
 	}
 }
 
-// TestCollectionOperatorTypeMismatchErrors pins the other half of the policy: an
-// ABSENT field is deny-safe, but a field of the WRONG SHAPE is an
-// APERTURE_RULE_EVAL error rather than a silent false. That matches expr's own
-// `operator "in" not defined on string`, and it is the reason the value model is
-// validated at load time.
-func TestCollectionOperatorTypeMismatchErrors(t *testing.T) {
-	c := NewCompiler()
-	ctx := context.Background()
-	md := collectionMetadata()
-
-	cases := []struct {
-		name string
-		node *Node
-	}{
-		{"has over a string", Compare(OpHas, Var("object.title"), Lit("he"))},
-		{"has over a number", Compare(OpHas, Var("object.n"), Lit(1))},
-		{"hasAll over a string", Compare(OpHasAll, Var("object.title"), List(Lit("h")))},
-		{"hasAny over an object", Compare(OpHasAny, Var("object.owner"), List(Lit("dept")))},
-		{"hasNone over a number", Compare(OpHasNone, Var("object.n"), List(Lit(5)))},
-		{"subsetOf over a string", Compare(OpSubsetOf, Var("object.title"), List(Lit("h")))},
-		{"isEmpty over a number", Unary(OpIsEmpty, Var("object.n"))},
-		{"isNotEmpty over a number", Unary(OpIsNotEmpty, Var("object.n"))},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			compiled, err := c.Compile(tc.node)
-			if err != nil {
-				t.Fatalf("compile: %v", err)
-			}
-			if _, err := compiled.Eval(ctx, Input{Object: md}); err == nil {
-				t.Fatalf("expected an eval error for a shape mismatch")
-			} else if code := aerr.CodeOf(err); code != aerr.APERTURE_RULE_EVAL {
-				t.Fatalf("code = %q, want APERTURE_RULE_EVAL (err: %v)", code, err)
-			}
-		})
-	}
-}
+// The other half of the policy — a field of the WRONG SHAPE — was an
+// APERTURE_RULE_EVAL error in E4-S1 and is a deny-safe false plus an Explain note
+// as of E5-S1. Its coverage lives in shape_test.go.
 
 // TestUnaryOperandValidation is the arity contract. Exactly isEmpty, isNotEmpty
 // and exists must OMIT Right; supplying one is an error rather than something

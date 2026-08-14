@@ -95,6 +95,16 @@ registers:
 - **Registered pure functions.** `hasAll` `hasAny` `hasNone` `subsetOf`
   `isEmpty` `isNotEmpty` have no native spelling with builtins off, so each is
   backed by a deterministic, side-effect-free function in the curated set.
+- **Guarded.** Whichever of the two forms above applies, a collection operator
+  whose collection operand is not *statically* a collection — anything but a
+  list literal, so in practice any operand reading metadata — renders instead to
+  the internal dispatcher `$op(op, __notes, leftPath, left, rightPath, right)`,
+  which applies the deny-safe shape policy below and records the note. The
+  common `object.region in ["us","eu"]` keeps its native `in`: a list literal is
+  an array by construction and cannot mismatch, so the decision path pays
+  nothing. Neither `$op` nor `__notes` is reachable from a rule — `$` is outside
+  the name grammar `Validate` enforces, and `__notes` is not an exposed context
+  root — so the guard is compiler-only by construction, not by denylist.
 
 **expr's predicate builtins are denied.** `expr.DisableAllBuiltins()` does not
 reach `all`, `any`, `none`, `one`, `filter`, `map`, `count`, `sum`, `find`,
@@ -142,7 +152,7 @@ rules.And(
 
 Other missing-field behavior: equality against a missing field is `false`; an
 ordered comparison (`lt le gt ge`) against one is an `APERTURE_RULE_EVAL` runtime
-error, as is `in` over a non-collection (a string or a number).
+error.
 
 **Every collection operator follows the same rule: an absent field reads as an
 EMPTY collection, never an error.** Which way that falls depends on the
@@ -152,10 +162,68 @@ operator's polarity, and the negative ones grant just like `nin`:
 |---|---|---|---|---|---|---|---|---|---|
 | result | `false` | `false` | `false` | `false` | `false` | `false` | **`true`** | **`true`** | **`true`** |
 
-A field of the **wrong shape** is a different story and is still an
-`APERTURE_RULE_EVAL` error — `hasAll` over a string, `isEmpty` over a number,
-`has` over a number. Deny-safety covers missing data, not mistyped data; that is
-why the value model is validated at load time.
+## Wrong-shaped fields: deny-safe, and noted
+
+A field of the **wrong shape** — `has` over a string, `hasAll` over a number,
+`isEmpty` over a bool — **evaluates to `false`**. Every collection operator, no
+exceptions, including the negative ones: `nin` over a string is `false`, not
+`true`. A mismatch never matches, whatever the operator's polarity, so mistyped
+data can only ever deny.
+
+It is never an `APERTURE_RULE_EVAL` error. Load-time validation of the value
+model stops mistyped data from the CSV and inline loaders, but it cannot cover a
+host-implemented `ObjectProvider` or the `principal` attribute bag, which bypass
+loaders entirely — and one mistyped field must not break every `Check` that
+touches it.
+
+Note the asymmetry with the absent-field table above, and that it is deliberate:
+
+| operand | policy |
+|---|---|
+| absent (`nil`) | reads as an **empty collection**; the operator's own semantics decide (negative ops match) |
+| wrong shape | the comparison is **`false`**, whatever the operator |
+
+Which shapes each operator accepts:
+
+| operators | accepts | expected-shape wording in a note |
+|---|---|---|
+| `in` `nin` `has` `hasKey` | array (elements) or object (keys) | `collection` |
+| `hasAll` `hasAny` `hasNone` `subsetOf` | array | `array` |
+| `isEmpty` `isNotEmpty` | array, object, or string | `array, object, or string` |
+| `exists` | anything — a nil test cannot mismatch | — |
+
+### Evaluation notes
+
+A silent `false` is how an access-control bug hides, so every mismatch is
+**recorded** and surfaced in `Explain` on every decision surface (library, CLI,
+Twirp `trace_json`, MCP):
+
+```
+object.tags: expected collection, got string
+```
+
+Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
+`Actual` — carrying **shape and path only, never a metadata value**. Two kinds
+are recorded today:
+
+- `shape_mismatch` — a collection operator met a non-collection.
+- `absent_field` — an operator **matched because the field is missing** (the
+  `nin` / `hasNone` / `subsetOf` / `isEmpty` grant above), which is otherwise
+  invisible in the verdict.
+
+The channel is opt-in and costs the decision path nothing: `Check` and
+`Enumerate` install no collector, so nothing is recorded and nothing is
+allocated; `Explain` installs one per grant. Direct library use:
+
+```go
+ctx, notes := rules.WithNoteCollector(ctx) // engine.Explain does this for you
+allowed, err := compiled.Eval(ctx, in)     // notes land in the collector
+_ = notes.Notes()
+
+ok, ns, err := compiled.EvalWithNotes(ctx, in) // or take them back directly
+```
+
+Notes are **diagnostic only** — they never influence a verdict.
 
 ## Validation before evaluation
 
@@ -171,7 +239,8 @@ evaluation, surfacing coded errors:
 - `APERTURE_RULE_TYPE_ERROR` — type-incompatible comparison, non-boolean result,
   or a call to an unregistered function (caught by the expression type-checker).
 - `APERTURE_RULE_EVAL` — a runtime failure (e.g. an ordered comparison against a
-  metadata field the object lacks) or a non-boolean result.
+  metadata field the object lacks) or a non-boolean result. A wrong-shaped
+  collection operand is **not** one of these: it denies with a note.
 - `APERTURE_RULE_NOT_FOUND` — a scope rule reference the `RuleSource` cannot
   resolve.
 

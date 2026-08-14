@@ -8,6 +8,7 @@ import (
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/scope"
 )
 
@@ -34,6 +35,16 @@ type Trace struct {
 	// MaxSpecificity is the top specificity among the covering candidates, the
 	// tier the deny-overrides tiebreak resolved at. Zero when nothing covered.
 	MaxSpecificity int
+	// Notes are the diagnostic observations rule evaluation recorded while
+	// resolving this decision — today, deny-safe shape mismatches and matches
+	// produced by an absent field. They explain a verdict that is otherwise
+	// silent: a rule that evaluated false because a metadata field was the wrong
+	// shape looks identical to one that simply did not match. Empty on any
+	// decision that evaluated no rule.
+	//
+	// Notes are DIAGNOSTIC ONLY: they never influence the verdict, and Check /
+	// Enumerate do not collect them at all.
+	Notes []EvaluationNote
 	// Decision is the final verdict, reason, and deciding grant ids — identical
 	// to what Check returns for the same request.
 	Decision Decision
@@ -77,6 +88,59 @@ type GrantEvaluation struct {
 	Deciding bool
 	// Outcome is a short human-readable note on this grant's disposition.
 	Outcome string
+}
+
+// EvaluationNote is one diagnostic observation a rule evaluation recorded while
+// a grant's scope was being resolved, tied back to the grant that triggered it.
+//
+// It is the decision-surface projection of rules.Note: a flat, self-describing
+// record every surface can serialize (the Twirp trace JSON and the MCP explain
+// tool both carry Trace verbatim) without importing the rules package's types.
+//
+// SHAPE AND PATH ONLY. A note names the variable path, the shape expected and the
+// shape found. It NEVER carries a metadata value, an object id, or anything else
+// that could leak data across accounts — Explain output crosses account
+// boundaries the same way an error message does.
+type EvaluationNote struct {
+	// GrantID is the grant whose scope resolution recorded the note.
+	GrantID string
+	// Rule is the rule reference that was evaluated.
+	Rule string
+	// Kind classifies the observation ("shape_mismatch", "absent_field").
+	Kind string
+	// Op is the comparison operator that made the observation ("hasAll", ...).
+	Op string
+	// Path is the dotted variable path of the operand ("object.tags"), or empty
+	// when the operand was not a plain variable reference.
+	Path string
+	// Expected is the shape the operator requires ("collection", "array", ...).
+	Expected string
+	// Actual is the shape actually found ("string", "number", "absent", ...).
+	Actual string
+	// Message is the one-line rendering surfaces print.
+	Message string
+}
+
+// evaluationNotes projects the rules package's notes onto the trace's own type,
+// stamping each with the grant whose resolution produced it.
+func evaluationNotes(grantID string, notes []rules.Note) []EvaluationNote {
+	if len(notes) == 0 {
+		return nil
+	}
+	out := make([]EvaluationNote, len(notes))
+	for i, n := range notes {
+		out[i] = EvaluationNote{
+			GrantID:  grantID,
+			Rule:     n.Rule,
+			Kind:     string(n.Kind),
+			Op:       n.Op,
+			Path:     n.Path,
+			Expected: n.Expected,
+			Actual:   n.Actual,
+			Message:  n.String(),
+		}
+	}
+	return out
 }
 
 // Explain resolves the request exactly as Check does but records the full
@@ -153,10 +217,16 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 			tr.Considered = append(tr.Considered, ev)
 			continue
 		}
-		covered, spec, err := e.coverer.cover(ctx, req, g, perm, object)
+		// Explain — and only Explain — installs an evaluation-notes collector, so
+		// a rule-backed scope resolver's diagnostics travel back up through the
+		// scope seam without widening any of its interfaces. One collector per
+		// grant is what ties each note to the grant that produced it.
+		noteCtx, collector := rules.WithNoteCollector(ctx)
+		covered, spec, err := e.coverer.cover(noteCtx, req, g, perm, object)
 		if err != nil {
 			return Trace{}, err
 		}
+		tr.Notes = append(tr.Notes, evaluationNotes(g.ID, collector.Notes())...)
 		ev.Covered = covered
 		ev.Specificity = spec
 		if covered {
@@ -233,6 +303,16 @@ func (t Trace) String() string {
 		}
 		fmt.Fprintf(&b, "   %s %s [%s %s] %s\n", marker, ev.GrantID, ev.Effect, ev.ObjectPattern, ev.Outcome)
 	}
+	// Evaluation notes come after the grants and before the verdict: they explain
+	// how a grant's rule behaved, which is what an operator reads next when a
+	// covering grant unexpectedly did not cover.
+	if len(t.Notes) > 0 {
+		fmt.Fprintf(&b, "  evaluation notes (%d):\n", len(t.Notes))
+		for _, n := range t.Notes {
+			fmt.Fprintf(&b, "     %s [rule %s]: %s\n", n.GrantID, n.Rule, n.Message)
+		}
+	}
+
 	fmt.Fprintf(&b, "  verdict: %s (top specificity %d)\n", verdict, t.MaxSpecificity)
 	fmt.Fprintf(&b, "  reason: %s\n", t.Decision.Reason)
 	return b.String()

@@ -83,10 +83,43 @@ enumerates unboundedly:
   (dangling-permission) grants are listed too, so the trace shows what was
   ruled out, not only what decided.
 - `MaxSpecificity` — the tier the tiebreak resolved at.
+- `Notes []EvaluationNote` — diagnostics rule evaluation recorded while resolving
+  a grant's scope (see below). Empty when no rule was evaluated.
 - `Decision` — identical to what Check returns.
 
 `Trace.String()` renders an operator-readable report (subjects, each grant's
-disposition, the verdict and reason), with the deciding grants marked.
+disposition, any evaluation notes, the verdict and reason), with the deciding
+grants marked.
+
+### Evaluation notes
+
+A rule-backed scope can decide `false` for a reason the verdict does not show:
+the metadata field it reads is the **wrong shape** (a string where an array was
+meant), or it **matched only because the field is absent**. Both are deny-safe by
+policy — a shape mismatch evaluates to `false` rather than raising
+`APERTURE_RULE_EVAL` — and both would otherwise be invisible, so `Explain`
+records them:
+
+```
+  evaluation notes (1):
+     g-doc [rule tagged]: object.tags: expected collection, got string
+```
+
+Each `EvaluationNote` carries `GrantID`, `Rule`, `Kind` (`shape_mismatch` /
+`absent_field`), `Op`, `Path`, `Expected`, `Actual` and a rendered `Message`.
+
+Three rules govern them:
+
+1. **Diagnostic only.** Notes never influence a verdict.
+2. **`Explain` only.** `Check` and `Enumerate` collect nothing and pay nothing;
+   their behavior is unchanged.
+3. **Shape and path only.** A note names the variable path and the shapes
+   involved — **never a metadata value**, never anything that could cross an
+   account boundary. Same rule as error messages.
+
+They reach every surface for free: the CLI prints `Trace.String()`, Twirp carries
+the whole trace as `trace_json`, and the MCP `aperture_explain` tool returns
+`engine.Trace` with a reflected schema.
 
 ## Fail-closed rendering
 
