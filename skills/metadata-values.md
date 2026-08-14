@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -137,6 +137,53 @@ value-model check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
 A `:json` rejection carries the column, the line, and the JSON kind or the
 decoder's message — never the cell.
 
+### The seed document's `objects:` section
+
+YAML nests natively, so the seed file spells the model **directly** — no encoding
+to learn, no delimiter to pick:
+
+```yaml
+objects:
+  - id: account:acme/brand:1
+    metadata:
+      tier: gold
+      seats: 5
+      tags: [premium, launch]
+      owner: { dept: eng, lead: alice }
+  - id: account:acme/brand:2      # metadata: may be omitted
+```
+
+The object-type is **derived from the identity's terminal segment**, never
+declared. `Document.BuildRegistry` groups the entries by type and registers one
+`provider.Static` per type with a TTL of 0; declaration order is what `List` and
+`Query` return. This is runtime **wiring**, not model state: `Apply` writes no row
+and an export never reproduces the section.
+
+Three properties, all of them the same ones the CSV loader owes:
+
+- **Numbers normalise identically.** The section is carried as raw JSON and
+  decoded with `UseNumber`, then an exact integer that fits `int64` becomes an
+  `int64` and everything else a `float64` — the same rule as `:int`/`:float` and a
+  `:json` cell. Without it, YAML would hand over an `int` and JSON a `float64` and
+  the *same document* would answer `object.seats == 5` differently depending on the
+  format it was written in.
+- **`metadata:` must be a mapping.** A scalar or an array there is rejected, so
+  the section cannot smuggle in a shape the field-level model would refuse.
+- **Every field goes through `provider.ValidateField`**, in sorted key order, at
+  build time — never re-implemented. A violation is **`APERTURE_CONFIG_INVALID`
+  naming the object id and the field**, wrapping the value model's own
+  `APERTURE_METADATA_INVALID` (with its `path`/`type`/`depth` context) in the
+  chain. A missing or duplicate `id`, or metadata that is not a mapping, is the
+  same `APERTURE_CONFIG_INVALID`; a malformed id passes through as
+  `APERTURE_IDENTITY_INVALID`.
+
+`provider.Static` is the in-memory `ObjectProvider` behind the section, and is
+reusable on its own (tests, embedded data). It is immutable after `NewStatic`
+returns, validates the value model again itself rather than trusting its caller,
+and **deep-copies its input** so a caller that keeps and mutates those maps cannot
+reach into metadata the Registry has already cached. Reads hand out its own maps
+**by reference**, exactly as `csvprovider` does.
+
 ## Querying the model: `Filter.Fields`
 
 The shape a field holds decides how a `provider.Filter.Fields` predicate compares
@@ -200,7 +247,9 @@ and slices are shared too:
 - a provider returns a **fresh** map per object, with fresh nested containers, and
   a reload builds a new value rather than editing the old one in place — in
   `csvprovider` every list cell is split into its own slice and every `:json`
-  cell decoded into its own map, so no two rows share one;
+  cell decoded into its own map, so no two rows share one, and `provider.Static`
+  deep-copies its whole object set once at construction so two entries built from
+  one source value never share a container either;
 - **no holder** — engine, rules, scope, CLI, server, host code — writes to a
   `Metadata` it was given, **at any depth**;
 - a consumer that needs to modify metadata copies it deeply first.
@@ -216,6 +265,7 @@ Changing the value model means changing all of these in the same PR:
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
+| The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the
 value model must not change that.

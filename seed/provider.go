@@ -48,19 +48,32 @@ func ParseFile(path string) (*Document, error) {
 	return Parse(data, formatFor(path))
 }
 
-// BuildRegistry constructs a live *provider.Registry from the document's
-// providers section. Relative file paths are resolved against baseDir (typically
-// the seed file's directory; pass "" to resolve against the process CWD). It
-// always returns a usable registry — empty when no providers are declared — so a
-// caller can wire it unconditionally. A malformed entry (missing object_type,
-// unknown kind, missing path, unparseable ttl, or a duplicate object_type) is an
-// APERTURE_CONFIG_INVALID / APERTURE_PROVIDER_INVALID coded error.
+// BuildRegistry constructs a live *provider.Registry from the document's two
+// wiring sections: providers (a declared implementation per object-type) and
+// objects (metadata declared inline, served by an in-memory provider.Static per
+// object-type). Relative file paths are resolved against baseDir (typically the
+// seed file's directory; pass "" to resolve against the process CWD). It always
+// returns a usable registry — empty when neither section is declared — so a
+// caller can wire it unconditionally.
+//
+// A malformed providers entry (missing object_type, unknown kind, missing path,
+// unparseable ttl, or a duplicate object_type) and a malformed objects entry
+// (missing id, a duplicate id, metadata that is not a mapping, or a value the
+// shared value model rejects) are both APERTURE_CONFIG_INVALID; a malformed id
+// passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice is
+// APERTURE_PROVIDER_INVALID.
+//
+// Neither section touches storage: Apply writes no row for either, and an export
+// reproduces neither.
 func (d *Document) BuildRegistry(baseDir string) (*provider.Registry, error) {
 	reg := provider.NewRegistry()
 	for _, p := range d.Providers {
 		if err := registerProvider(reg, p, baseDir); err != nil {
 			return nil, err
 		}
+	}
+	if err := d.registerObjects(reg); err != nil {
+		return nil, err
 	}
 	return reg, nil
 }

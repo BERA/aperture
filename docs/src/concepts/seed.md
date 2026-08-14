@@ -22,13 +22,15 @@ grants:        [{ id: g1, account: acme, subject: { kind: principal, id: alice }
 templates:     [ ... ]
 rules:         [ ... ]
 providers:     [ ... ]   # runtime wiring, not model state (see below)
+objects:       [ ... ]   # inline object metadata — also wiring, not model state
 ```
 
 Every field mirrors its `model` counterpart in declarative form. The `Document`
 started as a minimal seed shape and was generalized to the complete model, so **an
 export file is a strict superset of a seed file**: a seed that omits
-`templates`/`rules`/`providers` loads unchanged, and a full export reloads through
-the very same path. The field set is additive-only, so old seeds keep loading.
+`templates`/`rules`/`providers`/`objects` loads unchanged, and a full export
+reloads through the very same path. The field set is additive-only, so old seeds
+keep loading.
 
 Rule ASTs are carried as **raw JSON** — exactly the `rules` package's canonical
 `Node` serialization — so the file never invents a second rule format; it is the
@@ -90,6 +92,56 @@ properties make a round-trip trustworthy:
   accounts, so `Export` queries `*` explicitly — omitting it would silently drop a
   super-admin's reach on export/import.
 
+## Inline object metadata
+
+For a small or fixed object set, `objects:` declares metadata **in the seed file
+itself**, with no separate CSV beside it. YAML nests natively, so this is the most
+direct way to author the arrays and nested objects the
+[value model](providers.md#the-metadata-value-model) admits:
+
+```yaml
+objects:
+  - id: account:acme/brand:1
+    metadata:
+      tier: gold
+      seats: 5
+      tags: [premium, launch]
+      owner:
+        dept: eng
+        lead: alice
+  - id: account:acme/brand:2      # metadata: may be omitted entirely
+  - id: account:acme/app:be
+    metadata: { tier: gold }
+```
+
+The object-type is **derived from the identity's terminal segment** —
+`account:acme/brand:1` is a `brand` — never declared separately, so one fact in
+one place cannot disagree with itself. Entries of different types may be
+interleaved freely; `BuildRegistry` groups them and registers one in-memory
+[`provider.Static`](providers.md#in-memory-objects-providerstatic) per type, with
+a TTL of 0 (the data cannot go stale, because nothing can change it). Within a
+type, **declaration order is preserved** — it is the order `List` and `Query`
+return.
+
+The provider it builds is a full one: `Fetch` (with `APERTURE_NOT_FOUND` for an
+undeclared id), `List`, and `Query` honouring `Pattern`, `Limit`, and `Fields` on
+the [same contract](providers.md#the-filterfields-contract) every other provider
+implements — a collection field matches by membership, everything else by typed
+equality.
+
+Values are validated against the shared value model **when the document is
+built**, before any `Check` can see them, and numbers are normalised exactly as
+every other loader normalises them: an exact integer that fits `int64` becomes an
+`int64`, anything else a `float64`. That is what keeps `object.seats == 5` from
+answering differently depending on whether the object came from a seed file, a
+JSON seed file, or a CSV `:int` column.
+
+A missing or duplicate `id`, `metadata` that is not a mapping, or a value the
+value model rejects is `APERTURE_CONFIG_INVALID` naming the object id and the
+field (with the inner `APERTURE_METADATA_INVALID` kept in the chain); a malformed
+id is `APERTURE_IDENTITY_INVALID`. Declaring a type in **both** `providers:` and
+`objects:` is a duplicate registration, `APERTURE_PROVIDER_INVALID`.
+
 ## What is *not* in the file
 
 Two things are deliberately excluded from the model state file:
@@ -97,13 +149,14 @@ Two things are deliberately excluded from the model state file:
 - **Live host domain-object metadata** — that is the [provider](providers.md)
   cache: derived, disposable, never source of truth. Because `Export` reads storage
   back, and a provider produces no model rows, it is never reproduced.
-- **Provider *wiring*** — the `providers:` section is runtime wiring, not model
-  state. `Apply` never writes it to storage; instead `Document.BuildRegistry(baseDir)`
-  turns it into a live `*provider.Registry`. The seed file is the source of truth
-  for provider wiring, exactly as auth config is. A declared provider names an
-  `object_type`, a `kind` (currently only `csv`), a `path` (resolved relative to
-  the seed file), and optional cache `ttl`/`max_size`. A malformed entry is
-  `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
+- **Runtime *wiring*** — the `providers:` and `objects:` sections are runtime
+  wiring, not model state. `Apply` never writes either to storage; instead
+  `Document.BuildRegistry(baseDir)` turns both into a live `*provider.Registry`.
+  **The seed file is the source of truth for both**, exactly as auth config is —
+  and exactly as for `providers:`, an export never reproduces `objects:`. A
+  declared provider names an `object_type`, a `kind` (currently only `csv`), a
+  `path` (resolved relative to the seed file), and optional cache `ttl`/`max_size`.
+  A malformed entry is `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
 
 ## Related
 
