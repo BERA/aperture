@@ -104,6 +104,44 @@ parses the identical AST JSON strings through `rules.Node` and asserts each is
 valid and byte-stable. A new operator lands in `OP_SPECS`, in the JS test, **and**
 in that Go contract test, or the two sides drift silently.
 
+## Authoring operators (rule editor palette + comparison node)
+
+Every comparison operator is authorable **by clicking**. The palette's Compare
+group is GENERATED in `js/rules.js` (`buildPalette` → `operatorEntries`) from the
+serializer's `OP_SPECS`, so it lists each operator exactly once, in `ast.go`'s
+`Op*` order, and a new operator appears with no edit to the palette. Clicking one
+drops a `compare` node already set to that operator.
+
+- **Readable spellings.** An author never sees a raw token. `OP_LABELS` maps
+  token → spelling — `has member`, `has all`, `has any`, `has none`, `subset of`,
+  `has key`, `is empty`, `is not empty`, `exists`, plus `equals`, `not equals`,
+  `less than`, `less or equal`, `greater than`, `greater or equal`, `in`,
+  `not in`. It is a spelling table only: **membership and order come from
+  `OP_SPECS`**, and an operator with no spelling shows its bare token rather than
+  vanishing. The spelling is presentation — `opFromLabel` resolves it back to the
+  AST token in `reteToGraph`, so nothing downstream ever sees it, an unrecognised
+  spelling passes through verbatim for the validator to name, and a raw token
+  typed into the control is still accepted.
+- **The palette entry's `kind` is compound** (`"compare:hasAll"`) because the
+  shell template keys the palette by `kind`; `rules().add()` splits it into the
+  node kind plus the seed operator, keeping the operator out of the template.
+- **The unary operators render as SINGLE-input nodes.** A comparison's pins come
+  from the serializer's `inputKeys(kind, arity, op)` — never a hardcoded
+  `left`/`right` pair — both when the node is built and when its operator
+  changes (`applyCompareInputs`). Choosing `is empty` removes the `right` pin
+  *and any wire into it* before the pin goes; choosing a binary operator restores
+  it. The re-shape is a diff, so surviving pins keep their wires, and it is
+  serialised per node so a burst of edits cannot double-add a pin. An operand
+  left unwired by the change stays on the canvas — the editor never deletes an
+  author's work — and shows up as a second root in validation until it is
+  re-wired or removed.
+- **The operator control is a text input bound to a native `<datalist>`**, not a
+  `<select>`: Rete's classic control set is text/number only and the React
+  renderer is a committed vendored blob this repo never rebuilds, so a custom
+  control would mean a node build. The list is attached by delegation on
+  pointerdown/focusin (the input belongs to the renderer and is re-created by it),
+  which is idempotent and survives re-renders.
+
 ## Auth wiring (external credentials, never issued here)
 
 Aperture consumes credentials; it never mints them. The shell carries a bearer on
@@ -172,6 +210,6 @@ The shell obeys `.planning/access-control/research/design-system.md`:
 A change to the embedded shell's public surface — the static routes it exposes
 (`/`, `/css/*`, `/js/*`, `/vendor/*`), the `apiFetch` bearer convention, the nav
 skeleton, the `rules-serializer.js` mirror of `rules/ast.go` (operators, operand
-shapes, blocked calls, validation wording), or a rule above — updates this doc in
-the **same PR**. The gate in
+shapes, blocked calls, validation wording), the rule editor's operator palette
+and its spellings, or a rule above — updates this doc in the **same PR**. The gate in
 `skills/skills_test.go` fails the build if this doc loses its frontmatter.
