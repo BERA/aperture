@@ -50,39 +50,46 @@ func ParseFile(path string) (*Document, error) {
 
 // BuildOption tunes how BuildRegistry resolves the document's two wiring
 // sections. It is Go-level wiring on purpose: the seed FILE stays a plain
-// declaration of what exists, and the decision to tolerate an ambiguous one is
-// made by the host that builds the registry, where a reviewer sees it.
+// declaration of what exists, and the decision to make an ambiguous one fatal is
+// taken by the host that builds the registry, where a reviewer sees it.
 type BuildOption func(*buildConfig)
 
 // buildConfig is the resolved set of BuildOptions.
 type buildConfig struct {
-	// allowProviderPrecedence accepts the type-level precedence rule instead of
-	// refusing to build an ambiguous document. See AllowProviderPrecedence.
-	allowProviderPrecedence bool
+	// strictProviderCollision refuses to build a document whose two wiring
+	// sections claim the same object type, instead of applying the default
+	// type-level precedence rule. See StrictProviderCollision.
+	strictProviderCollision bool
 }
 
-// AllowProviderPrecedence accepts the type-level precedence rule for an object
-// type declared in BOTH the providers: and objects: sections, instead of failing
-// the build with APERTURE_CONFIG_INVALID.
+// StrictProviderCollision refuses to build a document that declares an object
+// type in BOTH the providers: and objects: sections, failing with
+// APERTURE_CONFIG_INVALID naming the colliding type(s), instead of applying the
+// default precedence rule.
 //
-// The rule it accepts is TOTAL and TYPE-LEVEL: the file-backed providers: entry
-// wins, and EVERY inline objects: entry for that type is discarded. There is no
-// object-level merge, no field-level merge, and no fallback — an inline id the
-// file happens to lack is simply not resolvable, exactly as if the entry had
-// never been written. Field-level merging is the most useful-sounding behaviour
-// and the most impossible to debug: a rule reading a field the CSV silently did
-// not override is a support ticket nobody can reproduce. Predictability wins.
+// The rule it replaces is the DEFAULT, and it is TOTAL and TYPE-LEVEL: the
+// file-backed providers: entry wins, and EVERY inline objects: entry for that
+// type is discarded. There is no object-level merge, no field-level merge, and
+// no fallback — an inline id the file happens to lack is simply not resolvable,
+// exactly as if the entry had never been written. Field-level merging is the
+// most useful-sounding behaviour and the most impossible to debug: a rule
+// reading a field the CSV silently did not override is a support ticket nobody
+// can reproduce. Predictability wins.
 //
-// Because the discard is total, a collision is a HARD APERTURE_CONFIG_INVALID by
-// default — no operator can miss it, and no logging path leaves this package that
-// could carry a warning instead. This option is the deliberate dev-time override
-// (a CSV shadowing checked-in inline defaults, say): the discard still happens in
-// full, but the host has said in code that it means it.
+// The discard is the default because adding a CSV for a type that also has
+// inline entries is a normal migration step, not a fault: a seed that booted
+// yesterday must not refuse to boot today because someone added a providers:
+// row. This option is for the host that would rather read the overlap as an
+// authoring mistake — a checked-in seed nobody is mid-migration on — and wants
+// the build to stop instead.
+//
+// The default is not silent either: Document.ProviderCollisions reports exactly
+// which types the build discards, so a host with a logger can say so at load.
 //
 // Every inline entry is validated either way — a malformed declaration fails the
 // load whether or not its type is ultimately discarded.
-func AllowProviderPrecedence() BuildOption {
-	return func(c *buildConfig) { c.allowProviderPrecedence = true }
+func StrictProviderCollision() BuildOption {
+	return func(c *buildConfig) { c.strictProviderCollision = true }
 }
 
 // BuildRegistry constructs a live *provider.Registry from the document's two
@@ -100,9 +107,10 @@ func AllowProviderPrecedence() BuildOption {
 // passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice by two
 // providers entries is APERTURE_PROVIDER_INVALID.
 //
-// A type claimed by BOTH sections is APERTURE_CONFIG_INVALID naming the type,
-// unless AllowProviderPrecedence is passed — see that option for the precedence
-// rule it accepts and why the default is loud.
+// A type claimed by BOTH sections is not an error: the providers: entry wins and
+// every inline entry for that type is discarded entirely. The discarded types
+// are reported by Document.ProviderCollisions, and StrictProviderCollision turns
+// the collision back into an APERTURE_CONFIG_INVALID for hosts that want one.
 //
 // Neither section touches storage: Apply writes no row for either, and an export
 // reproduces neither.

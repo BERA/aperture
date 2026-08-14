@@ -68,35 +68,42 @@ type objectGroup struct {
 // Precedence is TYPE-LEVEL and total: a type already served by the providers:
 // section keeps that file-backed provider, and every inline entry for that type
 // is discarded — no merge at any granularity and no fallback for an id the file
-// lacks. It is APERTURE_CONFIG_INVALID unless the caller passed
-// AllowProviderPrecedence; see that option for why the default is loud.
+// lacks. That is the DEFAULT, because pointing a type at a CSV while its inline
+// entries are still in the file is an ordinary migration step, not a fault; a
+// document that booted yesterday must not stop booting because a providers: row
+// was added. StrictProviderCollision makes the collision fatal for hosts that
+// would rather read it as an authoring mistake, and ProviderCollisions lets any
+// host report the discard.
 func (d *Document) registerObjects(reg *provider.Registry, cfg buildConfig) error {
 	groups, err := d.groupObjects()
 	if err != nil {
 		return err
 	}
-	// Collisions are collected rather than reported one at a time, so an author
-	// fixing a document sees every ambiguous type in one pass. Only the object
-	// TYPE is named: an object id can embed an account ("account:acme/brand:1"),
-	// and an error message is the wrong place for it.
-	var collided []string
-	for _, g := range groups {
-		if reg.Has(g.typ) {
-			collided = append(collided, g.typ)
+	if cfg.strictProviderCollision {
+		// Collisions are collected rather than reported one at a time, so an
+		// author fixing a document sees every ambiguous type in one pass. Only
+		// the object TYPE is named: an object id can embed an account
+		// ("account:acme/brand:1"), and an error message is the wrong place for
+		// it.
+		var collided []string
+		for _, g := range groups {
+			if reg.Has(g.typ) {
+				collided = append(collided, g.typ)
+			}
 		}
-	}
-	if len(collided) > 0 && !cfg.allowProviderPrecedence {
-		slices.Sort(collided)
-		// The types ride in the MESSAGE as well as the context, because the
-		// message is what a CLI prints and what lands in a bug report.
-		return aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
-			fmt.Sprintf("seed: object type(s) %s are declared in both the providers: and objects: "+
-				"sections; the providers: entry wins and every inline entry for that type is "+
-				"discarded entirely (no merge at any granularity, no fallback for an id the file "+
-				"lacks) — remove one of the two declarations, or build with "+
-				"seed.AllowProviderPrecedence() to accept the discard",
-				strings.Join(collided, ", ")),
-			map[string]any{"object_types": collided})
+		if len(collided) > 0 {
+			slices.Sort(collided)
+			// The types ride in the MESSAGE as well as the context, because the
+			// message is what a CLI prints and what lands in a bug report.
+			return aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+				fmt.Sprintf("seed: object type(s) %s are declared in both the providers: and objects: "+
+					"sections; the providers: entry wins and every inline entry for that type is "+
+					"discarded entirely (no merge at any granularity, no fallback for an id the file "+
+					"lacks) — remove one of the two declarations, or drop "+
+					"seed.StrictProviderCollision() to accept the discard",
+					strings.Join(collided, ", ")),
+				map[string]any{"object_types": collided})
+		}
 	}
 
 	for _, g := range groups {
@@ -117,6 +124,60 @@ func (d *Document) registerObjects(reg *provider.Registry, cfg buildConfig) erro
 		}
 	}
 	return nil
+}
+
+// ProviderCollisions reports the object types this document declares in BOTH its
+// providers: and objects: sections — exactly the types whose inline entries
+// BuildRegistry discards in favour of the file-backed provider — sorted, and
+// empty when there is no overlap.
+//
+// It exists because the discard is the DEFAULT and must not be silent. There is
+// no logging path out of this package (a library that logs is a library that
+// picks your logger), so the collision is returned as a fact the host can
+// surface however it already surfaces things:
+//
+//	reg, err := doc.BuildRegistry(dir)
+//	if err != nil {
+//		return err
+//	}
+//	if types := doc.ProviderCollisions(); len(types) > 0 {
+//		slog.Warn("seed: inline objects discarded, providers: entry wins",
+//			"object_types", types)
+//	}
+//
+// It reads the document only — no file IO, no registry — so it is safe to call
+// before or after BuildRegistry, and calling it twice costs nothing shared. An
+// entry whose id does not parse is skipped rather than reported here: it is not
+// a collision, and BuildRegistry already fails the load on it with
+// APERTURE_IDENTITY_INVALID.
+//
+// Only object TYPES are returned, never ids: an id can embed an account
+// ("account:acme/brand:1"), and this value is destined for a log line.
+func (d *Document) ProviderCollisions() []string {
+	if len(d.Objects) == 0 || len(d.Providers) == 0 {
+		return nil
+	}
+	filed := make(map[string]bool, len(d.Providers))
+	for _, p := range d.Providers {
+		if p.ObjectType != "" {
+			filed[p.ObjectType] = true
+		}
+	}
+	var collided []string
+	seen := make(map[string]bool, len(filed))
+	for _, o := range d.Objects {
+		id, err := identity.Parse(o.ID)
+		if err != nil {
+			continue
+		}
+		typ := terminalType(id)
+		if filed[typ] && !seen[typ] {
+			seen[typ] = true
+			collided = append(collided, typ)
+		}
+	}
+	slices.Sort(collided)
+	return collided
 }
 
 // groupObjects validates every inline entry and groups them by object-type.
