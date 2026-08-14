@@ -77,6 +77,187 @@ func TestEvalOrderedComparisonAgainstMissingFieldErrors(t *testing.T) {
 	}
 }
 
+// TestEvalNestedAccessIsNilSafe pins the E2-S2 guarantee: because NodeVar renders
+// with optional chaining (object?.owner?.dept), reading a nested path through a
+// MISSING intermediate yields nil and the enclosing comparison goes false — it is
+// never the expr-lang runtime error "cannot fetch dept from <nil>", which would
+// surface as APERTURE_RULE_EVAL at Check time. A path through a PRESENT
+// intermediate is unchanged.
+func TestEvalNestedAccessIsNilSafe(t *testing.T) {
+	c := NewCompiler()
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		rule *Node
+		in   Input
+		want bool
+	}{
+		{
+			name: "present nested path matches",
+			rule: Compare(OpEq, Var("object.owner.dept"), Lit("eng")),
+			in:   Input{Object: map[string]any{"owner": map[string]any{"dept": "eng"}}},
+			want: true,
+		},
+		{
+			name: "present nested path does not match",
+			rule: Compare(OpEq, Var("object.owner.dept"), Lit("eng")),
+			in:   Input{Object: map[string]any{"owner": map[string]any{"dept": "sales"}}},
+			want: false,
+		},
+		{
+			name: "missing intermediate is false, not an error",
+			rule: Compare(OpEq, Var("object.owner.dept"), Lit("eng")),
+			in:   Input{Object: map[string]any{"title": "hello"}},
+			want: false,
+		},
+		{
+			name: "missing leaf under a present intermediate is false",
+			rule: Compare(OpEq, Var("object.owner.dept"), Lit("eng")),
+			in:   Input{Object: map[string]any{"owner": map[string]any{"id": "u1"}}},
+			want: false,
+		},
+		{
+			name: "nil object map is false, not an error",
+			rule: Compare(OpEq, Var("object.owner.dept"), Lit("eng")),
+			in:   Input{},
+			want: false,
+		},
+		{
+			name: "depth-3 path through a missing intermediate is false",
+			rule: Compare(OpEq, Var("principal.attrs.team.name"), Lit("core")),
+			in:   Input{Principal: map[string]any{"id": "alice"}},
+			want: false,
+		},
+		{
+			name: "depth-3 path fully present matches",
+			rule: Compare(OpEq, Var("principal.attrs.team.name"), Lit("core")),
+			in: Input{Principal: map[string]any{
+				"attrs": map[string]any{"team": map[string]any{"name": "core"}},
+			}},
+			want: true,
+		},
+		{
+			name: "in over a nested list through a present intermediate",
+			rule: Compare(OpIn, Lit("eu"), Var("object.owner.regions")),
+			in: Input{Object: map[string]any{
+				"owner": map[string]any{"regions": []any{"us", "eu"}},
+			}},
+			want: true,
+		},
+		{
+			name: "in over a nested list through a missing intermediate is false",
+			rule: Compare(OpIn, Lit("eu"), Var("object.owner.regions")),
+			in:   Input{Object: map[string]any{}},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			compiled, err := c.Compile(tc.rule)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			got, err := compiled.Eval(ctx, tc.in)
+			if err != nil {
+				t.Fatalf("eval must not error on a nested read: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("eval = %v, want %v (source %s)", got, tc.want, compiled.Source())
+			}
+		})
+	}
+}
+
+// TestEvalNinOverAbsentFieldGrants pins a surprising but pre-existing expr-lang
+// behavior, unchanged by the optional-chaining render: `x not in <nil>` is TRUE.
+// A "nin" rule therefore SELECTS (grants) for an object that simply lacks the
+// field — a deny-list over an absent column passes everything. Nested objects and
+// list-valued metadata make this far easier to hit, so it is pinned here rather
+// than left to be rediscovered in production. Authors who need the field to exist
+// must say so explicitly, e.g. And(Compare(OpNe, Var(path), Lit(nil)), nin...).
+func TestEvalNinOverAbsentFieldGrants(t *testing.T) {
+	c := NewCompiler()
+	ctx := context.Background()
+
+	// Absent at the top level.
+	flat, err := c.Compile(Compare(OpNin, Lit("alice"), Var("object.blocklist")))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	got, err := flat.Eval(ctx, Input{Object: map[string]any{}})
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if !got {
+		t.Fatalf(`"x not in <absent field>" must be true (pre-existing expr behavior)`)
+	}
+	// And the dual: `in` over the same absent field is false.
+	in, err := c.Compile(Compare(OpIn, Lit("alice"), Var("object.blocklist")))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	got, err = in.Eval(ctx, Input{Object: map[string]any{}})
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if got {
+		t.Fatalf(`"x in <absent field>" must be false`)
+	}
+	// Absent through a missing intermediate behaves identically now that nested
+	// reads are nil-safe.
+	nested, err := c.Compile(Compare(OpNin, Lit("alice"), Var("object.owner.blocklist")))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	got, err = nested.Eval(ctx, Input{Object: map[string]any{}})
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if !got {
+		t.Fatalf(`"x not in <absent nested field>" must be true`)
+	}
+	// The deny-list actually denies once the field is present and matches.
+	got, err = nested.Eval(ctx, Input{Object: map[string]any{
+		"owner": map[string]any{"blocklist": []any{"alice"}},
+	}})
+	if err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	if got {
+		t.Fatalf("nin must be false when the element IS in the list")
+	}
+
+	// The documented workaround (docs/src/concepts/rules.md, skills/rules-engine.md):
+	// require the field explicitly so a deny-list stops granting on absent data.
+	guarded, err := c.Compile(And(
+		Compare(OpNe, Var("object.blocklist"), Lit(nil)),
+		Compare(OpNin, Lit("alice"), Var("object.blocklist")),
+	))
+	if err != nil {
+		t.Fatalf("compile guarded nin: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		md   map[string]any
+		want bool
+	}{
+		{"field absent: guard denies", map[string]any{}, false},
+		{"field present, not listed: selects", map[string]any{"blocklist": []any{"bob"}}, true},
+		{"field present, listed: denies", map[string]any{"blocklist": []any{"alice"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := guarded.Eval(ctx, Input{Object: tc.md})
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("eval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEvalUsesPrincipalActionAndFunctions(t *testing.T) {
 	c := NewCompiler()
 	rule := And(
