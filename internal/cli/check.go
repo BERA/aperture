@@ -61,6 +61,7 @@ func runCheck(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
 	res, err := svc.Check(ctx, service.Query{
@@ -121,6 +122,7 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
 	ids, err := svc.Enumerate(ctx, service.EnumerateQuery{
@@ -173,6 +175,7 @@ func runIdentifiers(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
 	ids, err := svc.ObjectIdentifiers(ctx, args.Get(0), cmd.StringSlice("exclude")...)
@@ -217,6 +220,7 @@ func runExplain(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
 	tr, err := svc.Explain(ctx, service.Query{

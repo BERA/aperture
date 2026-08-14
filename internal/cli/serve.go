@@ -103,6 +103,7 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	stack.reportCollisions(cmd.ErrWriter)
 
 	// Wire the append-only audit trail (E4-S2) through the same store so the
 	// mutation/impersonation/delegation record is durable and the E6-S4 audit

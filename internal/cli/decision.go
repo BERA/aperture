@@ -1,6 +1,10 @@
 package cli
 
 import (
+	"fmt"
+	"io"
+	"strings"
+
 	"github.com/frankbardon/aperture/engine"
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
@@ -40,6 +44,26 @@ type decisionStack struct {
 	// when the seed declares no object source at all (nil means empty metadata,
 	// which is exactly rules.NewEngine's own default).
 	fetcher rules.MetadataFetcher
+	// collisions are the object types declared in BOTH the seed's `providers:` and
+	// `objects:` sections. The file-backed provider wins and the inline entries for
+	// those types are discarded entirely — the documented default. Discarding data
+	// silently would be hostile, and `seed` has no logging path of its own, so it
+	// reports the fact and the caller surfaces it (reportCollisions).
+	collisions []string
+}
+
+// reportCollisions writes a warning naming every object type whose inline
+// `objects:` entries were discarded because a `providers:` entry claimed the same
+// type. Nothing is written when there is no collision, so a normal boot stays
+// silent. Only object TYPES are named — never ids — so the warning cannot leak
+// cross-account data.
+func (s decisionStack) reportCollisions(w io.Writer) {
+	if len(s.collisions) == 0 || w == nil {
+		return
+	}
+	fmt.Fprintf(w, "warning: seed declares %d object type(s) in both providers: and objects: — "+
+		"the providers: entry wins and the inline entries were discarded: %s\n",
+		len(s.collisions), strings.Join(s.collisions, ", "))
 }
 
 // buildDecisionStack wires the decision graph over an already-seeded store.
@@ -98,6 +122,7 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		registry:   reg,
 		ruleSource: ruleSource,
 		fetcher:    fetcher,
+		collisions: doc.ProviderCollisions(),
 	}, nil
 }
 
