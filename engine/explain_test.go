@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 
@@ -165,6 +168,151 @@ func TestExplain_ScopeAndRule(t *testing.T) {
 	}
 	if tr2.Decision.Allow {
 		t.Fatalf("rule should not select the public document\n%s", tr2.String())
+	}
+}
+
+// --- Determinism of the rendered report ---
+
+// TestTraceStringIsDeterministic explains the SAME decision repeatedly and
+// requires byte-identical reports.
+//
+// Trace.String documents itself as deterministic, and it was not: the considered
+// grants come from Storage.GrantsForSubjects and the subjects from
+// GroupsForPrincipal, and storage/memory answers both by ranging over a Go map —
+// whose iteration order Go deliberately randomises per range. So the line order
+// varied run to run and anyone diffing or snapshotting a trace saw phantom
+// changes. The model here is wide on purpose (many grants, many groups) so the
+// underlying order really does move between iterations; the count of distinct
+// raw orderings is logged to show the test is not vacuous.
+func TestTraceStringIsDeterministic(t *testing.T) {
+	f := newFixture(t)
+	const groupsPerPrincipal = 6
+	groups := make([]string, groupsPerPrincipal)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("group%02d", i)
+	}
+	f.principal("alice")
+	for _, g := range groups {
+		f.group(g, "alice")
+	}
+
+	// A wide spread of grants across both subject kinds, mixed effects, mixed
+	// specificities, and one action mismatch — so every branch of the report
+	// (covered, not covered, ruled out, deciding) has several lines to order.
+	for i := 0; i < 12; i++ {
+		f.grant(fmt.Sprintf("g-alice-%02d", i), acctAcme, subjPrincipal("alice"),
+			model.EffectAllow, permRead, fmt.Sprintf("account:acme/project:p%02d/**", i))
+	}
+	for i, g := range groups {
+		f.grant(fmt.Sprintf("g-group-%02d", i), acctAcme, subjGroup(g),
+			model.EffectAllow, permRead, "account:acme/**")
+		f.grant(fmt.Sprintf("g-group-deny-%02d", i), acctAcme, subjGroup(g),
+			model.EffectDeny, permRead, fmt.Sprintf("account:acme/project:p%02d/document:sealed", i))
+	}
+	f.grant("g-wrong-action", acctAcme, subjPrincipal("alice"),
+		model.EffectAllow, permWrite, "account:acme/**")
+
+	req := Request{
+		Account: acctAcme, Principal: "alice", Action: "read",
+		Object: "account:acme/project:p03/document:42",
+	}
+
+	const runs = 25
+	var want string
+	rawOrders := map[string]struct{}{}
+	for i := 0; i < runs; i++ {
+		tr, err := f.eng.Explain(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Explain (run %d): %v", i, err)
+		}
+		if len(tr.Considered) < 2 {
+			t.Fatalf("fixture considered %d grants; the test needs several to order", len(tr.Considered))
+		}
+
+		raw := make([]string, 0, len(tr.Considered)+len(tr.Subjects))
+		for _, s := range tr.Subjects {
+			raw = append(raw, string(s.Kind)+":"+s.ID)
+		}
+		for _, ev := range tr.Considered {
+			raw = append(raw, ev.GrantID)
+		}
+		rawOrders[strings.Join(raw, "|")] = struct{}{}
+
+		got := tr.String()
+		if i == 0 {
+			want = got
+			continue
+		}
+		if got != want {
+			t.Fatalf("Trace.String is not deterministic; run %d differs from run 0:\n--- run 0 ---\n%s\n--- run %d ---\n%s",
+				i, want, i, got)
+		}
+	}
+	t.Logf("%d runs produced %d distinct storage orderings and 1 rendered report", runs, len(rawOrders))
+}
+
+// TestTraceStringIgnoresListOrder is the non-flaky twin: it permutes a trace's
+// lists directly instead of hoping the map iterator shuffles them, so the
+// guarantee is asserted rather than sampled. It also pins that String leaves the
+// caller's slices alone — sorting in place would silently reorder a Trace that a
+// surface is about to serialize.
+func TestTraceStringIgnoresListOrder(t *testing.T) {
+	base := Trace{
+		Request: Request{Account: acctAcme, Principal: "alice", Action: "read", Object: "account:acme/document:42"},
+		Subjects: []model.Subject{
+			{Kind: model.SubjectPrincipal, ID: "alice"},
+			{Kind: model.SubjectRole, ID: "reader"},
+			{Kind: model.SubjectRole, ID: "auditor"},
+			{Kind: model.SubjectGroup, ID: "platform"},
+			{Kind: model.SubjectGroup, ID: "oncall"},
+		},
+		Considered: []GrantEvaluation{
+			{GrantID: "g-a", Effect: model.EffectAllow, ObjectPattern: "account:acme/**", Outcome: "allow covers the object via literal scope at specificity 1", Covered: true},
+			{GrantID: "g-b", Effect: model.EffectDeny, ObjectPattern: "account:acme/document:42", Outcome: "deny covers the object via literal scope at specificity 3", Covered: true, Deciding: true},
+			{GrantID: "g-c", Effect: model.EffectAllow, ObjectPattern: "account:acme/document:*", Outcome: "literal scope does not cover the object"},
+			{GrantID: "g-d", Effect: model.EffectAllow, ObjectPattern: "account:acme/project:x/**", Outcome: `action "write" does not match the requested "read"`},
+		},
+		Notes: []EvaluationNote{
+			{GrantID: "g-a", Rule: "sensitive", Kind: "shape_mismatch", Op: "hasAll", Path: "object.tags", Expected: "collection", Actual: "string", Message: "object.tags: hasAll expects collection, found string"},
+			{GrantID: "g-a", Rule: "sensitive", Kind: "absent_field", Op: "hasNone", Path: "object.labels", Expected: "collection", Actual: "absent", Message: "object.labels: hasNone matched on an absent field"},
+			{GrantID: "g-c", Rule: "regional", Kind: "shape_mismatch", Op: "subsetOf", Path: "object.regions", Expected: "collection", Actual: "number", Message: "object.regions: subsetOf expects collection, found number"},
+		},
+		MaxSpecificity: 3,
+		Decision:       Decision{Allow: false, Reason: "deny overrides at specificity 3", DecidingGrantIDs: []string{"g-b"}},
+	}
+
+	want := base.String()
+	if want == "" {
+		t.Fatal("rendered trace is empty")
+	}
+
+	for seed := uint64(1); seed <= 20; seed++ {
+		permuted := Trace{
+			Request:        base.Request,
+			Subjects:       slices.Clone(base.Subjects),
+			Considered:     slices.Clone(base.Considered),
+			Notes:          slices.Clone(base.Notes),
+			MaxSpecificity: base.MaxSpecificity,
+			Decision:       base.Decision,
+		}
+		r := rand.New(rand.NewPCG(seed, seed*2+1))
+		r.Shuffle(len(permuted.Subjects), func(i, j int) {
+			permuted.Subjects[i], permuted.Subjects[j] = permuted.Subjects[j], permuted.Subjects[i]
+		})
+		r.Shuffle(len(permuted.Considered), func(i, j int) {
+			permuted.Considered[i], permuted.Considered[j] = permuted.Considered[j], permuted.Considered[i]
+		})
+		r.Shuffle(len(permuted.Notes), func(i, j int) {
+			permuted.Notes[i], permuted.Notes[j] = permuted.Notes[j], permuted.Notes[i]
+		})
+
+		before := slices.Clone(permuted.Considered)
+		if got := permuted.String(); got != want {
+			t.Fatalf("permutation %d rendered differently:\n--- want ---\n%s\n--- got ---\n%s", seed, want, got)
+		}
+		if !slices.EqualFunc(before, permuted.Considered, func(a, b GrantEvaluation) bool { return a.GrantID == b.GrantID }) {
+			t.Fatalf("permutation %d: String reordered the caller's Considered slice in place", seed)
+		}
 	}
 }
 

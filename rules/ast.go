@@ -427,11 +427,18 @@ func validateLiteral(raw json.RawMessage) error {
 	if len(raw) == 0 {
 		return aerr.New(aerr.APERTURE_RULE_INVALID, "rule: literal has no value")
 	}
-	v, err := decodeScalar(raw)
-	if err != nil {
+	// FAST PATH. classifyScalar PROVES the bytes are a scalar without decoding
+	// them, so a well-formed literal — every literal on the decision hot path —
+	// costs no allocation at all. It never proves the negative: anything it cannot
+	// classify falls through to decodeScalar, which remains the sole authority on
+	// what a literal may be. Validation therefore accepts and rejects exactly the
+	// same set it always did.
+	if kind, _ := classifyScalar(raw); kind != scalarUnclassified {
+		return nil
+	}
+	if _, err := decodeScalar(raw); err != nil {
 		return err
 	}
-	_ = v
 	return nil
 }
 
@@ -707,6 +714,27 @@ func renderJoined(b *bytes.Buffer, children []*Node, sep string) error {
 }
 
 func renderLiteral(b *bytes.Buffer, raw json.RawMessage) error {
+	// FAST PATH, the render twin of validateLiteral's. Each classified form is
+	// written straight from the raw bytes, which is byte-for-byte what the decode
+	// path below produces — see classifyScalar for why that identity holds for a
+	// number (json.Number.String() IS the token text) and for a plain string
+	// (strconv.Quote of an unescaped printable-ASCII body IS the JSON token).
+	// TestRenderLiteralFastPathMatchesDecoder pins the equivalence.
+	switch kind, tok := classifyScalar(raw); kind {
+	case scalarNull:
+		b.WriteString("nil")
+		return nil
+	case scalarTrue:
+		b.WriteString("true")
+		return nil
+	case scalarFalse:
+		b.WriteString("false")
+		return nil
+	case scalarNumber, scalarPlainString:
+		b.Write(tok)
+		return nil
+	}
+
 	v, err := decodeScalar(raw)
 	if err != nil {
 		return err
@@ -730,9 +758,169 @@ func renderLiteral(b *bytes.Buffer, raw json.RawMessage) error {
 	return nil
 }
 
+// scalarKind is what classifyScalar was able to prove about a literal's raw
+// JSON bytes. It is a strictly OPTIONAL fast path: scalarUnclassified means
+// "not proven", never "invalid", and every caller falls back to decodeScalar.
+type scalarKind uint8
+
+const (
+	// scalarUnclassified means the bytes were not proven to be one of the forms
+	// below. It carries no verdict — the caller must run decodeScalar.
+	scalarUnclassified scalarKind = iota
+	scalarNull
+	scalarTrue
+	scalarFalse
+	// scalarNumber is a token matching the JSON number grammar exactly.
+	scalarNumber
+	// scalarPlainString is a JSON string whose body is printable ASCII with no
+	// escape sequence and no embedded quote — the form whose JSON spelling and
+	// Go strconv.Quote spelling are identical.
+	scalarPlainString
+)
+
+// classifyScalar identifies a literal's raw JSON without decoding it, returning
+// the kind and the trimmed token.
+//
+// WHY THIS EXISTS. Node.Validate and Node.render each decode every literal in
+// the AST, and rules.Engine.compile runs both on EVERY decision before it can
+// probe the compiled-program cache (issue #9). Decoding through
+// json.NewDecoder costs ~7 allocations and ~2.4 KB per literal per call — the
+// decoder's internal read buffer dwarfs the value it is parsing — so a rule's
+// per-Check cost scaled with its literal count for no reason: the answer is the
+// same every time.
+//
+// SAFETY. The classifier is one-sided. It returns a kind ONLY when the bytes
+// are provably that kind under the JSON grammar; every uncertain case (escaped
+// or non-ASCII strings, composites, malformed input, trailing garbage) returns
+// scalarUnclassified and the caller decodes as before. So it can never widen
+// what Validate accepts, and it can never change what render emits.
+func classifyScalar(raw []byte) (scalarKind, []byte) {
+	tok := trimJSONSpace(raw)
+	if len(tok) == 0 {
+		return scalarUnclassified, nil
+	}
+	switch c := tok[0]; {
+	case c == 'n':
+		if string(tok) == "null" {
+			return scalarNull, tok
+		}
+	case c == 't':
+		if string(tok) == "true" {
+			return scalarTrue, tok
+		}
+	case c == 'f':
+		if string(tok) == "false" {
+			return scalarFalse, tok
+		}
+	case c == '"':
+		if isPlainJSONString(tok) {
+			return scalarPlainString, tok
+		}
+	case c == '-' || (c >= '0' && c <= '9'):
+		if isJSONNumber(tok) {
+			return scalarNumber, tok
+		}
+	}
+	return scalarUnclassified, nil
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// trimJSONSpace strips the four JSON whitespace bytes from both ends. A
+// RawMessage produced by encoding/json carries none, but a hand-built Node may.
+func trimJSONSpace(b []byte) []byte {
+	i, j := 0, len(b)
+	for i < j && isJSONSpace(b[i]) {
+		i++
+	}
+	for j > i && isJSONSpace(b[j-1]) {
+		j--
+	}
+	return b[i:j]
+}
+
+// isPlainJSONString reports whether tok is a JSON string whose body contains
+// only printable ASCII other than '"' and '\'.
+//
+// That restriction is what makes the render fast path exact rather than merely
+// close: with no escape to expand and no byte outside 0x20-0x7E, the decoded Go
+// string is the body verbatim, and strconv.Quote of such a string re-emits it
+// unchanged between the same two quotes. Anything else — an escape, a control
+// byte, any non-ASCII rune — is left to the decoder, whose output Quote may
+// legitimately re-spell. json.Marshal HTML-escapes '<' to the six-byte sequence
+// backslash-u-0-0-3-c, for instance, so Lit("a<b") carries a backslash, takes
+// the slow path, and renders exactly as it always has.
+func isPlainJSONString(tok []byte) bool {
+	if len(tok) < 2 || tok[len(tok)-1] != '"' {
+		return false
+	}
+	for _, c := range tok[1 : len(tok)-1] {
+		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+// isJSONNumber reports whether tok is exactly one JSON number and nothing else:
+// -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, consuming the whole token.
+//
+// It is deliberately the strict grammar. Anything it turns down (a leading '+',
+// a bare '.', a leading zero, trailing bytes) falls back to the decoder, so a
+// false negative costs an allocation and nothing else; a false POSITIVE would
+// be a correctness bug, which is why nothing here is approximate.
+func isJSONNumber(tok []byte) bool {
+	i := 0
+	if i < len(tok) && tok[i] == '-' {
+		i++
+	}
+	switch {
+	case i >= len(tok):
+		return false
+	case tok[i] == '0':
+		i++
+	case tok[i] >= '1' && tok[i] <= '9':
+		for i < len(tok) && tok[i] >= '0' && tok[i] <= '9' {
+			i++
+		}
+	default:
+		return false
+	}
+	if i < len(tok) && tok[i] == '.' {
+		i++
+		start := i
+		for i < len(tok) && tok[i] >= '0' && tok[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return false
+		}
+	}
+	if i < len(tok) && (tok[i] == 'e' || tok[i] == 'E') {
+		i++
+		if i < len(tok) && (tok[i] == '+' || tok[i] == '-') {
+			i++
+		}
+		start := i
+		for i < len(tok) && tok[i] >= '0' && tok[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return false
+		}
+	}
+	return i == len(tok)
+}
+
 // decodeScalar decodes a literal's raw JSON into a scalar (nil, bool, json.Number,
 // or string), rejecting composites. UseNumber keeps integer literals exact so a
 // rule round-trips and renders without float reformatting.
+//
+// This is the SLOW path — classifyScalar handles the common forms without it —
+// but it remains the definition of what a literal may be: the fast path only
+// ever short-circuits inputs this function would have accepted.
 func decodeScalar(raw json.RawMessage) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()

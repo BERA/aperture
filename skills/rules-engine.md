@@ -1,6 +1,6 @@
 ---
 name: rules-engine
-description: The rules engine evaluates a JSON rule AST as a Pulse expression over object metadata and principal/action context, compiling once and caching, to back the inclusive/exclusive scope resolvers.
+description: The rules engine evaluates a JSON rule AST as an expr-lang expression over object metadata and principal/action context, compiling once and caching, to back the inclusive/exclusive scope resolvers.
 applies_to: [cli, http, mcp]
 ---
 
@@ -12,10 +12,12 @@ is the rule-backed variant of the inclusive/exclusive scope resolvers (E2-S1): a
 `*rules.Engine` satisfies `scope.RuleEvaluator`, so wiring it as
 `engine.ScopeDeps{Rules: eng}` turns on rule-driven scope membership.
 
-Expressions are evaluated by Pulse's expression evaluator (`expr-lang/expr`, the
-same pure-Go engine Pulse uses for its `FILTER_EXPRESSION` predicate). Aperture
-does not hand-roll a parser and stays `CGO_ENABLED=0` — it never pulls Pulse's
-geo/h3 packages.
+Expressions are evaluated by [`expr-lang/expr`](https://github.com/expr-lang/expr)
+**directly**: `rules` renders each AST to an expr-lang expression and compiles it
+in-process with expr-lang's pure-Go evaluator. Aperture does not hand-roll a
+parser, has **no dependency on Pulse**, and stays `CGO_ENABLED=0`. Any older doc
+calling this a "Pulse expression" is stale — `rules` imports
+`github.com/expr-lang/expr` and that is the whole engine.
 
 ## The rule AST (the editor + state-file contract)
 
@@ -256,7 +258,7 @@ operators** by expr's grammar, so they are registered but not reachable through 
 
 ## Compile-once, cache
 
-A rule is rendered to its canonical Pulse expression, hashed (sha256), and the
+A rule is rendered to its canonical expr-lang expression, hashed (sha256), and the
 compiled program is cached by that hash — so distinct rule references whose ASTs
 render identically share one compiled program, and per-`Check` cost is bounded
 (the NFR lever E4-S4 tunes). The cache is concurrency-safe with an optional TTL
@@ -265,10 +267,21 @@ exposes hit/miss/eviction counters.
 
 What the cache removes is the **expr-lang compile**, not the AST walk: `Selected`
 calls `Engine.Compile` per evaluation, and `Compile` re-validates, re-renders, and
-re-hashes the AST before it can probe the cache by hash. That walk is therefore on
-every decision, and its cost scales with node count — measured at ~2.2 µs / 19
-allocs for a 3-node rule and ~14 allocs per **literal** node beyond it, because
-`Validate` decodes each literal's JSON afresh.
+re-hashes the AST before it can probe the cache by hash. That walk is still on
+every decision, but it is now **flat in literal count** — ~0.65 µs / 5 allocs /
+288 B for a 3-node rule and ~0.65 µs / 5 allocs / 320 B for a 6-node one. What
+remains is the render buffer, the rendered string, and the sha256 + hex of it.
+
+Getting there was issue #9. Both `Validate` and `render` used to decode every
+literal through a `json.NewDecoder`, twice per decision, at ~14 allocs and
+~4.9 KB per literal — so a rule's per-`Check` cost scaled with how many literals
+it happened to contain (a 6-node rule cost 47 allocs against a 3-node rule's 19,
+for expressions that evaluate identically). `rules.classifyScalar` now identifies
+the common literal forms straight from the raw JSON bytes with no allocation, and
+defers to the decoder only for escaped/non-ASCII strings, composites and
+malformed input — so it can never widen what `Validate` accepts. The
+`bench/collection_test.go` budget that tracked this is now 2 allocs, measured at
+0.0.
 
 ## What a rule costs a `Check`
 
