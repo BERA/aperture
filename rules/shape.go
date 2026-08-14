@@ -116,6 +116,25 @@ func classify(path string, v any, want expectation) operand {
 		o.ok, o.absent = true, true
 		return o
 	}
+	// Fast path for []any, which is the ONLY array shape the metadata value model
+	// admits (provider.ValidateField rejects typed containers), so this is the
+	// case that actually arrives on the hot path. The reflect branch below copies
+	// element by element, which costs ~16 B and ~12 ns per element per Check —
+	// linear in array length, and enough to drop throughput under the 10k
+	// checks/sec NFR floor at the 64KiB value cap (bench/collection_test.go).
+	//
+	// Aliasing rather than copying is safe: members is READ-ONLY after
+	// construction (every consumer below only ranges it or calls containsValue),
+	// so this never writes through to the caller's metadata, and the transitive
+	// read-only contract in provider/provider.go is preserved.
+	if s, ok := v.([]any); ok {
+		o.ok = want == expectCollection || want == expectArray || want == expectSizable
+		o.length = len(s)
+		if o.ok {
+			o.members = s
+		}
+		return o
+	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
