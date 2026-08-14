@@ -3,7 +3,9 @@ package seed
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"slices"
+	"strings"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
@@ -47,60 +49,123 @@ type Object struct {
 	Metadata json.RawMessage `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 }
 
+// objectGroup is one object-type's inline entries, in declaration order.
+type objectGroup struct {
+	typ     string
+	objects []provider.Object
+}
+
 // registerObjects builds the document's inline objects into in-memory providers
 // and registers one per object-type, in first-declaration order.
 //
-// Objects of DIFFERENT types may be interleaved freely in the file — they are
-// grouped here — but within a type, declaration order is preserved, because that
-// is the order List and Query return.
-func (d *Document) registerObjects(reg *provider.Registry) error {
-	if len(d.Objects) == 0 {
-		return nil
+// It runs in two passes, and the split is the point: EVERY inline entry is
+// validated (pass one) before any precedence decision is taken (pass two), so a
+// malformed declaration fails the load whether or not its type is ultimately
+// discarded in favour of a providers: entry. Validation that depended on wiring
+// would mean a document silently stopped being checked the day someone added a
+// CSV for one of its types.
+//
+// Precedence is TYPE-LEVEL and total: a type already served by the providers:
+// section keeps that file-backed provider, and every inline entry for that type
+// is discarded — no merge at any granularity and no fallback for an id the file
+// lacks. It is APERTURE_CONFIG_INVALID unless the caller passed
+// AllowProviderPrecedence; see that option for why the default is loud.
+func (d *Document) registerObjects(reg *provider.Registry, cfg buildConfig) error {
+	groups, err := d.groupObjects()
+	if err != nil {
+		return err
 	}
-	byType := make(map[string][]provider.Object)
-	var types []string // first-declaration order of the object-types
+	// Collisions are collected rather than reported one at a time, so an author
+	// fixing a document sees every ambiguous type in one pass. Only the object
+	// TYPE is named: an object id can embed an account ("account:acme/brand:1"),
+	// and an error message is the wrong place for it.
+	var collided []string
+	for _, g := range groups {
+		if reg.Has(g.typ) {
+			collided = append(collided, g.typ)
+		}
+	}
+	if len(collided) > 0 && !cfg.allowProviderPrecedence {
+		slices.Sort(collided)
+		// The types ride in the MESSAGE as well as the context, because the
+		// message is what a CLI prints and what lands in a bug report.
+		return aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			fmt.Sprintf("seed: object type(s) %s are declared in both the providers: and objects: "+
+				"sections; the providers: entry wins and every inline entry for that type is "+
+				"discarded entirely (no merge at any granularity, no fallback for an id the file "+
+				"lacks) — remove one of the two declarations, or build with "+
+				"seed.AllowProviderPrecedence() to accept the discard",
+				strings.Join(collided, ", ")),
+			map[string]any{"object_types": collided})
+	}
+
+	for _, g := range groups {
+		if reg.Has(g.typ) {
+			// The file-backed provider wins the whole type. Nothing from these
+			// entries reaches the registry, not even for ids the file lacks.
+			continue
+		}
+		impl, err := provider.NewStatic(g.objects)
+		if err != nil {
+			return err
+		}
+		// TTL 0 never expires: inline metadata is fixed for the life of the
+		// process, so a freshness window would only buy re-reads of a value that
+		// cannot have changed.
+		if err := reg.Register(g.typ, impl, provider.WithTTL(0)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// groupObjects validates every inline entry and groups them by object-type.
+//
+// Objects of DIFFERENT types may be interleaved freely in the file — they are
+// grouped here, and the groups come back in first-declaration order — but within
+// a type, declaration order is preserved, because that is the order List and
+// Query return.
+//
+// Ids are deduplicated across the WHOLE section, not per type: two entries with
+// the same id are the same object declared twice however they are spelled, and
+// the second would silently shadow the first.
+func (d *Document) groupObjects() ([]objectGroup, error) {
+	if len(d.Objects) == 0 {
+		return nil, nil
+	}
+	index := make(map[string]int, len(d.Objects)) // object-type -> groups slot
+	var groups []objectGroup
 	seen := make(map[string]bool, len(d.Objects))
 
 	for _, o := range d.Objects {
 		if o.ID == "" {
-			return aerr.New(aerr.APERTURE_CONFIG_INVALID, "seed: object is missing id")
+			return nil, aerr.New(aerr.APERTURE_CONFIG_INVALID, "seed: object is missing id")
 		}
 		id, err := identity.Parse(o.ID)
 		if err != nil {
-			return err // passes through APERTURE_IDENTITY_INVALID
+			return nil, err // passes through APERTURE_IDENTITY_INVALID
 		}
 		key := id.String()
 		if seen[key] {
-			return aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
 				"seed: object is declared more than once", map[string]any{"id": key})
 		}
 		seen[key] = true
 
 		md, err := decodeObjectMetadata(key, o.Metadata)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		typ := terminalType(id)
-		if _, ok := byType[typ]; !ok {
-			types = append(types, typ)
+		slot, ok := index[typ]
+		if !ok {
+			slot = len(groups)
+			index[typ] = slot
+			groups = append(groups, objectGroup{typ: typ})
 		}
-		byType[typ] = append(byType[typ], provider.Object{ID: id, Metadata: md})
+		groups[slot].objects = append(groups[slot].objects, provider.Object{ID: id, Metadata: md})
 	}
-
-	for _, typ := range types {
-		impl, err := provider.NewStatic(byType[typ])
-		if err != nil {
-			return err
-		}
-		// TTL 0 never expires: inline metadata is fixed for the life of the
-		// process, so a freshness window would only buy re-reads of a value that
-		// cannot have changed. Register surfaces APERTURE_PROVIDER_INVALID when the
-		// type already has a provider (a providers: entry for the same type).
-		if err := reg.Register(typ, impl, provider.WithTTL(0)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return groups, nil
 }
 
 // terminalType returns the object-type an identity belongs to: the type of its

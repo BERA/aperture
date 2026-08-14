@@ -139,8 +139,56 @@ JSON seed file, or a CSV `:int` column.
 A missing or duplicate `id`, `metadata` that is not a mapping, or a value the
 value model rejects is `APERTURE_CONFIG_INVALID` naming the object id and the
 field (with the inner `APERTURE_METADATA_INVALID` kept in the chain); a malformed
-id is `APERTURE_IDENTITY_INVALID`. Declaring a type in **both** `providers:` and
-`objects:` is a duplicate registration, `APERTURE_PROVIDER_INVALID`.
+id is `APERTURE_IDENTITY_INVALID`. Ids are deduplicated across the **whole**
+section, not per type — the same id declared twice is the same object declared
+twice, however it is spelled.
+
+### When both sections claim a type
+
+`providers:` and `objects:` can each claim the same object type. **Precedence is
+type-level and total:**
+
+> If a `providers:` entry exists for an object type, the file-backed provider
+> wins and **every** inline `objects:` entry for that type is discarded.
+
+There is **no object-level merge, no field-level merge, and no fallback**. An
+inline id the file happens to lack is simply not resolvable — `Fetch` returns
+`APERTURE_NOT_FOUND` and enumeration never lists it, exactly as if the entry had
+never been written. A field only the inline entry declared does not appear on an
+object the file *does* carry.
+
+That is deliberate. Field-level merging is the most useful-sounding behaviour and
+the most impossible to debug: a rule reading a field the CSV silently did not
+override is a support ticket nobody can reproduce. Predictability wins.
+
+Because the discard is total, **a collision is a hard error by default**:
+`BuildRegistry` returns `APERTURE_CONFIG_INVALID` naming every colliding object
+type (sorted, in both the message and the error context — never the object ids,
+which can embed an account). Silently discarding a section the author took the
+trouble to write would be hostile, and nothing in `seed` has a logging path that
+could carry a warning to an operator instead.
+
+A collision that *is* deliberate — a CSV shadowing checked-in inline defaults for
+a dev run, say — is accepted by building with the override:
+
+```go
+reg, err := doc.BuildRegistry(dir, seed.AllowProviderPrecedence())
+```
+
+The discard still happens in full; the option only says the host meant it. It is
+Go wiring rather than a seed-file key on purpose: the file stays a plain
+declaration of what exists, and the choice to tolerate an ambiguous one sits in
+code, where a reviewer sees it.
+
+**Validation is independent of precedence.** Every inline entry is checked —
+`id`, identity, duplicates, the value model — *before* any type is discarded, so
+a malformed declaration fails the load whether or not its type ultimately loses
+to a `providers:` entry. Otherwise a document would silently stop being validated
+the day someone added a CSV for one of its types.
+
+Two `providers:` entries for one type remain a duplicate registration,
+`APERTURE_PROVIDER_INVALID` — that is a straight contradiction with no winner to
+pick, not a precedence question.
 
 ## What is *not* in the file
 
@@ -157,6 +205,8 @@ Two things are deliberately excluded from the model state file:
   declared provider names an `object_type`, a `kind` (currently only `csv`), a
   `path` (resolved relative to the seed file), and optional cache `ttl`/`max_size`.
   A malformed entry is `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
+  When both sections claim one type, `providers:` wins the type outright — see
+  [When both sections claim a type](#when-both-sections-claim-a-type).
 
 ## Related
 

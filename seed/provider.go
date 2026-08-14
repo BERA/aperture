@@ -48,6 +48,43 @@ func ParseFile(path string) (*Document, error) {
 	return Parse(data, formatFor(path))
 }
 
+// BuildOption tunes how BuildRegistry resolves the document's two wiring
+// sections. It is Go-level wiring on purpose: the seed FILE stays a plain
+// declaration of what exists, and the decision to tolerate an ambiguous one is
+// made by the host that builds the registry, where a reviewer sees it.
+type BuildOption func(*buildConfig)
+
+// buildConfig is the resolved set of BuildOptions.
+type buildConfig struct {
+	// allowProviderPrecedence accepts the type-level precedence rule instead of
+	// refusing to build an ambiguous document. See AllowProviderPrecedence.
+	allowProviderPrecedence bool
+}
+
+// AllowProviderPrecedence accepts the type-level precedence rule for an object
+// type declared in BOTH the providers: and objects: sections, instead of failing
+// the build with APERTURE_CONFIG_INVALID.
+//
+// The rule it accepts is TOTAL and TYPE-LEVEL: the file-backed providers: entry
+// wins, and EVERY inline objects: entry for that type is discarded. There is no
+// object-level merge, no field-level merge, and no fallback — an inline id the
+// file happens to lack is simply not resolvable, exactly as if the entry had
+// never been written. Field-level merging is the most useful-sounding behaviour
+// and the most impossible to debug: a rule reading a field the CSV silently did
+// not override is a support ticket nobody can reproduce. Predictability wins.
+//
+// Because the discard is total, a collision is a HARD APERTURE_CONFIG_INVALID by
+// default — no operator can miss it, and no logging path leaves this package that
+// could carry a warning instead. This option is the deliberate dev-time override
+// (a CSV shadowing checked-in inline defaults, say): the discard still happens in
+// full, but the host has said in code that it means it.
+//
+// Every inline entry is validated either way — a malformed declaration fails the
+// load whether or not its type is ultimately discarded.
+func AllowProviderPrecedence() BuildOption {
+	return func(c *buildConfig) { c.allowProviderPrecedence = true }
+}
+
 // BuildRegistry constructs a live *provider.Registry from the document's two
 // wiring sections: providers (a declared implementation per object-type) and
 // objects (metadata declared inline, served by an in-memory provider.Static per
@@ -60,19 +97,29 @@ func ParseFile(path string) (*Document, error) {
 // unparseable ttl, or a duplicate object_type) and a malformed objects entry
 // (missing id, a duplicate id, metadata that is not a mapping, or a value the
 // shared value model rejects) are both APERTURE_CONFIG_INVALID; a malformed id
-// passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice is
-// APERTURE_PROVIDER_INVALID.
+// passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice by two
+// providers entries is APERTURE_PROVIDER_INVALID.
+//
+// A type claimed by BOTH sections is APERTURE_CONFIG_INVALID naming the type,
+// unless AllowProviderPrecedence is passed — see that option for the precedence
+// rule it accepts and why the default is loud.
 //
 // Neither section touches storage: Apply writes no row for either, and an export
 // reproduces neither.
-func (d *Document) BuildRegistry(baseDir string) (*provider.Registry, error) {
+func (d *Document) BuildRegistry(baseDir string, opts ...BuildOption) (*provider.Registry, error) {
+	var cfg buildConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	reg := provider.NewRegistry()
+	// providers: is registered FIRST so the objects: section can see which types
+	// are already file-backed. That ordering IS the precedence rule.
 	for _, p := range d.Providers {
 		if err := registerProvider(reg, p, baseDir); err != nil {
 			return nil, err
 		}
 	}
-	if err := d.registerObjects(reg); err != nil {
+	if err := d.registerObjects(reg, cfg); err != nil {
 		return nil, err
 	}
 	return reg, nil

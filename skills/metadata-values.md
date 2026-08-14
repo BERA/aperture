@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -182,7 +182,33 @@ Three properties, all of them the same ones the CSV loader owes:
   `APERTURE_METADATA_INVALID` (with its `path`/`type`/`depth` context) in the
   chain. A missing or duplicate `id`, or metadata that is not a mapping, is the
   same `APERTURE_CONFIG_INVALID`; a malformed id passes through as
-  `APERTURE_IDENTITY_INVALID`.
+  `APERTURE_IDENTITY_INVALID`. Ids are deduplicated across the **whole** section,
+  not per type.
+
+#### When `providers:` and `objects:` claim the same type
+
+**Precedence is type-level and total: the file-backed `providers:` entry wins,
+and every inline `objects:` entry for that type is discarded.** No object-level
+merge, no field-level merge, no fallback — an inline id the file lacks is not
+resolvable (`APERTURE_NOT_FOUND`, and absent from enumeration), and a field only
+the inline entry declared never appears on an object the file does carry. A rule
+reading a field the CSV silently did not override is a support ticket nobody can
+reproduce; predictability wins over usefulness here.
+
+Because that discard is total, **a collision is `APERTURE_CONFIG_INVALID` by
+default**, naming every colliding object *type* (sorted, in both the message and
+the error context — never the object ids, which can embed an account). Nothing in
+`seed` has a logging path to an operator, so a warning would be a silent discard
+in practice. A deliberate collision is accepted with
+`doc.BuildRegistry(dir, seed.AllowProviderPrecedence())` — Go wiring, not a
+seed-file key, so the file stays a plain declaration and the tolerance sits where
+a reviewer sees it.
+
+**Validation does not depend on precedence.** Every inline entry is validated
+before any type is discarded, so a malformed declaration fails the load even when
+its type loses to a `providers:` entry. Two `providers:` entries for one type are
+still `APERTURE_PROVIDER_INVALID` — a contradiction with no winner to pick, not a
+precedence question.
 
 `provider.Static` is the in-memory `ObjectProvider` behind the section, and is
 reusable on its own (tests, embedded data). It is immutable after `NewStatic`
@@ -273,6 +299,7 @@ Changing the value model means changing all of these in the same PR:
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
+| The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `AllowProviderPrecedence` doc comments in `seed/provider.go` |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the
 value model must not change that.
