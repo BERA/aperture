@@ -220,8 +220,14 @@ reg.MustRegister("app",   csvprovider.New("apps.csv"),   provider.WithTTL(0))
 The first row is a header. One column **must** be named `id` and holds each
 object's canonical identity string; its terminal segment type is the object-type
 the provider is registered under. Every other column becomes a metadata field
-keyed by the column name. A column name may carry a `name:type` suffix so its
-cells are coerced to a real type the rules engine reads natively:
+keyed by the column name. A column name may carry a type suffix so its cells are
+coerced to a real type the rules engine reads natively. The full grammar is:
+
+```text
+name:type[<elem>][(delim)]
+```
+
+#### Scalar columns
 
 ```text
 id,category_id,seats:int,active:bool,budget:float
@@ -230,12 +236,58 @@ brand:5,books,12,false,3000
 brand:23,garden,,true,
 ```
 
-Supported types are `string` (the default, no suffix), `int` (stored as `int64`),
+Scalar types are `string` (the default, no suffix), `int` (stored as `int64`),
 `float` (`float64`), and `bool`. An **empty cell omits that field** for the row,
 so a rule can supply its own default (row `brand:23` above has no `seats` or
-`budget`). A missing `id` column, a duplicate id, a wrong column count, or a value
-that will not coerce to its declared type is an `APERTURE_CONFIG_INVALID` error; a
-malformed id passes through as the identity package's `APERTURE_IDENTITY_INVALID`.
+`budget`).
+
+#### Array columns
+
+The type `list` produces a real `[]any` — the [array](#the-metadata-value-model)
+of the value model — which is what makes `"premium" in object.tags` decide
+correctly instead of string-matching a delimited blob (a blob match also matches
+`"premium-trial"` and grants access it shouldn't):
+
+```text
+id,tags:list,seats:list<int>,aliases:list(;)
+brand:1,premium|launch,3|5,acme;acme-co
+brand:2,,1,bcorp
+```
+
+| Suffix | Elements |
+|---|---|
+| `:list` | strings, split on `\|` |
+| `:list<int>` / `:list<float>` / `:list<bool>` | each element coerced through the **same** scalar path |
+| `:list(;)` | strings, split on `;` — that column only |
+| `:list<int>(;)` | both, in that order |
+
+**Element typing is not decoration.** The expression evaluator does no
+numeric/string coercion, so `5 in object.seats` is **false** against the strings
+`["3","5"]` — a silently wrong `false`, the worst failure mode an access-control
+engine has. `:list<int>` is what prevents it.
+
+**There is no escape syntax.** A value that must contain the delimiter needs a
+per-column delimiter its data does not contain. A stray, doubled, leading, or
+trailing delimiter — how a delimiter *inside* a value looks to the parser —
+yields an empty element and is a **hard error at parse**, never a silently
+mis-split row.
+
+An **empty cell in a list column is the one departure** from the scalar rule: it
+yields an **empty list** (`[]`), not an absent field, so a membership rule
+evaluates to a definite `false` rather than running against `nil` (row `brand:2`
+above has `tags: []`).
+
+#### Errors
+
+A missing `id` column, a duplicate id, a wrong column count, an unknown type or
+malformed type suffix, a value that will not coerce to its declared type, or a
+list cell with an empty element is an `APERTURE_CONFIG_INVALID` error naming the
+column — and, for a cell, the line and the offending element. A malformed id
+passes through as the identity package's `APERTURE_IDENTITY_INVALID`. Every
+parsed value is then checked against the [value model](#validating-at-load) with
+`provider.ValidateField`, so a shape, depth, or size violation fails the **load**
+as `APERTURE_METADATA_INVALID` instead of surfacing as a runtime error on the
+`Check` hot path.
 
 ### Loading and the read-only contract
 
@@ -245,8 +297,10 @@ use (the file may not exist yet at wiring time). `FromReader(r)` builds an
 already-loaded provider from any reader (embedded data, tests). `Reload`
 re-reads the file, building a **fresh** set and swapping it in atomically, so maps
 already handed to and cached by the Registry stay immutable — honouring the
-"metadata is read-only" contract. After a `Reload`, call
-`Registry.InvalidateType` to drop the now-stale cache entries.
+"metadata is read-only" contract. That holds at depth: every list cell is parsed
+into a slice allocated for that row alone, so no two rows — and no two loads —
+ever share one. After a `Reload`, call `Registry.InvalidateType` to drop the
+now-stale cache entries.
 
 `Query` honours `Filter.Pattern` and `Filter.Limit` directly and matches
 `Filter.Fields` by string-equality (a field absent from an object never matches).
