@@ -27,21 +27,80 @@ file (E5-S2) persists the same shape. There is no second rule format.
 |---|---|---|
 | `and` / `or` | `children` (>= 2) | logical conjunction / disjunction |
 | `not` | `children` (exactly 1) | logical negation |
-| `compare` | `op`, `left`, `right` | binary comparison |
+| `compare` | `op`, `left`, `right` | comparison; `right` is omitted for the unary ops |
 | `var` | `name` (dotted path) | context variable reference |
 | `literal` | `value` (scalar JSON) | string / number / bool / null constant |
-| `list` | `items` | list literal (right side of `in`/`nin`) |
+| `list` | `items` | list literal (right side of a collection op) |
 | `call` | `name`, `items` (args) | call to a registered pure function |
 
-`compare` ops: `eq ne lt le gt ge in nin`. The JSON form is stable and
-round-trips (marshal -> unmarshal -> marshal is byte-identical), including falsy
-literals (`false`, `0`, `""`, `null`).
+The JSON form is stable and round-trips (marshal -> unmarshal -> marshal is
+byte-identical), including falsy literals (`false`, `0`, `""`, `null`) and the
+unary operators, whose `right` key stays absent.
 
 ```json
 {"type":"compare","op":"eq",
  "left":{"type":"var","name":"object.classification"},
  "right":{"type":"literal","value":"public"}}
 ```
+
+## Operators
+
+Scalar comparisons — `left` and `right` are both required, any operand node:
+
+| `op` | Reads as | Renders to |
+|---|---|---|
+| `eq` `ne` | `object.tier == "gold"` | `==` `!=` |
+| `lt` `le` `gt` `ge` | `object.level >= 3` | `<` `<=` `>` `>=` |
+
+Collection operators. `left` is the collection (or, for `exists`, any path);
+`right` is the operand, and is **omitted entirely** for the three unary ops:
+
+| `op` | Reads as | `left` applies to | `right` |
+|---|---|---|---|
+| `in` | `object.region in ["us","eu"]` | any | list or var |
+| `nin` | `principal.id not in object.blocklist` | any | list or var |
+| `has` | `object.tags has "urgent"` | array | one element (never a list) |
+| `hasAll` | `object.tags has all ["a","b"]` | array | list or var |
+| `hasAny` | `object.tags has any ["a","b"]` | array | list or var |
+| `hasNone` | `object.tags has none ["a","b"]` | array | list or var |
+| `subsetOf` | `object.tags subset of ["a","b"]` | array | list or var |
+| `hasKey` | `object.owner has key "dept"` | object | one element (never a list) |
+| `isEmpty` | `object.tags is empty` | array, object | **omitted** |
+| `isNotEmpty` | `object.tags is not empty` | array, object | **omitted** |
+| `exists` | `object.owner.dept exists` | any path | **omitted** |
+
+Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
+
+- The three unary ops require `right == nil`; supplying one is an error, not
+  something ignored, so a rule has exactly one spelling.
+- Every other op requires both operands.
+- `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf` need a `list` or a `var` on
+  the right — a set.
+- `has` `hasKey` need a single element on the right; a `list` there is an error
+  pointing at `hasAll`/`hasAny`/`hasNone`.
+
+Build a unary node with `rules.Unary(op, left)`; everything else with
+`rules.Compare(op, left, right)`.
+
+### How each operator compiles
+
+`expr.DisableAllBuiltins()` is on, so nothing is assumed reachable. Each operator
+either renders to native expr syntax or calls a pure function the compiler
+registers:
+
+- **Native.** `eq ne lt le gt ge in nin` are infix. `has` and `hasKey` render as
+  a *flipped* `in` (`"urgent" in object?.tags`) — expr's `in` is element
+  membership over an array **and key membership over an object**, so `hasKey`
+  needs no new machinery. `exists` renders as `(left != nil)`.
+- **Registered pure functions.** `hasAll` `hasAny` `hasNone` `subsetOf`
+  `isEmpty` `isNotEmpty` have no native spelling with builtins off, so each is
+  backed by a deterministic, side-effect-free function in the curated set.
+
+**expr's predicate builtins are denied.** `expr.DisableAllBuiltins()` does not
+reach `all`, `any`, `none`, `one`, `filter`, `map`, `count`, `sum`, `find`,
+`findIndex`, `findLast`, `findLastIndex`, `groupBy`, `sortBy`, `reduce` — the
+parser resolves those names before consulting the disabled table. `Validate`
+rejects a `call` node naming any of them with `APERTURE_RULE_INVALID`.
 
 ## Context variables
 
@@ -85,13 +144,28 @@ Other missing-field behavior: equality against a missing field is `false`; an
 ordered comparison (`lt le gt ge`) against one is an `APERTURE_RULE_EVAL` runtime
 error, as is `in` over a non-collection (a string or a number).
 
+**Every collection operator follows the same rule: an absent field reads as an
+EMPTY collection, never an error.** Which way that falls depends on the
+operator's polarity, and the negative ones grant just like `nin`:
+
+| Field absent | `has` | `hasAll` | `hasAny` | `hasKey` | `isNotEmpty` | `exists` | `hasNone` | `subsetOf` | `isEmpty` |
+|---|---|---|---|---|---|---|---|---|---|
+| result | `false` | `false` | `false` | `false` | `false` | `false` | **`true`** | **`true`** | **`true`** |
+
+A field of the **wrong shape** is a different story and is still an
+`APERTURE_RULE_EVAL` error — `hasAll` over a string, `isEmpty` over a number,
+`has` over a number. Deny-safety covers missing data, not mistyped data; that is
+why the value model is validated at load time.
+
 ## Validation before evaluation
 
 `Compiler.Compile` (and `Engine.Compile`) validate and type-check before any
 evaluation, surfacing coded errors:
 
-- `APERTURE_RULE_INVALID` — malformed AST (bad arity, missing operand, non-scalar
-  literal, non-identifier variable path).
+- `APERTURE_RULE_INVALID` — malformed AST (bad arity, missing operand, a right
+  operand on a unary op, the wrong operand shape for a collection op, non-scalar
+  literal, non-identifier variable path, a `call` naming a denied predicate
+  builtin).
 - `APERTURE_RULE_UNKNOWN_VARIABLE` — a variable root outside `object` /
   `principal` / `account` / `action`.
 - `APERTURE_RULE_TYPE_ERROR` — type-incompatible comparison, non-boolean result,
@@ -103,10 +177,13 @@ evaluation, surfacing coded errors:
 
 Evaluation is pure and deterministic over a fixed metadata snapshot: all of
 `expr-lang`'s builtins are disabled, so no wall-clock or random function is
-reachable. The only callable functions are the curated pure set (`lower`,
-`upper`, `contains`, `startsWith`, `endsWith`, `len`) plus any a host registers
-with `rules.Function` / `WithFunction` (the parallel to Pulse's
-`Options.Extensions.ExprFunctions`).
+reachable. The curated pure set is `lower`, `upper`, `contains`, `startsWith`,
+`endsWith`, `len`, plus the collection-operator backings `hasAll`, `hasAny`,
+`hasNone`, `subsetOf`, `isEmpty`, `isNotEmpty` — all deterministic and
+side-effect-free. A host adds its own with `rules.Function` / `WithFunction`.
+Note that `contains`, `startsWith` and `endsWith` are reserved as **infix
+operators** by expr's grammar, so they are registered but not reachable through a
+`call` node; the other nine are.
 
 ## Compile-once, cache
 

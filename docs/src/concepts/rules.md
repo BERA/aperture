@@ -29,18 +29,18 @@ JSON form is a stable contract that round-trips byte-identically
 | `and` | `Children` (≥ 2) | logical conjunction |
 | `or` | `Children` (≥ 2) | logical disjunction |
 | `not` | `Children` (exactly 1) | logical negation |
-| `compare` | `Op`, `Left`, `Right` | binary comparison |
+| `compare` | `Op`, `Left`, `Right` | a comparison; `Right` is omitted for the unary operators |
 | `var` | `Name` (dotted path) | a context-variable reference |
 | `literal` | `Value` (scalar JSON) | a string, number, bool, or null constant |
-| `list` | `Items` | an ordered list, the right side of `in`/`nin` |
+| `list` | `Items` | an ordered list, the right side of a collection operator |
 | `call` | `Name`, `Items` (args) | a call to a registered pure function |
 
-The comparison operators carried in `compare.Op` are `eq ne lt le gt ge in nin`,
-rendered to `== != < <= > >= in "not in"` respectively.
+The operators carried in `compare.Op` are covered in
+[the operator vocabulary](#the-operator-vocabulary) below.
 
-Constructor helpers build the tree in Go — `And`, `Or`, `Not`, `Compare`, `Var`,
-`Lit`, `List`, `Call`. This rule says *the object is public, or the principal's
-tier is one of gold/platinum*:
+Constructor helpers build the tree in Go — `And`, `Or`, `Not`, `Compare`,
+`Unary`, `Var`, `Lit`, `List`, `Call`. This rule says *the object is public, or
+the principal's tier is one of gold/platinum*:
 
 ```go
 ast := rules.Or(
@@ -85,6 +85,101 @@ The three metadata roots are `map[string]any` so a rule reads host-defined
 fields dynamically; `action` is a typed string so misusing it (`action.foo`) is
 a type error. This closed environment is enforced twice — structurally by
 `Validate` (below) and again by the expr-lang type-checker at compile time.
+
+## The operator vocabulary
+
+There are **eleven** comparison operators beyond the six scalar ones. All of them
+are values of `compare.Op` — none is editor-only sugar, because the AST is the
+editor's serialization target and the state file's persisted form: a rule
+authored as *has all* must read back as *has all*.
+
+### Scalar comparisons
+
+| `Op` | Reads as | Renders to |
+|---|---|---|
+| `eq` / `ne` | `object.tier == "gold"` | `==` / `!=` |
+| `lt` `le` `gt` `ge` | `object.level >= 3` | `<` `<=` `>` `>=` |
+
+Both operands are required and either may be any operand node.
+
+### Collection operators
+
+`Left` is the collection being tested (for `exists`, any path at all). `Right` is
+the operand — and the last three operators are **unary**: they reuse the same
+`compare` node with `Right` **omitted**, rather than introducing a new node type.
+
+| `Op` | Reads as | `Left` applies to | `Right` |
+|---|---|---|---|
+| `in` | `object.region in ["us","eu"]` | any | a `list` or a `var` |
+| `nin` | `principal.id not in object.blocklist` | any | a `list` or a `var` |
+| `has` | `object.tags has "urgent"` | array | one element — never a `list` |
+| `hasAll` | `object.tags has all ["a","b"]` | array | a `list` or a `var` |
+| `hasAny` | `object.tags has any ["a","b"]` | array | a `list` or a `var` |
+| `hasNone` | `object.tags has none ["a","b"]` | array | a `list` or a `var` |
+| `subsetOf` | `object.tags subset of ["a","b"]` | array | a `list` or a `var` |
+| `hasKey` | `object.owner has key "dept"` | object | one element — never a `list` |
+| `isEmpty` | `object.tags is empty` | array, object | **omitted** |
+| `isNotEmpty` | `object.tags is not empty` | array, object | **omitted** |
+| `exists` | `object.owner.dept exists` | any path | **omitted** |
+
+```go
+// "tagged both a and b, in no blocked region, and it actually has an owner"
+rules.And(
+    rules.Compare(rules.OpHasAll, rules.Var("object.tags"),
+        rules.List(rules.Lit("a"), rules.Lit("b"))),
+    rules.Compare(rules.OpHasNone, rules.Var("object.regions"),
+        rules.Var("account.blockedRegions")),
+    rules.Unary(rules.OpExists, rules.Var("object.owner.dept")),
+)
+```
+
+`rules.Unary(op, left)` builds a unary node; it is still a `compare` node, and
+its JSON simply carries no `right` key:
+
+```json
+{"type":"compare","op":"isEmpty","left":{"type":"var","name":"object.tags"}}
+```
+
+That omission is part of the contract. `Validate` requires `Right == nil` for
+exactly `isEmpty`, `isNotEmpty` and `exists` and **rejects a supplied one**, so
+there is only ever one spelling of a unary rule and the JSON round-trips
+byte-identically. Every other operator still requires both operands.
+
+### How each operator compiles
+
+`expr.DisableAllBuiltins()` is in force, so nothing may be *assumed* reachable.
+Each operator makes a deliberate choice:
+
+| Strategy | Operators | Rendered form |
+|---|---|---|
+| Native infix | `eq ne lt le gt ge in nin` | `(left <op> right)` |
+| Native, flipped `in` | `has`, `hasKey` | `(right in left)` |
+| Native nil test | `exists` | `(left != nil)` |
+| Registered pure function | `hasAll` `hasAny` `hasNone` `subsetOf` `isEmpty` `isNotEmpty` | `hasAll(left, right)`, `isEmpty(left)`, … |
+
+`has` and `hasKey` need no new machinery because expr's `in` is element
+membership over an array **and key membership over a map** — `"dept" in
+object.owner` is already the `hasKey` semantics, so the operator is pure
+spelling. `exists` leans on the [optional chaining](#nested-access-is-nil-safe)
+`var` already renders, which is what makes `object.owner.dept exists` false
+rather than a runtime error when `owner` is missing.
+
+The six with no native spelling are backed by functions in the curated pure set.
+Each is deterministic and side-effect-free, so the purity guarantee holds: they
+read their arguments and nothing else.
+
+### Predicate builtins are denied
+
+`expr.DisableAllBuiltins()` does not do everything its name suggests. expr's
+fifteen **predicate** builtins — `all`, `any`, `none`, `one`, `filter`, `map`,
+`count`, `sum`, `find`, `findIndex`, `findLast`, `findLastIndex`, `groupBy`,
+`sortBy`, `reduce` — are resolved by the parser *before* it consults the disabled
+table, so `all(...)` still compiles under Aperture's option set while `len(...)`
+genuinely does not. Nothing in the AST emits expr's `#` pointer, so none is
+reachable through a well-formed rule today — but a `call` node renders
+`name(args…)` verbatim, so `Call("all", …)` would compile. `Validate` therefore
+rejects those names outright with `APERTURE_RULE_INVALID`, and a test pins the
+callable set against expr's own builtin registry.
 
 ## Missing fields and nested access
 
@@ -141,6 +236,34 @@ rules.And(
 )
 ```
 
+### Collection operators: an absent field reads as an empty collection
+
+Every collection operator applies the same rule — **an absent array or object is
+not an error, it is an empty one**. Which way that falls out depends on the
+operator's polarity, and the negative operators grant exactly the way `nin` does:
+
+| Field absent | `has` | `hasAll` | `hasAny` | `hasKey` | `isNotEmpty` | `exists` | `hasNone` | `subsetOf` | `isEmpty` |
+|---|---|---|---|---|---|---|---|---|---|
+| result | `false` | `false` | `false` | `false` | `false` | `false` | ⚠️ `true` | ⚠️ `true` | ⚠️ `true` |
+
+`hasNone` and `subsetOf` are the ones to watch: *no forbidden tag* and *only
+allowed tags* are both trivially satisfied by an object that carries no tags at
+all. Pair them with `exists` (or `isNotEmpty`) when the field must be present:
+
+```go
+rules.And(
+    rules.Unary(rules.OpIsNotEmpty, rules.Var("object.tags")),
+    rules.Compare(rules.OpHasNone, rules.Var("object.tags"),
+        rules.List(rules.Lit("restricted"))),
+)
+```
+
+Deny-safety covers **missing** data, not **mistyped** data. A field of the wrong
+shape — `hasAll` over a string, `isEmpty` over a number, `has` over a number — is
+still an `APERTURE_RULE_EVAL` runtime error, matching expr's own
+`operator "in" not defined on string`. That is the argument for validating the
+value model at load time rather than at `Check` time.
+
 ### Other missing-field behavior
 
 - **Equality** against a missing field is `false` (nil never equals a scalar).
@@ -154,15 +277,24 @@ rules.And(
 
 `Node.Validate()` checks that a node and its subtree are **structurally
 well-formed** — the closed node set, the correct arities (`and`/`or` need ≥ 2
-children, `not` exactly 1, `compare` a left and right operand), a known
+children, `not` exactly 1, `compare` the operands its operator calls for), a known
 comparison operator, a scalar literal, and a variable whose first path segment
 is one of the four roots. It returns `APERTURE_RULE_INVALID` for a malformed node
 and `APERTURE_RULE_UNKNOWN_VARIABLE` for a variable outside the exposed roots.
 
 Validation is **pure structure** — it does not type-check and never touches the
-expression engine. A literal is checked to carry a scalar (arrays and objects are
-rejected; use a `list` node for collections). An `in`/`nin` right operand must be
-a `list` or a `var`.
+expression engine. Beyond arity it enforces, per operator:
+
+- A literal carries a scalar (arrays and objects are rejected; use a `list` node
+  for collections).
+- `isEmpty` / `isNotEmpty` / `exists` carry **no** `right` operand; every other
+  operator carries one.
+- `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf` take a `list` or a `var` on
+  the right.
+- `has` / `hasKey` take a single element on the right — a `list` there is an
+  error that points at `hasAll`/`hasAny`/`hasNone`.
+- A `call` may not name one of expr's [predicate
+  builtins](#predicate-builtins-are-denied).
 
 For the *deep* check — structure **plus** a full compile pass that surfaces type
 errors and unknown functions — call `rules.ValidateAST(raw)`. It decodes a JSON
@@ -194,12 +326,18 @@ reusable `*vm.Program` via `expr.Compile`. Every compiler fixes the same options
 - **`expr.Env(evalEnv{})`** — the typed four-root environment, so any other
   top-level identifier is an unknown name at compile time.
 - **`expr.AsBool()`** — a rule must evaluate to a boolean.
-- **`expr.DisableAllBuiltins()`** — all of expr-lang's builtins are off, so **no
-  wall-clock or random function is reachable** and evaluation stays deterministic.
+- **`expr.DisableAllBuiltins()`** — expr-lang's builtin library is off, so **no
+  wall-clock or random function is reachable** and evaluation stays
+  deterministic. It does not cover the predicate builtins; `Validate`
+  [denies those by name](#predicate-builtins-are-denied).
 - **The curated pure function set** — `lower`, `upper`, `contains`, `startsWith`,
-  `endsWith`, `len`. A host adds its own deterministic, side-effect-free functions
-  with `rules.Function(name, fn)` / `Engine WithFunction`; these join (and can
-  shadow) the curated set. An unknown function is caught at compile time.
+  `endsWith`, `len`, plus the collection-operator backings `hasAll`, `hasAny`,
+  `hasNone`, `subsetOf`, `isEmpty`, `isNotEmpty`. A host adds its own
+  deterministic, side-effect-free functions with `rules.Function(name, fn)` /
+  `Engine WithFunction`; these join (and can shadow) the curated set. An unknown
+  function is caught at compile time. Note that `contains`, `startsWith` and
+  `endsWith` are reserved as **infix operators** by expr's grammar, so they are
+  registered but cannot be reached through a `call` node; the other nine can.
 
 A compile failure that survives validation is a type mismatch, a non-boolean
 result, or a call to an unregistered function — all surfaced as

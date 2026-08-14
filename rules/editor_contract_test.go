@@ -15,8 +15,9 @@ import (
 // JSON shape ever drifts from what the editor produces, one side breaks here.
 //
 // The cases mirror rules-serializer.test.js one-for-one (nested and/or/not,
-// compare with var+literal, in/nin with a list and with a var, a call, and the
-// falsy-scalar edge cases false/0/""/null that must survive omitempty).
+// compare with var+literal, in/nin with a list and with a var, a call, the nine
+// collection operators including the three unary ones, and the falsy-scalar edge
+// cases false/0/""/null that must survive omitempty).
 func TestEditorASTContract(t *testing.T) {
 	cases := map[string]string{
 		"compare var eq string": `{"type":"compare","op":"eq","left":{"type":"var","name":"object.classification"},"right":{"type":"literal","value":"public"}}`,
@@ -33,6 +34,32 @@ func TestEditorASTContract(t *testing.T) {
 		"nin with var on right": `{"type":"compare","op":"nin","left":{"type":"var","name":"principal.id"},"right":{"type":"var","name":"object.blocklist"}}`,
 
 		"call len ge number": `{"type":"compare","op":"ge","left":{"type":"call","name":"len","items":[{"type":"var","name":"object.tags"}]},"right":{"type":"literal","value":1}}`,
+
+		// The nine collection operators (E4-S1). The six binary ones keep the
+		// left/right shape; the three unary ones (isEmpty, isNotEmpty, exists)
+		// carry NO "right" key at all — that omission is the contract, so a rule
+		// authored as "is empty" reads back as "is empty".
+		"has element": `{"type":"compare","op":"has","left":{"type":"var","name":"object.tags"},"right":{"type":"literal","value":"urgent"}}`,
+
+		"hasAll list": `{"type":"compare","op":"hasAll","left":{"type":"var","name":"object.tags"},"right":{"type":"list","items":[{"type":"literal","value":"a"},{"type":"literal","value":"b"}]}}`,
+
+		"hasAny list": `{"type":"compare","op":"hasAny","left":{"type":"var","name":"object.tags"},"right":{"type":"list","items":[{"type":"literal","value":"a"},{"type":"literal","value":"b"}]}}`,
+
+		"hasNone list": `{"type":"compare","op":"hasNone","left":{"type":"var","name":"object.tags"},"right":{"type":"list","items":[{"type":"literal","value":"a"}]}}`,
+
+		"subsetOf var": `{"type":"compare","op":"subsetOf","left":{"type":"var","name":"object.tags"},"right":{"type":"var","name":"principal.allowedTags"}}`,
+
+		"hasKey": `{"type":"compare","op":"hasKey","left":{"type":"var","name":"object.owner"},"right":{"type":"literal","value":"dept"}}`,
+
+		"isEmpty unary":    `{"type":"compare","op":"isEmpty","left":{"type":"var","name":"object.tags"}}`,
+		"isNotEmpty unary": `{"type":"compare","op":"isNotEmpty","left":{"type":"var","name":"object.tags"}}`,
+		"exists unary":     `{"type":"compare","op":"exists","left":{"type":"var","name":"object.owner.dept"}}`,
+
+		"collection ops nested under and/or": `{"type":"and","children":[` +
+			`{"type":"compare","op":"exists","left":{"type":"var","name":"object.tags"}},` +
+			`{"type":"or","children":[` +
+			`{"type":"compare","op":"hasAny","left":{"type":"var","name":"object.tags"},"right":{"type":"list","items":[{"type":"literal","value":"gold"}]}},` +
+			`{"type":"not","children":[{"type":"compare","op":"isEmpty","left":{"type":"var","name":"object.owner"}}]}]}]}`,
 
 		"falsy false": `{"type":"compare","op":"eq","left":{"type":"var","name":"object.archived"},"right":{"type":"literal","value":false}}`,
 		"falsy zero":  `{"type":"compare","op":"eq","left":{"type":"var","name":"object.count"},"right":{"type":"literal","value":0}}`,
