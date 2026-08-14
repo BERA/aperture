@@ -267,10 +267,21 @@ exposes hit/miss/eviction counters.
 
 What the cache removes is the **expr-lang compile**, not the AST walk: `Selected`
 calls `Engine.Compile` per evaluation, and `Compile` re-validates, re-renders, and
-re-hashes the AST before it can probe the cache by hash. That walk is therefore on
-every decision, and its cost scales with node count — measured at ~2.2 µs / 19
-allocs for a 3-node rule and ~14 allocs per **literal** node beyond it, because
-`Validate` decodes each literal's JSON afresh.
+re-hashes the AST before it can probe the cache by hash. That walk is still on
+every decision, but it is now **flat in literal count** — ~0.65 µs / 5 allocs /
+288 B for a 3-node rule and ~0.65 µs / 5 allocs / 320 B for a 6-node one. What
+remains is the render buffer, the rendered string, and the sha256 + hex of it.
+
+Getting there was issue #9. Both `Validate` and `render` used to decode every
+literal through a `json.NewDecoder`, twice per decision, at ~14 allocs and
+~4.9 KB per literal — so a rule's per-`Check` cost scaled with how many literals
+it happened to contain (a 6-node rule cost 47 allocs against a 3-node rule's 19,
+for expressions that evaluate identically). `rules.classifyScalar` now identifies
+the common literal forms straight from the raw JSON bytes with no allocation, and
+defers to the decoder only for escaped/non-ASCII strings, composites and
+malformed input — so it can never widen what `Validate` accepts. The
+`bench/collection_test.go` budget that tracked this is now 2 allocs, measured at
+0.0.
 
 ## What a rule costs a `Check`
 

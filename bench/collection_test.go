@@ -375,12 +375,12 @@ func TestMetadataIsSharedByReference(t *testing.T) {
 // gate the default build. TestMetadataIsSharedByReference above is the ungated
 // structural guard that runs every time.
 //
-// KNOWN FAILING as of E5-S2, and deliberately not tuned to pass: rule-tags-at-cap
-// exceeds the budget because rules' guarded dispatcher materialises a fresh []any
-// of the collection operand on EVERY evaluation (rules/shape.go, classify:
-// `o.members = make([]any, rv.Len())` filled through reflect). That is a genuine
-// per-Check copy of metadata the provider went to trouble to share by reference —
-// see docs/benchmarks.md, "Findings".
+// Both budgets below started out FAILING and are now met. The copy detector
+// failed while the guarded dispatcher materialised a fresh []any of the
+// collection operand on every evaluation (rules/shape.go, classify); the
+// literal-node budget failed while every literal was decoded through a
+// json.Decoder on every AST walk (issue #9, fixed by rules.classifyScalar).
+// Both are held here as ratchets — see docs/benchmarks.md, "Findings".
 func TestCollectionCheckAllocations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping allocation profile under -short")
@@ -441,16 +441,22 @@ func TestCollectionCheckAllocations(t *testing.T) {
 	// (BenchmarkRuleEval: identical to the scalar rule) — so any per-Check excess
 	// here is NOT the operator, it is the rules engine re-walking the AST on every
 	// decision. Budgeted separately so the two mechanisms cannot be confused.
-	// KNOWN ISSUE #9, pre-existing and NOT introduced by this effort: the budget
-	// below is a ratchet held at the measured value, not a target. The right
-	// number is 8. Lowering it back is the acceptance criterion for #9 — do not
-	// raise it further to make a change fit.
-	if d := profiles[ruleLiteralIn].allocsPerOp - base.allocsPerOp; d > 30 {
+	//
+	// ISSUE #9, FIXED. This budget was a ratchet held at 30 while the per-Check
+	// AST re-walk cost ~14 allocations per LITERAL NODE — which is what made a
+	// three-literal rule 28 allocations dearer than a one-literal rule that
+	// evaluates identically. rules.decodeScalar built a json.Decoder for every
+	// literal on every walk, twice per decision (Validate, then render); the
+	// literal fast path in rules/ast.go (classifyScalar) removed it, and the
+	// measured delta is now 0.0. The budget is 2 rather than 0 only to leave
+	// room for a literal count that genuinely differs, NOT for a per-literal
+	// decode to creep back: anything scaling with literal count blows past it.
+	if d := profiles[ruleLiteralIn].allocsPerOp - base.allocsPerOp; d > 2 {
 		t.Errorf("%s costs %.1f allocs/op more than the %s baseline (%.1f vs %.1f) even though "+
 			"BenchmarkRuleEval shows the two rules evaluate identically; the excess scales with "+
 			"the AST's LITERAL NODE count, which points at the per-Check re-validation in "+
-			"rules.Engine.compile (Validate -> decodeScalar allocates a json.Decoder per literal) "+
-			"rather than at the operator — see docs/benchmarks.md, \"Findings\"",
+			"rules.Engine.compile — a literal is being decoded rather than classified on the "+
+			"walk (issue #9, rules.classifyScalar) — see docs/benchmarks.md, \"Findings\"",
 			ruleLiteralIn, d, ruleScalar, profiles[ruleLiteralIn].allocsPerOp, base.allocsPerOp)
 	}
 }
