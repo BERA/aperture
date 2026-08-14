@@ -393,6 +393,112 @@ async function ruleRpc(method, body) {
   return data || {};
 }
 
+/*
+ * ---- What-if preview: rendering the metadata snapshot ----------------------
+ *
+ * The preview shows the metadata the rule ACTUALLY saw, straight off the
+ * provider. It stays strictly read-only: nothing below is an input, and there is
+ * no path by which the client supplies metadata — the snapshot only ever arrives
+ * on the EvaluateRule response.
+ *
+ * The value shape is closed, so these helpers render against a known model
+ * rather than defending against arbitrary JSON. A field value is:
+ *
+ *   - a SCALAR (null, boolean, string, number), or
+ *   - an ARRAY of scalars — an empty list cell produces a real `[]`, or
+ *   - an OBJECT whose members are scalars, scalar arrays, or ONE further object
+ *     level (the depth cap is 2).
+ *
+ * Arrays of objects are impossible: the provider rejects them at load, so an
+ * array element is never a container.
+ *
+ * A field that was ABSENT from the object simply has no row. That is a real
+ * semantic difference from an empty list or an empty object, which DO get a row
+ * (`[]` / `{}` plus an "empty list" / "empty object" note), because an author
+ * debugging an `in` comparison has to tell "the field is missing" apart from
+ * "the field is there and holds nothing".
+ */
+
+// formatMetadataScalar renders one scalar the way the previous single-line
+// JSON.stringify preview did — strings keep their quotes, everything else shows
+// its JSON form. The quotes are not decoration: they distinguish the string
+// "42" from the number 42, which is exactly the mismatch the preview exists to
+// expose.
+function formatMetadataScalar(value) {
+  if (value === undefined) return "undefined"; // unreachable over JSON; total anyway
+  const text = JSON.stringify(value);
+  return text === undefined ? String(value) : text;
+}
+
+// metadataRows flattens a metadata snapshot into the ordered, indented row list
+// the preview panel renders. Flattening (rather than nesting templates) keeps
+// the markup down to a single x-for, which the depth cap of 2 makes sufficient.
+//
+// Field order is whatever the server sent; Go marshals a map with its keys
+// sorted, so the listing is already alphabetical and stable between runs.
+function metadataRows(metadata) {
+  const rows = [];
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return rows;
+  }
+  Object.keys(metadata).forEach(function (name) {
+    pushMetadataRows(rows, name, name, metadata[name], 0);
+  });
+  return rows;
+}
+
+// pushMetadataRows appends the row(s) for one value. A scalar or an array is a
+// single row; an object is a header row followed by one row per member, indented
+// one level. `path` is the dotted path from the field root and is used only as
+// the x-for key, so it must stay unique.
+function pushMetadataRows(rows, path, label, value, depth) {
+  if (Array.isArray(value)) {
+    // Elements are always scalars, so each renders as its own chip and a long
+    // array wraps inside the panel instead of stretching it.
+    rows.push({
+      key: path,
+      depth: depth,
+      label: label,
+      kind: "array",
+      text: value.length === 0 ? "[]" : "",
+      items: value.map(formatMetadataScalar),
+      note: value.length === 0 ? "empty list" : countNote(value.length, "item"),
+    });
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    rows.push({
+      key: path,
+      depth: depth,
+      label: label,
+      kind: "object",
+      text: keys.length === 0 ? "{}" : "{…}",
+      items: [],
+      note: keys.length === 0 ? "empty object" : countNote(keys.length, "field"),
+    });
+    keys.forEach(function (k) {
+      pushMetadataRows(rows, path + "." + k, k, value[k], depth + 1);
+    });
+    return;
+  }
+  rows.push({
+    key: path,
+    depth: depth,
+    label: label,
+    kind: "scalar",
+    text: formatMetadataScalar(value),
+    items: [],
+    note: "",
+  });
+}
+
+// countNote renders "1 item" / "3 items" — a plain count, no emoji, sentence
+// case, per the shell's copy rules.
+function countNote(n, noun) {
+  return n + " " + noun + (n === 1 ? "" : "s");
+}
+
 // A small starter rule so the canvas is not blank on first open; also exercises
 // fromAST end to end. object.classification == "public".
 const STARTER_AST = {
@@ -434,6 +540,11 @@ function rules() {
     previewError: null,
     previewResult: null, // true | false | null (not yet run)
     previewObject: null, // the object metadata snapshot the rule saw
+    // previewRows is that snapshot flattened for display by metadataRows():
+    // one row per field, plus one indented row per member of an object-valued
+    // field. Derived on evaluate rather than on every render so the panel does
+    // not re-walk the snapshot on unrelated Alpine updates.
+    previewRows: [],
     // The node palette, grouped by category. Covers the whole AST: logical
     // combinators, comparisons over variables/literals, and the Pulse building
     // blocks (list/call) from E2-S3.
@@ -534,6 +645,7 @@ function rules() {
       this.preview.objects = [];
       this.previewResult = null;
       this.previewObject = null;
+      this.previewRows = [];
       this.previewError = null;
       if (!this.preview.objectType) return;
       try {
@@ -668,6 +780,7 @@ function rules() {
       this.previewError = null;
       this.previewResult = null;
       this.previewObject = null;
+      this.previewRows = [];
       if (!this.preview.objectId) {
         this.previewError = { code: "APERTURE_INVALID_INPUT", msg: "Select an object to evaluate the rule against." };
         return;
@@ -681,6 +794,7 @@ function rules() {
         });
         this.previewResult = !!resp.result;
         this.previewObject = resp.object_json ? JSON.parse(resp.object_json) : null;
+        this.previewRows = metadataRows(this.previewObject);
       } catch (e) {
         this.previewError = { code: e.code || "APERTURE_ERROR", msg: e.message };
       } finally {
@@ -738,3 +852,7 @@ function rules() {
 
 window.rules = rules;
 window.createBlueprintEditor = createBlueprintEditor;
+// Exported so the preview's snapshot rendering can be exercised directly from a
+// console against a real EvaluateRule payload; the panel itself reads
+// previewRows off the Alpine component.
+window.metadataRows = metadataRows;
