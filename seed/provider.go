@@ -92,32 +92,53 @@ func StrictProviderCollision() BuildOption {
 	return func(c *buildConfig) { c.strictProviderCollision = true }
 }
 
-// BuildRegistry constructs a live *provider.Registry from the document's two
-// wiring sections: providers (a declared implementation per object-type) and
+// BuildRegistry constructs a live *provider.Registry from the document's three
+// wiring sections: providers (a declared implementation per object-type),
 // objects (metadata declared inline, served by an in-memory provider.Static per
-// object-type). Relative file paths are resolved against baseDir (typically the
-// seed file's directory; pass "" to resolve against the process CWD). It always
-// returns a usable registry — empty when neither section is declared — so a
-// caller can wire it unconditionally.
+// object-type), and field_types (the declared type of selected inline metadata
+// fields, currently dates). Relative file paths are resolved against baseDir
+// (typically the seed file's directory; pass "" to resolve against the process
+// CWD). It always returns a usable registry — empty when no section is declared
+// — so a caller can wire it unconditionally.
 //
 // A malformed providers entry (missing object_type, unknown kind, missing path,
-// unparseable ttl, or a duplicate object_type) and a malformed objects entry
+// unparseable ttl, or a duplicate object_type), a malformed objects entry
 // (missing id, a duplicate id, metadata that is not a mapping, or a value the
-// shared value model rejects) are both APERTURE_CONFIG_INVALID; a malformed id
-// passes through as APERTURE_IDENTITY_INVALID, and a type claimed twice by two
-// providers entries is APERTURE_PROVIDER_INVALID.
+// shared value model rejects), and a malformed field_types entry (missing
+// object_type, a duplicated object_type, an empty field name, or an unknown
+// declared type) are all APERTURE_CONFIG_INVALID; a malformed id passes through
+// as APERTURE_IDENTITY_INVALID, and a type claimed twice by two providers
+// entries is APERTURE_PROVIDER_INVALID.
 //
-// A type claimed by BOTH sections is not an error: the providers: entry wins and
-// every inline entry for that type is discarded entirely. The discarded types
-// are reported by Document.ProviderCollisions, and StrictProviderCollision turns
-// the collision back into an APERTURE_CONFIG_INVALID for hosts that want one.
+// A type claimed by BOTH the providers: and objects: sections is not an error:
+// the providers: entry wins and every inline entry for that type is discarded
+// entirely. The discarded types are reported by Document.ProviderCollisions, and
+// StrictProviderCollision turns the collision back into an
+// APERTURE_CONFIG_INVALID for hosts that want one.
 //
-// Neither section touches storage: Apply writes no row for either, and an export
-// reproduces neither.
+// field_types: applies to the objects: section ONLY. A providers: entry carries
+// its own typing (a CSV header's :date / :datetime column suffix), so a declared
+// field type is never silently imposed on rows a provider loaded — one type
+// declaration in two places could disagree with itself, which is the failure
+// this document's derive-the-object-type-from-the-identity rule already avoids
+// elsewhere. Inline entries are still fully validated against the declaration
+// when a providers: entry wins their type; the canonicalised values are then
+// discarded along with the rest of those entries.
+//
+// The field_types: section is validated FIRST, before anything is registered, so
+// a typo'd declaration fails the build even in a document that declares no
+// objects at all.
+//
+// No section touches storage: Apply writes no row for any of them, and an export
+// reproduces none.
 func (d *Document) BuildRegistry(baseDir string, opts ...BuildOption) (*provider.Registry, error) {
 	var cfg buildConfig
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	declared, err := d.fieldTypeIndex()
+	if err != nil {
+		return nil, err
 	}
 	reg := provider.NewRegistry()
 	// providers: is registered FIRST so the objects: section can see which types
@@ -127,7 +148,7 @@ func (d *Document) BuildRegistry(baseDir string, opts ...BuildOption) (*provider
 			return nil, err
 		}
 	}
-	if err := d.registerObjects(reg, cfg); err != nil {
+	if err := d.registerObjects(reg, cfg, declared); err != nil {
 		return nil, err
 	}
 	return reg, nil

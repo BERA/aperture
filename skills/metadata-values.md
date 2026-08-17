@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the seed document's inline objects section, its optional field_types: date declarations, and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -43,7 +43,91 @@ Rejected everywhere:
   spelled in the two types the expression environment and JSON share so a loader
   normalises once;
 - **`time.Time`** — a rule literal is a JSON scalar and could never be compared
-  against one. Loaders format timestamps as RFC 3339 strings.
+  against one. Loaders format timestamps as RFC 3339 strings (see
+  [Dates](#dates) for the two canonical forms).
+
+## Dates
+
+A date is **not a fourth shape**. It is an ordinary **string scalar** that a
+loader has additionally been told is a date, and the value model is unchanged by
+it. What `provider/date.go` adds is the constraint that such a string must be one
+of exactly **two canonical forms**:
+
+| Form | Layout | Example |
+|---|---|---|
+| calendar day | `2006-01-02` (RFC 3339 full-date) | `2026-03-04` |
+| timestamp | `2006-01-02T15:04:05Z` (RFC 3339 date-time, always `Z`) | `2026-03-04T01:02:03Z` |
+
+**Granularity is carried by the string itself** — a value containing a `T` is a
+timestamp, one that does not is a calendar day — so no type tag travels beside
+the value, and a canonical date round-trips through YAML, JSON, CSV, and the
+expression environment as the string it already is.
+
+The model stays **date-blind**: `ValidateField` cannot know which strings a host
+means as dates, so it keeps accepting any string. Declaring a field to be a date
+— and so subjecting its values to `provider.ParseDateValue` — is a **loader's**
+job, through its typed column or field schema.
+
+### Accepted and rejected
+
+| Input | Result |
+|---|---|
+| `2026-03-04` | accepted, calendar day |
+| `2026-03-04T01:02:03Z` | accepted, timestamp |
+| `2026-03-04T01:02:03` | accepted — **no offset is read as UTC** |
+| `2026-03-04T01:02:03.456Z` | accepted, **truncated** to `…T01:02:03Z` |
+| `2026-03-04T01:02:03+05:00` | **rejected** — `DateReasonNonUTCOffset` |
+| `2026-02-30`, `2026-13-01`, `2023-02-29` | **rejected** — `DateReasonCalendar` |
+| `03/04/2026`, `2026-3-4`, `Mar 4 2026` | **rejected** — `DateReasonLayout` |
+| `""` | **rejected** — `DateReasonEmpty` (a loader that reads an empty cell as an *absent* field checks that before parsing) |
+
+Three properties are load-bearing, each because its absence is a silently wrong
+answer rather than a loud failure:
+
+- **An explicit offset is rejected, not converted.** Canonicalising is
+  instant-correct and calendar-surprising: a host writing
+  `2026-01-01T00:00:00+05:00` means January 1st, and the UTC instant is
+  `2025-12-31T19:00:00Z`, so every question about the day, month, or year would
+  answer 2025. Rejecting makes the host convert deliberately. An **offset-free**
+  value is accepted because it asserts no other zone; there is no timezone knob
+  anywhere in Aperture, and every instant is constructed and formatted in
+  `time.UTC`.
+- **Fractional seconds truncate; they never round.** Rounding can carry a value
+  across the very boundary a rule is testing.
+- **Parsing is mandatory — comparing the canonical strings is not a permissible
+  shortcut.** The two forms sort correctly *within* one granularity but not
+  across it: the date-only form is a strict prefix of the timestamp form, so
+  `"2026-03-04" < "2026-03-04T00:00:00Z"` as text while the two name the **same
+  instant**. A cutoff written against a date field and compared against a
+  timestamp would be wrong at exactly the boundary instant.
+
+### The entry points
+
+```go
+v, err := provider.ParseDateValue("2026-03-04T01:02:03.456Z") // load path
+v.Time()                       // 2026-03-04 01:02:03 +0000 UTC, never sub-second
+v.Granularity()                // provider.GranularityDateTime
+v.String()                     // "2026-03-04T01:02:03Z" — the form a loader stores
+v.Compare(other)               // -1 / 0 / +1 over the INSTANTS, never the text
+
+s, err := provider.CanonicalizeDate(raw)  // parse + render, idempotent
+v, ok := provider.DateValueOf(value)      // evaluation path: any value, no error built
+provider.DateOf(t) / provider.DateTimeOf(t)  // from a time.Time, converted to UTC
+```
+
+`DateValue`'s fields are unexported, so there is no way to express one in another
+zone, with sub-second precision, or with a granularity its instant cannot
+support. The zero `DateValue` is the only invalid one and `IsZero` identifies it.
+
+A rejection is **`APERTURE_CONFIG_INVALID`** — a loader-side failure, not a
+value-model violation — carrying `reason` (the `DateReason`) and `expected` (the
+two layouts) in its context. Read the cause back with `provider.DateReasonOf(err)`
+rather than matching message text. As everywhere in this model the error **never
+carries the value**, which for dates is sharper than usual: a date can be personal
+data, a birth date or a termination date. The `*time.ParseError` is classified and
+then **discarded**, never wrapped — its own `Error` string quotes the input
+verbatim. A loader adds its own locating context around the rejection: the
+**column, line, and field**, never the cell.
 
 ## Caps
 
@@ -122,20 +206,46 @@ loader normalises into the model — it never widens it.
 A header column carries `name:type[<elem>][(delim)]`:
 
 ```text
-id,tier,seats:int,tags:list,ranks:list<int>,aliases:list(;),owner:json
-brand:1,gold,40,premium|launch,3|5,acme;acme-co,"{""dept"":""eng"",""tags"":[""a""]}"
-brand:2,silver,,,,,
+id,tier,seats:int,hired_at:date,last_seen:datetime,tags:list,ranks:list<int>,aliases:list(;),owner:json
+brand:1,gold,40,2026-03-04,2026-03-04T12:30:00Z,premium|launch,3|5,acme;acme-co,"{""dept"":""eng"",""tags"":[""a""]}"
+brand:2,silver,,,,,,,
 ```
 
 | Suffix | Value |
 |---|---|
 | none / `:string`, `:int`, `:float`, `:bool` | a **scalar** (`int` → `int64`, `float` → `float64`) |
+| `:date` | a **string scalar** in `2006-01-02`, canonicalised at load through `provider.ParseDateValue` |
+| `:datetime` | a **string scalar** in `2006-01-02T15:04:05Z`, same parser |
 | `:list` | an **array** of strings, split on `\|` |
 | `:list<int>` / `:list<float>` / `:list<bool>` | an array whose elements go through the **same** scalar coercion |
 | `:list(;)` | the delimiter override, for that column only |
 | `:json` | an **object**, decoded from the cell — takes no `<elem>` and no `(delim)` |
 
-Four rules the value model does not impose, but the CSV encoding must:
+The suffix spelling is **lower-case and exact**. An unrecognised one — `:timestamp`,
+`:Date`, `:time` — is `APERTURE_CONFIG_INVALID` ("unknown column type"), never a
+silently untyped column. The header is cut at its **first** colon, so a column
+name cannot itself contain one: `hired:at:date` reads as the column `hired` with
+the unknown type `at:date`.
+
+Five rules the value model does not impose, but the CSV encoding must:
+
+- **A date column's cells are validated and canonicalised at load**, and the
+  **canonical** string is what is stored — not the cell as written. `:datetime`
+  turns `2026-03-04T12:30:00.750Z` and `2026-03-04T12:30:00` alike into
+  `2026-03-04T12:30:00Z`, so two rows naming one instant are one string and a
+  `Filter.Fields` equality predicate over the column means something. The
+  predicate must itself be canonical; range querying is not a provider concern.
+  **The declared type also fixes the granularity** — a `:date` column rejects a
+  timestamp and a `:datetime` column rejects a bare day, rather than quietly
+  widening it to midnight. **An empty cell omits the field**, following the
+  scalar rule: an absent date differs meaningfully from any date, and a zero time
+  would silently satisfy every `before` rule written against the column. A
+  rejection is `APERTURE_CONFIG_INVALID` naming the **column, line, and field**
+  and carrying the `DateReason` — never the cell. **`:list<date>` does not
+  exist**: arrays of dates are out of scope and rejected by name. Neither does a
+  time-of-day type. A date-shaped string inside a `:json` cell is **not**
+  date-validated — `:json` is opaque structured data, and only a declared column
+  gets date treatment.
 
 - **Element typing is mandatory for numeric membership.** expr does no
   numeric/string coercion, so `5 in object.seats` is `false` against `["3","5"]`.
@@ -158,10 +268,12 @@ Four rules the value model does not impose, but the CSV encoding must:
   `int64` becomes an `int64`, everything else a `float64`. That is what keeps
   `object.owner.seats == object.seats` from being a silent `false`.
 
-Grammar, coercion, and `:json` decode failures are `APERTURE_CONFIG_INVALID`; the
-value-model check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
-A `:json` rejection carries the column, the line, and the JSON kind or the
-decoder's message — never the cell.
+Grammar, coercion, `:date`/`:datetime`, and `:json` decode failures are
+`APERTURE_CONFIG_INVALID`; the value-model check that runs on every parsed cell —
+including a date, which reaches it as the plain string scalar it is — is
+`APERTURE_METADATA_INVALID`. A `:json` rejection carries the column, the line,
+and the JSON kind or the decoder's message; a date rejection carries the column,
+the line, the `reason`, and the layout `expected`. Neither ever carries the cell.
 
 ### The seed document's `objects:` section
 
@@ -203,6 +315,96 @@ Three properties, all of them the same ones the CSV loader owes:
   same `APERTURE_CONFIG_INVALID`; a malformed id passes through as
   `APERTURE_IDENTITY_INVALID`. Ids are deduplicated across the **whole** section,
   not per type.
+
+#### The seed document's `field_types:` section
+
+A CSV header can say `hired_at:date`; a YAML mapping has nowhere to put that. The
+optional `field_types:` section is the missing declaration — and **only** that:
+
+```yaml
+field_types:
+  - object_type: brand
+    fields:
+      hired_at: date
+      last_seen: datetime
+
+objects:
+  - id: account:acme/brand:1
+    metadata:
+      hired_at: "2026-03-04"
+      last_seen: "2026-03-04T12:30:00Z"
+```
+
+| Spelling | Meaning |
+|---|---|
+| `date` | a **string scalar** in `2006-01-02`, canonicalised at load through `provider.ParseDateValue` |
+| `datetime` | a **string scalar** in `2006-01-02T15:04:05Z`, same parser |
+
+The vocabulary is **exactly those two words, lower-case and exact** — the CSV
+column suffix with the colon dropped, so one word means one thing in both
+loaders. `timestamp`, `Date`, `time`, and an empty type are all
+`APERTURE_CONFIG_INVALID`, never a silently ignored declaration. Each entry names
+an `object_type` (matched against the identity's terminal segment, as `providers:`
+is) and may appear at most once per type.
+
+It is a **third top-level wiring section**, beside `providers:` and `objects:`
+and shaped like `providers:` — a list of entries each naming its `object_type`,
+rather than a map keyed by type, so a duplicate declaration is a detectable error
+and not a last-one-wins merge. It is deliberately **not** a `fields:` key on an
+`object_types:` entry: `object_types:` is model state that `Apply` writes and
+`Export` rebuilds from storage, so a declaration hung there would be silently
+dropped by every export.
+
+**Quote date values in YAML.** YAML resolves an *unquoted* calendar day as a
+`!!timestamp`, and the seed loader's YAML path normalises through JSON, so
+`hired_at: 2026-03-04` arrives already widened to `2026-03-04T00:00:00Z` and a
+field declared `date` rejects it. The widening happens inside the YAML decoder,
+before `seed` sees the document, so it cannot be undone there — the rejection
+carries a `hint` naming the fix when the instant is exactly midnight. JSON has no
+date type and so no trap; the two formats agree on every quoted value.
+
+Six rules, five of them shared verbatim with the CSV loader:
+
+- **Validated and canonicalised at `BuildRegistry` time**, through
+  `provider.ParseDateValue` — never re-implemented here. The **canonical** text is
+  stored, so `2026-03-04T01:02:03.456Z` and `2026-03-04T01:02:03` both become
+  `2026-03-04T01:02:03Z`, and a `Filter.Fields` predicate over the field is
+  canonical-string equality.
+- **The declared type fixes the granularity** — a `date` field rejects a timestamp
+  and a `datetime` field rejects a bare day, rather than quietly widening it to
+  midnight.
+- **An empty value omits the field**, exactly as an empty CSV cell does.
+- **A declared field is not a required field.** The section declares a *type*; an
+  object that omits the field is valid. Declaring a type for an object type with
+  **no** `objects:` entries is likewise legal (the entries may be arriving, or the
+  type may be served by a `providers:` entry) and registers nothing on its own —
+  but the declaration is still validated, so a typo fails the build immediately.
+- **It applies to `objects:` only.** A `providers:` entry carries its own typing
+  (the CSV suffix), so a declaration is never imposed on provider-loaded rows; one
+  type declaration in two places could disagree with itself. Inline entries are
+  still fully validated against the declaration when a `providers:` entry wins
+  their type — validation never depends on precedence — and the canonicalised
+  values are discarded with the rest of those entries.
+- **A non-string value is its own error**, unlike a CSV cell which is always
+  text: a number, array, or object in a declared date field is
+  `APERTURE_CONFIG_INVALID` naming the declared `type` and the `kind` found, not a
+  confusing parse failure.
+
+A rejection is `APERTURE_CONFIG_INVALID` naming the **object id and the field**,
+in both the message and the context, and carries the `reason`
+(`provider.DateReasonOf`) for a parse failure. A granularity mismatch is **not** a
+parse failure, so it carries no `reason` and `DateReasonOf` correctly reports
+none — the same shape the CSV loader's granularity rejection has. Neither ever
+carries the value: a date is frequently personal data. The value model's own
+error is classified and dropped rather than wrapped, because `DateReasonOf` reads
+the **outermost** coded error and wrapping would hide the reason.
+
+**This is a date-type declaration, not a general metadata schema.** No
+`required:`, `default:`, `enum:`, `pattern:`, `int`/`float`/`bool`, or nested
+field paths. The value model already governs shape, depth, and size; the one
+thing it cannot govern is which strings a host means as dates. Like `providers:`
+and `objects:`, the section is runtime **wiring**: no storage row, no `Apply`
+write, no export.
 
 #### When `providers:` and `objects:` claim the same type
 
@@ -323,10 +525,12 @@ Changing the value model means changing all of these in the same PR:
 | Change | Also update |
 |---|---|
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
+| The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | the "Dates" section above + `docs/src/concepts/providers.md` |
 | The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md` |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
+| The seed `field_types:` section (its spelling, its vocabulary, what it applies to) | "The seed document's `field_types:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and its two type words must stay identical to the CSV `:date`/`:datetime` suffixes, which is the whole reason it exists |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
 | The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |
 

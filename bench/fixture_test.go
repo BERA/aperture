@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/frankbardon/aperture/engine"
 	aerr "github.com/frankbardon/aperture/errors"
@@ -96,6 +97,96 @@ const (
 	ruleTagsTypical = "rule-tags-typical"
 	// ruleTagsAtCap is the same guarded render over the cap-maximal array.
 	ruleTagsAtCap = "rule-tags-at-cap"
+	// ruleDateCompare is a binary DATE comparison, which puts PARSING on the
+	// comparison hot path: both operands are canonical date strings and both are
+	// parsed to instants on every evaluation, because comparing the strings is
+	// wrong across granularities. Read as a delta from rule-scalar, this is the
+	// per-comparison cost of a date operator.
+	ruleDateCompare = "rule-date-compare"
+	// ruleDateBetween is the ternary form, which parses THREE operands per
+	// evaluation rather than two. The pair makes the per-operand parse cost
+	// readable by difference rather than as one absolute number.
+	ruleDateBetween = "rule-date-between"
+	// ruleDateRelative is the same binary comparison with its bound RESOLVED per
+	// evaluation instead of read from a literal: calendar arithmetic (a snap and
+	// a clamping quarter offset) plus the canonical-string round trip $rel does
+	// on the way into $date. Read as a delta from rule-date-compare, this is the
+	// per-evaluation cost of a relative date rather than a fixed one.
+	ruleDateRelative = "rule-date-relative"
+	// ruleDateSameYear is the calendar-BUCKET shape rather than an ordering one.
+	// sameDay/sameMonth/sameYear do not compare instants at all once parsed —
+	// they read calendar components off both sides — so their post-parse cost is
+	// a different branch from before/after/between and is measured separately.
+	ruleDateSameYear = "rule-date-same-year"
+	// ruleDateRelBounds is the most expensive shape the AST can express: a
+	// ternary between whose BOTH bounds are relative dates. One evaluation pays
+	// two anchor resolutions, two snaps, two offsets, two canonical formats and
+	// three parses. If relative resolution were ever shared across the operands
+	// of one decision, this is the fixture that would show it.
+	ruleDateRelBounds = "rule-date-rel-bounds"
+	// ruleDateClamped exercises the CLAMPING branch of the calendar arithmetic,
+	// which a mid-month anchor never reaches: the anchor is snapped to a 31-day
+	// month end and then offset into a 28-day month, so addMonthsClamped's day
+	// clamp actually runs. Read as a delta from rule-date-relative (a
+	// non-clamping quarter offset), this is what clamping costs.
+	ruleDateClamped = "rule-date-clamped"
+	// ruleDateMulti is one rule carrying FIVE date comparisons rather than one,
+	// so the per-comparison cost is readable against the single-comparison
+	// variants instead of being confounded with the fixed per-decision overhead
+	// every rule pays. It is also where the four date operators no other asserted
+	// fixture uses are held to the floor.
+	ruleDateMulti = "rule-date-multi"
+	// ruleDateDeny is the DENY path, which is a different branch and not a
+	// cheaper one: a string of exactly the date-only WIDTH that is not a date
+	// reaches time.Parse, whose failure constructs a *time.ParseError inside the
+	// standard library before provider classifies and discards it. That is the
+	// one bounded allocating path in an otherwise allocation-free parse, and a
+	// rule over host-supplied data is exactly where malformed values live, so it
+	// is held to the same floor as every allow.
+	ruleDateDeny = "rule-date-deny"
+)
+
+// The date fixtures' reference instant.
+//
+// It is PINNED rather than read from the wall clock, for two reasons that both
+// bite this fixture specifically. A relative-date bound moves with the clock, so
+// a fixture built against time.Now() decides a different comparison every day and
+// its warm-up assertion is a promise about the calendar rather than about the
+// code. And the clamping variant only reaches the branch it exists to measure
+// when the anchor month is longer than the target month — under a live clock that
+// is true for part of the year and quietly untrue for the rest, which is the
+// worst possible property for a regression guard.
+//
+// 2026-08-31 is chosen so that every date variant resolves to a stable verdict
+// AND the clamping variant genuinely clamps: August has 31 days, and six months
+// back is February 2026 with 28. TestDateFixtureActuallyClamps asserts that
+// derivation rather than trusting this comment.
+//
+// One documented coupling comes with it (rules.WithClock): the engine has ONE
+// time source, so pinning it also freezes compiled-rule cache expiry. That is
+// harmless here and mildly helpful — the rule engine is built with the default
+// TTL (entries live until invalidated), and the NFR is about the cached Check, so
+// a frozen clock can only keep the measured window in the cached steady state.
+var benchNow = time.Date(2026, time.August, 31, 12, 0, 0, 0, time.UTC)
+
+// benchClock pins the rules engine's single time source to benchNow.
+type benchClock struct{}
+
+func (benchClock) Now() time.Time { return benchNow }
+
+// The date fixture's field values. They are the two canonical granularities, so
+// the mixed-granularity path (a date-only field compared against a timestamp
+// bound, which parses through a different branch) is exercised rather than only
+// the same-shape case.
+const (
+	benchHiredAt    = "2026-03-04"
+	benchReviewedAt = "2026-03-04T09:30:00Z"
+	// benchMalformedAt is the deny fixture's operand: a legal metadata string
+	// scalar that is not a canonical date. Its WIDTH is the load-bearing part —
+	// it is exactly as long as the date-only layout, which is what carries it
+	// past provider's cheap length screen and into time.Parse, so the deny
+	// variant measures the allocating failure branch rather than the free one.
+	benchMalformedAt = "04/03/2026"
 )
 
 // benchObject is the object every rule variant is checked against. Using ONE
@@ -120,6 +211,13 @@ type ruleVariant struct {
 	name   string
 	ast    *rules.Node
 	render string
+	// allow is the verdict the variant's Check must return, asserted on every
+	// warm-up. It exists because one variant DENIES by design: a benchmark that
+	// silently measured a fail-closed deny would report a meaningless number, so
+	// the expected verdict is stated per variant rather than assumed, and a
+	// variant that stops deciding what it was written to decide fails loudly
+	// instead of quietly measuring the other branch.
+	allow bool
 }
 
 // ruleVariants is the closed set of rule-backed benchmark cases.
@@ -133,29 +231,133 @@ func ruleVariants() []ruleVariant {
 			name:   ruleScalar,
 			ast:    rules.Compare(rules.OpEq, rules.Var("object.classification"), rules.Lit("public")),
 			render: `native infix: (object.classification == "public")`,
+			allow:  true,
 		},
 		{
 			name: ruleLiteralIn,
 			ast: rules.Compare(rules.OpIn, rules.Var("object.region"),
 				rules.List(rules.Lit("us-east"), rules.Lit("us-west"), rules.Lit("eu-west"))),
 			render: `native infix, list literal: (object.region in ["us-east", ...])`,
+			allow:  true,
 		},
 		{
 			name:   ruleNested,
 			ast:    rules.Compare(rules.OpEq, rules.Var("object.owner.dept"), rules.Lit("platform")),
 			render: `optional chaining: (object?.owner?.dept == "platform")`,
+			allow:  true,
 		},
 		{
 			name: ruleTagsTypical,
 			ast: rules.Compare(rules.OpHasAny, rules.Var("object.tags"),
 				rules.List(rules.Lit(benchTag(tagsTypicalLen-1)))),
 			render: `guarded dispatcher: $op("hasAny", __notes, "object.tags", object?.tags, ...)`,
+			allow:  true,
 		},
 		{
 			name: ruleTagsAtCap,
 			ast: rules.Compare(rules.OpHasAny, rules.Var("object.tagsAtCap"),
 				rules.List(rules.Lit(benchTag(tagsAtCapLen-1)))),
 			render: `guarded dispatcher: $op("hasAny", __notes, "object.tagsAtCap", object?.tagsAtCap, ...)`,
+			allow:  true,
+		},
+		// The date cases compare a date-only FIELD against a TIMESTAMP bound on
+		// purpose: granularity never affects ordering, so the mixed case is the
+		// one a real rule hits and the one a string comparison would get wrong.
+		{
+			name: ruleDateCompare,
+			ast: rules.Compare(rules.OpBefore, rules.Var("object.hired_at"),
+				rules.Lit("2026-12-31T23:59:59Z")),
+			render: `guarded dispatcher: $date("before", __notes, "object.hired_at", object?.hired_at, ...) — 2 parses`,
+			allow:  true,
+		},
+		{
+			name: ruleDateBetween,
+			ast: rules.Between(rules.Var("object.reviewed_at"),
+				rules.Lit("2026-01-01"), rules.Lit("2026-12-31T23:59:59Z")),
+			render: `guarded dispatcher: $date("between", __notes, "object.reviewed_at", object?.reviewed_at, ...) — 3 parses`,
+			allow:  true,
+		},
+		// Calendar-bucket equality. Once both operands have parsed, sameYear does
+		// not compare instants at all — it reads a calendar component off each
+		// side — so its post-parse branch differs from every ordering operator
+		// above and the pair separates parse cost from comparison cost.
+		{
+			name: ruleDateSameYear,
+			ast: rules.Compare(rules.OpSameYear, rules.Var("object.hired_at"),
+				rules.Lit("2026-07-15")),
+			render: `guarded dispatcher: $date("sameYear", __notes, "object.hired_at", object?.hired_at, ...) — 2 parses`,
+			allow:  true,
+		},
+		// The relative bound is resolved on EVERY evaluation — snap, offset,
+		// format, and then the parse $date does on the way back in — where the
+		// three cases above read a literal. The rule reads "hired before the
+		// start of the previous quarter"; against the pinned instant that bound
+		// is 2026-04-01, which the fixture's 2026-03-04 hire date precedes.
+		{
+			name: ruleDateRelative,
+			ast: rules.Compare(rules.OpBefore, rules.Var("object.hired_at"),
+				rules.RelativeDate(rules.AnchorNow, -1, rules.UnitQuarters, rules.SnapStartOfQuarter)),
+			render: `guarded dispatcher: $date("before", ..., $rel(__now, "NOW", -1, "quarters", "startOfQuarter"), ...) — 2 parses + calendar arithmetic`,
+			allow:  true,
+		},
+		// The ternary form with BOTH bounds relative — the most work a single
+		// comparison can be made to do. Two anchors (one of them TODAY, which
+		// resolves through a different branch from NOW), two snaps, two offsets,
+		// two canonical formats, three parses. The pair with rule-date-relative
+		// is what answers "does a second relative operand cost a second full
+		// resolution, or is the anchor shared?".
+		{
+			name: ruleDateRelBounds,
+			ast: rules.Between(rules.Var("object.hired_at"),
+				rules.RelativeDate(rules.AnchorNow, -5, rules.UnitYears, rules.SnapStartOfYear),
+				rules.RelativeDate(rules.AnchorToday, 0, rules.UnitDays, rules.SnapEndOfDay)),
+			render: `guarded dispatcher: $date("between", ..., $rel(...,"NOW",-5,"years","startOfYear"), $rel(...,"TODAY",0,"days","endOfDay")) — 3 parses + 2 x calendar arithmetic`,
+			allow:  true,
+		},
+		// The CLAMPING branch. Snap to the end of a 31-day month, then offset six
+		// months back into a 28-day one: addMonthsClamped's day clamp runs, where
+		// rule-date-relative's quarter offset off a start-of-quarter boundary
+		// never touches it. Against the pinned instant the bound is
+		// 2026-02-28T23:59:59 (asserted by TestDateFixtureActuallyClamps), which
+		// the 2026-03-04 hire date follows.
+		{
+			name: ruleDateClamped,
+			ast: rules.Compare(rules.OpAfter, rules.Var("object.hired_at"),
+				rules.RelativeDate(rules.AnchorNow, -6, rules.UnitMonths, rules.SnapEndOfMonth)),
+			render: `guarded dispatcher: $date("after", ..., $rel(__now, "NOW", -6, "months", "endOfMonth"), ...) — 2 parses + CLAMPING calendar arithmetic`,
+			allow:  true,
+		},
+		// Five date comparisons in one rule, over both fixture granularities. It
+		// measures what a realistic date-heavy policy costs — nothing else here
+		// has more than one comparison — and it is where onOrAfter, onOrBefore,
+		// sameDay and sameMonth are held to the NFR floor, so every one of the
+		// eight date operators sits inside the asserted set rather than only
+		// inside an informational benchmark. TestDateBenchCoverage enforces that.
+		{
+			name: ruleDateMulti,
+			ast: rules.And(
+				rules.Compare(rules.OpOnOrAfter, rules.Var("object.hired_at"), rules.Lit("2026-03-04")),
+				rules.Compare(rules.OpAfter, rules.Var("object.reviewed_at"), rules.Lit("2026-03-04")),
+				rules.Compare(rules.OpOnOrBefore, rules.Var("object.hired_at"), rules.Lit("2026-12-31T23:59:59Z")),
+				rules.Compare(rules.OpSameDay, rules.Var("object.reviewed_at"), rules.Lit("2026-03-04")),
+				rules.Compare(rules.OpSameMonth, rules.Var("object.hired_at"), rules.Lit("2026-03-20")),
+			),
+			render: `five $date(...) calls under one and — 10 parses`,
+			allow:  true,
+		},
+		// The DENY path, and the only variant here that denies. Its left operand
+		// is a well-formed metadata string that is not a canonical date, so the
+		// comparison takes the deny-safe branch instead of the comparison branch.
+		// Deliberately measured rather than assumed cheap: this is the one input
+		// shape that allocates inside the parse (a *time.ParseError the value
+		// model classifies and discards), and host-supplied data is where
+		// malformed dates actually come from.
+		{
+			name: ruleDateDeny,
+			ast: rules.Compare(rules.OpBefore, rules.Var("object.malformed_at"),
+				rules.Lit("2026-12-31T23:59:59Z")),
+			render: `guarded dispatcher: $date("before", ..., "object.malformed_at", ...) — parse FAILS, deny-safe false`,
+			allow:  false,
 		},
 	}
 }
@@ -185,6 +387,16 @@ func benchMetadata() provider.Metadata {
 		},
 		"tags":      benchTags(tagsTypicalLen),
 		"tagsAtCap": benchTags(tagsAtCapLen),
+		// Dates ride inside the value model as ordinary string scalars, so they
+		// cost the metadata bag nothing structurally — the cost the date variants
+		// measure is the PARSE, which happens per evaluation and not per fetch.
+		"hired_at":    benchHiredAt,
+		"reviewed_at": benchReviewedAt,
+		// A legal string scalar the value model has no opinion about and a date
+		// operator cannot parse — the model is deliberately date-blind, so this
+		// is exactly the shape a host loads when nothing declared the field a
+		// date. It drives the deny variant.
+		"malformed_at": benchMalformedAt,
 	}
 }
 
@@ -438,7 +650,13 @@ func buildRuleLayer(tb testing.TB, ctx context.Context, store *memory.Store, mus
 			Account: acct(0), Principal: ruleUser, Action: v.name, Object: benchObject,
 		}
 	}
-	return reg, rules.NewEngine(source, reg), reqs
+	// The clock is PINNED (benchNow). It is the engine's single time source, so
+	// this fixes both what NOW means to a relative-date bound — which is what
+	// makes the date variants decide the same comparison on every run and on
+	// every day — and, as the documented flip side, compiled-rule cache expiry.
+	// The latter is inert here: this engine takes the default TTL, under which
+	// entries live until invalidated anyway.
+	return reg, rules.NewEngine(source, reg, rules.WithClock(benchClock{})), reqs
 }
 
 func acct(i int) string  { return fmt.Sprintf("acct%d", i) }

@@ -135,7 +135,7 @@ Read-only previews. Nothing is written and nothing is audited.
 |---|---|---|
 | `Simulate` | `SimulateRequest` → `Decision` | The decision a query WOULD get under a hypothetical overlay (unsaved rules + synthetic grants/permissions/principals layered over the live model). Backs the rule editor's live preview. |
 | `SimulateExplain` | `SimulateRequest` → `ExplainResponse` | Same overlay, returning the full `Explain` trace. |
-| `EvaluateRule` | `EvaluateRuleRequest` → `EvaluateRuleResponse` | Run an UNSAVED rule AST directly against one object's provider metadata (no account/principal/grant); returns the boolean `result` plus the object metadata snapshot the rule saw. |
+| `EvaluateRule` | `EvaluateRuleRequest` → `EvaluateRuleResponse` | Run an UNSAVED rule AST directly against one object's provider metadata (no account/principal/grant); returns the boolean `result`, the object metadata snapshot the rule saw (`object_json`), the reference instant it resolved relative dates against (`now`), what each relative-date operand became at that instant (`bounds_json`), and the evaluation's deny-safe notes (`notes_json`). |
 
 ## Templates
 

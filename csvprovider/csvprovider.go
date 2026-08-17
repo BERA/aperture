@@ -29,6 +29,46 @@
 //
 //	id,category_id,seats:int,active:bool,budget:float
 //
+// # Dates
+//
+// The types "date" and "datetime" declare a column to hold dates, so every cell
+// is validated and canonicalised at LOAD through the shared date value model
+// (provider.ParseDateValue) instead of travelling as an unexamined string:
+//
+//	id,hired_at:date,last_seen:datetime
+//	brand:1,2026-03-04,2026-03-04T12:30:00Z
+//
+// The point is where the failure lands. A typo'd or impossible date in an
+// untyped column is a perfectly good string that no rule can compare, so it
+// becomes a silent deny at decision time, months later, in production; declared
+// as a date it is a hard error on the line and column that hold it.
+//
+// A date is stored as its CANONICAL string — "2006-01-02" for date and
+// "2006-01-02T15:04:05Z" for datetime — not as the cell was written, so two rows
+// naming one instant are one string and a Filter.Fields equality predicate over
+// the column works. The value model is unchanged by this: a date is an ordinary
+// string scalar, and ValidateField still runs on it.
+//
+// Accepted, rejected, and why the offset policy is what it is are all the value
+// model's rules, not this loader's — see provider.ParseDateValue. Two
+// consequences are worth stating here because they are the ones a CSV author
+// meets:
+//
+//   - An explicit offset is a load ERROR, not a conversion.
+//     2026-01-01T00:00:00+05:00 means January 1st to whoever wrote it, and its
+//     UTC instant is 2025-12-31T19:00:00Z — converting silently moves the year.
+//     A Z suffix is accepted, and so is an offset-free timestamp (read as UTC).
+//   - The declared type fixes the granularity. A ":date" column takes days and a
+//     ":datetime" column takes instants; the other form is rejected rather than
+//     quietly widened to midnight.
+//
+// An empty cell omits the field, exactly as an empty scalar cell does — an
+// absent date is meaningfully different from any date, and a zero time would
+// silently satisfy every "before" rule written against the column.
+//
+// There is no ":list<date>": arrays of dates are out of scope and are rejected
+// by name rather than by accident. There is no time-of-day type either.
+//
 // # Arrays
 //
 // The type "list" produces a real []any, which is what makes membership rules
@@ -83,8 +123,8 @@
 //
 // # Empty cells
 //
-// An empty cell in a SCALAR column omits that field for the row, so a rule can
-// supply its own default. An empty cell in a JSON column does the same: an
+// An empty cell in a SCALAR or DATE column omits that field for the row, so a
+// rule can supply its own default. An empty cell in a JSON column does the same: an
 // object that is absent is meaningfully different from one that is empty, and
 // reading an absent object is safe. An empty cell in a LIST column is the one
 // departure: it yields an empty list ([]any{}), not an absent field, so "x" in
@@ -109,9 +149,14 @@
 //
 // A missing "id" column, a duplicate id, a wrong column count, an unknown type
 // or malformed type suffix, a value that will not coerce to its declared type,
-// a list cell with an empty element, or a json cell that is not valid JSON or
-// does not decode to an object is an APERTURE_CONFIG_INVALID error naming the
-// column (and, for a cell, the line and the offending element). A malformed id
+// a list cell with an empty element, a json cell that is not valid JSON or
+// does not decode to an object, or a date cell that is not a canonical date of
+// its column's granularity is an APERTURE_CONFIG_INVALID error naming the
+// column (and, for a cell, the line and the offending element). A date
+// rejection additionally carries the provider.DateReason, so a caller branches
+// on the cause rather than on message text, and — like the json rejection —
+// never carries the cell, which is host data and, for a date, frequently
+// personal data. A malformed id
 // passes through as the identity package's APERTURE_IDENTITY_INVALID. Every
 // parsed value is additionally checked against the shared metadata value model
 // (provider.ValidateField) before it is stored, so a shape, depth, or size
@@ -288,7 +333,7 @@ func (p *Provider) Query(_ context.Context, filter provider.Filter) ([]provider.
 // elem and delim are set only for a list column; they stay empty for a scalar.
 type column struct {
 	name  string
-	typ   string // "string", "int", "float", "bool", "list", or "json"
+	typ   string // "string", "int", "float", "bool", "date", "datetime", "list", or "json"
 	elem  string // element type of a list column ("string" unless <elem> says otherwise)
 	delim string // element separator of a list column (defaultListDelim unless (delim) says otherwise)
 	index int
@@ -302,6 +347,16 @@ const (
 	// nothing else: a cell decoding to an array, a scalar, or null is rejected
 	// so that "list" stays the single array path.
 	typeJSON = "json"
+	// typeDate is the column type whose cells are calendar days, validated and
+	// canonicalised through the shared date value model and stored as the string
+	// scalar that model defines (provider.DateLayout).
+	typeDate = "date"
+	// typeDateTime is the timestamp counterpart of typeDate
+	// (provider.DateTimeLayout). It is spelled out rather than folded into
+	// typeDate with a modifier because the two are different declarations: a
+	// column is a day or it is an instant, and mixing the two in one column is
+	// exactly what this type rejects.
+	typeDateTime = "datetime"
 )
 
 // defaultListDelim separates the elements of a list cell unless the header
@@ -317,6 +372,34 @@ func isScalarType(t string) bool {
 		return true
 	}
 	return false
+}
+
+// isDateType reports whether t is one of the two date column types.
+//
+// They are deliberately NOT members of isScalarType even though each produces a
+// string scalar, because that set doubles as the legal list element types and an
+// array of dates is out of scope: ":list<date>" must be rejected with a reason,
+// not accepted by inheritance. Keeping the two sets apart is what makes the
+// rejection a decision rather than an omission.
+func isDateType(t string) bool {
+	return t == typeDate || t == typeDateTime
+}
+
+// dateLayoutOf names the one canonical layout a date column accepts, for a
+// diagnostic. It is the layout, never a value.
+func dateLayoutOf(typ string) string {
+	if typ == typeDateTime {
+		return provider.DateTimeLayout
+	}
+	return provider.DateLayout
+}
+
+// dateGranularityOf is the granularity a date column declares its cells carry.
+func dateGranularityOf(typ string) provider.DateGranularity {
+	if typ == typeDateTime {
+		return provider.GranularityDateTime
+	}
+	return provider.GranularityDate
 }
 
 // parseFile opens path and parses it, wrapping an open failure as
@@ -400,6 +483,20 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 					return nil, nil, err
 				}
 				val = obj
+			case isDateType(c.typ):
+				if cell == "" {
+					// A date column follows the SCALAR rule, not the list rule:
+					// an empty cell omits the field. An absent date is
+					// meaningfully different from any date, and the alternative
+					// — storing a zero time — would silently satisfy every
+					// "before <anything>" rule ever written against the column.
+					continue
+				}
+				s, err := coerceDate(cell, c, line)
+				if err != nil {
+					return nil, nil, err
+				}
+				val = s
 			default:
 				if cell == "" {
 					continue // omit an empty scalar field; a rule can default it
@@ -502,12 +599,13 @@ func parseTypeSuffix(name, suffix string) (column, error) {
 	}
 
 	typ := rest
-	// Everything but "list" is a single, undecorated type. "json" joins the
-	// scalars here rather than growing a branch of its own: its cell carries its
-	// whole structure, so an element type or a delimiter is as meaningless on it
-	// as it is on ":int" and is rejected identically.
+	// Everything but "list" is a single, undecorated type. "json", "date", and
+	// "datetime" join the scalars here rather than growing a branch of their
+	// own: a json cell carries its whole structure and a date cell is one
+	// canonical string, so an element type or a delimiter is as meaningless on
+	// them as it is on ":int" and is rejected identically.
 	if typ != typeList {
-		if !isScalarType(typ) && typ != typeJSON {
+		if !isScalarType(typ) && typ != typeJSON && !isDateType(typ) {
 			return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
 				"csvprovider: unknown column type",
 				map[string]any{"name": name, "type": typ})
@@ -522,6 +620,15 @@ func parseTypeSuffix(name, suffix string) (column, error) {
 
 	if !elemSet {
 		elem = "string" // ":list" is ":list<string>"
+	}
+	if isDateType(elem) {
+		// Named explicitly rather than swept into "unknown element type",
+		// because ":list<date>" is a reasonable thing to try and the author
+		// deserves to be told it is out of scope rather than left guessing that
+		// they mistyped a supported element type.
+		return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: a list column cannot hold dates; declare a single date or datetime column instead",
+			map[string]any{"name": name, "elem": elem})
 	}
 	if !isScalarType(elem) {
 		return column{}, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
@@ -685,6 +792,52 @@ func jsonKind(v any) string {
 		return "object"
 	}
 	return "unknown"
+}
+
+// coerceDate validates one date cell through the shared date value model and
+// returns the CANONICAL text to store. The loader never re-implements the
+// parsing, the accepted forms, or the offset policy — provider/date.go is the
+// single definition, shared with the seed loader and the rules engine, so a
+// value the CSV accepts is exactly a value a rule can compare.
+//
+// It stores the canonical rendering rather than the cell as written, so
+// "2026-03-04T01:02:03.456Z" and "2026-03-04T01:02:03" both become
+// "2026-03-04T01:02:03Z" on disk-to-memory. Two rows that name the same instant
+// are then the same string, which is what makes a Filter.Fields equality
+// predicate over a date column usable at all.
+//
+// The declared type also fixes the GRANULARITY. A ":date" column holds calendar
+// days and a ":datetime" column holds instants; a cell carrying the other form
+// is rejected rather than stored, because the column type would otherwise be a
+// claim the data does not honour — and because the implicit repair (reading a
+// bare day in a :datetime column as midnight) is precisely the silent assumption
+// this model exists to refuse. Write the midnight out.
+//
+// Every rejection names the column, the line, and the field, and carries the
+// DateReason so a caller can branch on the cause. It NEVER carries the cell: a
+// date is frequently personal data — a birth date, a termination date — and an
+// error is a thing that gets logged. That is also why the value model's own
+// error is classified and then dropped rather than wrapped; it says nothing this
+// one does not, and the chain is shorter for it.
+func coerceDate(cell string, c column, line int) (string, error) {
+	v, err := provider.ParseDateValue(cell)
+	if err != nil {
+		return "", aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: cannot parse cell as its declared date type",
+			map[string]any{
+				"line": line, "field": c.name, "type": c.typ,
+				"reason": string(provider.DateReasonOf(err)), "expected": dateLayoutOf(c.typ),
+			})
+	}
+	if want := dateGranularityOf(c.typ); v.Granularity() != want {
+		return "", aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
+			"csvprovider: cell is a valid date of the wrong granularity for its declared column type",
+			map[string]any{
+				"line": line, "field": c.name, "type": c.typ,
+				"granularity": v.Granularity().String(), "expected": dateLayoutOf(c.typ),
+			})
+	}
+	return v.String(), nil
 }
 
 // coerce converts a raw cell to the value for its declared column type. int is

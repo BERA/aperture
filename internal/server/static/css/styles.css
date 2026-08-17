@@ -499,3 +499,38 @@ body {
 /* Global account switcher in the shell topbar. */
 .shell__account { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; }
 .shell__account .a-caption { white-space: nowrap; }
+
+/* ── Rule editor: naming the node controls ────────────────────────────────
+ *
+ * Rete's classic React renderer draws every control as a bare <input> with no
+ * label, and that renderer is a committed vendored blob this repo never
+ * rebuilds — so a relative-date node would otherwise read as four anonymous
+ * boxes. The renderer DOES tag each control's wrapper with
+ * `data-testid="control-<key>"`, which is a stable hook to hang a label on
+ * without injecting anything into React's DOM (a ::before belongs to CSS, not to
+ * the element tree React reconciles).
+ *
+ * Scoped to the rule canvas so it can never label an unrelated control, and
+ * uppercase per the design spec's one exception: form-field labels.
+ */
+.rete-canvas [data-testid="control-mode"]::before,
+.rete-canvas [data-testid="control-lower"]::before,
+.rete-canvas [data-testid="control-upper"]::before,
+.rete-canvas [data-testid="control-anchor"]::before,
+.rete-canvas [data-testid="control-n"]::before,
+.rete-canvas [data-testid="control-unit"]::before,
+.rete-canvas [data-testid="control-snap"]::before {
+  display: block;
+  padding: 4px 0 1px 3px;
+  font: 600 9px/1.2 var(--font-body);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+}
+.rete-canvas [data-testid="control-mode"]::before { content: "right operand"; }
+.rete-canvas [data-testid="control-lower"]::before { content: "lower bound"; }
+.rete-canvas [data-testid="control-upper"]::before { content: "upper bound"; }
+.rete-canvas [data-testid="control-anchor"]::before { content: "anchor"; }
+.rete-canvas [data-testid="control-n"]::before { content: "offset"; }
+.rete-canvas [data-testid="control-unit"]::before { content: "unit"; }
+.rete-canvas [data-testid="control-snap"]::before { content: "snapped to"; }

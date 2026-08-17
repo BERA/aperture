@@ -29,11 +29,12 @@ file (E5-S2) persists the same shape. There is no second rule format.
 |---|---|---|
 | `and` / `or` | `children` (>= 2) | logical conjunction / disjunction |
 | `not` | `children` (exactly 1) | logical negation |
-| `compare` | `op`, `left`, `right` | comparison; `right` is omitted for the unary ops |
+| `compare` | `op`, `left`, `right` | comparison; `right` is omitted for the unary ops, and is a two-item `list` for `between` |
 | `var` | `name` (dotted path) | context variable reference |
 | `literal` | `value` (scalar JSON) | string / number / bool / null constant |
 | `list` | `items` | list literal (right side of a collection op) |
 | `call` | `name`, `items` (args) | call to a registered pure function |
+| `relativeDate` | `anchor`, `n`, `unit`, `snap` (**all four, always**) | a date relative to the decision's reference instant; an **operand**, legal only inside a date operator |
 
 The JSON form is stable and round-trips (marshal -> unmarshal -> marshal is
 byte-identical), including falsy literals (`false`, `0`, `""`, `null`) and the
@@ -71,6 +72,56 @@ Collection operators. `left` is the collection (or, for `exists`, any path);
 | `isNotEmpty` | `object.tags is not empty` | array, object | **omitted** |
 | `exists` | `object.owner.dept exists` | any path | **omitted** |
 
+Date operators. `left` is the date-valued field; `right` is another date operand
+— a literal, a variable, or a `relativeDate` — except for `between`, which takes
+**two bounds**:
+
+| `op` | Reads as | `right` |
+|---|---|---|
+| `before` | `object.hired_at before "2026-01-01"` | one element (strict) |
+| `after` | `object.hired_at after "2026-01-01"` | one element (strict) |
+| `onOrBefore` | `object.hired_at on or before "2026-01-01"` | one element (inclusive) |
+| `onOrAfter` | `object.hired_at on or after "2026-01-01"` | one element (inclusive) |
+| `between` | `object.hired_at between ["2026-01-01","2026-12-31"]` | a `list` of exactly two bounds |
+| `sameDay` | `object.hired_at same day as "2026-03-04"` | one element |
+| `sameMonth` | `object.hired_at same month as "2026-03-04"` | one element |
+| `sameYear` | `object.hired_at same year as "2026-03-04"` | one element |
+
+A date operand is one of the two canonical strings the value model defines —
+`2006-01-02` or `2006-01-02T15:04:05Z` (see the `metadata-values` skill). Four
+properties are worth stating outright:
+
+- **`between` is INCLUSIVE AT BOTH ENDS.** `between [lo, hi]` is exactly
+  `onOrAfter lo && onOrBefore hi`. Bounds are never reordered: a `lo` above the
+  `hi` is a range that matches nothing, which is what the author wrote — and it
+  is **noted**, because "matched nothing" is otherwise indistinguishable from a
+  window nothing happens to fall in.
+- **Granularity never affects ordering.** `"2026-03-04"` and
+  `"2026-03-04T00:00:00Z"` name the same instant and compare **equal**. Ordering
+  is over instants, never over text — which is also why no date operator renders
+  to a native `<`.
+- **`sameDay` / `sameMonth` / `sameYear` are calendar-bucket EQUALITY, in UTC.**
+  Not distance: `2026-03-31` and `2026-04-01` are a day apart and are **not** in
+  the same month, and `2026-03-04` and `2025-03-04` share a month number but are
+  **not** in the same month. There is no timezone conversion anywhere and no
+  timezone knob — every instant in the model is already UTC.
+- **A date operand that will not parse denies, and never raises** — see
+  "Malformed dates" below.
+
+`between` needs two right-hand operands and `compare` carries one `right`, so
+`right` is a `list` of exactly two items. **No new node type, no new field, and
+no new JSON key**: every rule persisted before dates existed loads and
+re-marshals byte-identically, and the author's one `between` node reads back as
+one node rather than as an `and` of two comparisons.
+
+```json
+{"type":"compare","op":"between",
+ "left":{"type":"var","name":"object.hired_at"},
+ "right":{"type":"list","items":[
+   {"type":"literal","value":"2026-01-01"},
+   {"type":"literal","value":"2026-12-31"}]}}
+```
+
 Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
 
 - The three unary ops require `right == nil`; supplying one is an error, not
@@ -78,11 +129,174 @@ Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
 - Every other op requires both operands.
 - `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf` need a `list` or a `var` on
   the right — a set.
-- `has` `hasKey` need a single element on the right; a `list` there is an error
-  pointing at `hasAll`/`hasAny`/`hasNone`.
+- `has` `hasKey` and the eight single-operand date ops need a single element on
+  the right; a `list` there is an error.
+- `between` needs a `list` of **exactly two** bounds on the right — one bound,
+  three bounds, an empty list, or a bare operand are all rejected.
+- A `relativeDate` operand is legal only inside a date operator (either side, or
+  either `between` bound); see "Relative dates".
 
-Build a unary node with `rules.Unary(op, left)`; everything else with
+Build a unary node with `rules.Unary(op, left)`, a `between` node with
+`rules.Between(left, low, high)`, and everything else with
 `rules.Compare(op, left, right)`.
+
+## Relative dates
+
+A rule that says "touched in the last 90 days" must keep meaning that tomorrow,
+so the cutoff cannot be a literal. The `relativeDate` node expresses a date
+**relative to the decision's reference instant** (`NOW` — see "The clock, and one
+`NOW` per decision") as structured fields, not as an expression an author has to
+learn to write:
+
+```json
+{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}
+```
+
+| field | vocabulary |
+|---|---|
+| `anchor` | `NOW` \| `TODAY` |
+| `n` | any whole number; **negative goes into the past** |
+| `unit` | `years` \| `quarters` \| `months` \| `weeks` \| `days` \| `hours` \| `minutes` |
+| `snap` | `none` \| `startOfYear` \| `endOfYear` \| `startOfQuarter` \| `endOfQuarter` \| `startOfMonth` \| `endOfMonth` \| `startOfWeek` \| `endOfWeek` \| `startOfDay` \| `endOfDay` |
+
+The two worked examples:
+
+| Intent | Node |
+|---|---|
+| three months prior to today | `{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}` |
+| year to date plus five years of history | a `between` whose lower bound is `{"anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"}` and whose upper bound is `{"anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}` |
+
+```json
+{"type":"compare","op":"between",
+ "left":{"type":"var","name":"object.hired_at"},
+ "right":{"type":"list","items":[
+   {"type":"relativeDate","anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"},
+   {"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}]}}
+```
+
+Build one with `rules.RelativeDate(anchor, n, unit, snap)`; the vocabularies have
+exported constants (`rules.AnchorNow`, `rules.UnitMonths`, `rules.SnapStartOfYear`,
+…).
+
+Six rules, each of which is API rather than convention:
+
+- **A negative `n` goes into the past.** "Three months ago" is `n: -3`. There is
+  no separate direction field anywhere that could disagree with the sign — a sign
+  error in a date rule is silent and grants access backwards in time, so the
+  convention is stated once and used by every surface.
+- **All four fields are always present.** "No offset" is `n: 0` (with whatever
+  unit — zero of anything is the anchor itself) and "no snap" is the vocabulary
+  member `"none"`, never an absent key. Absence never means anything, so the
+  editor's four controls are never empty and both validators run the same four
+  uniform checks.
+- **`TODAY` is a distinct persisted anchor**, defined as `NOW` snapped to the
+  start of its UTC day. It is never rewritten into `NOW` + `snap: startOfDay`: an
+  author who chose `TODAY` reads back `TODAY`.
+- **A snap composes on top of the anchor.** `anchor: TODAY, snap: startOfYear` is
+  legal and means the start of the year — the wider snap simply subsumes the
+  anchor's start-of-day. The snap is applied **before** the offset (see "UTC,
+  clamping, and the order of operations"), so the node reads left to right the
+  way it is spoken: `NOW, n: -5, unit: years, snap: startOfYear` is "the start of
+  the year, five years back".
+- **The node is an operand, and only a date operator's operand.** It is legal on
+  either side of `before` / `after` / `onOrBefore` / `onOrAfter` / `sameDay` /
+  `sameMonth` / `sameYear`, and as either bound of a `between` — the two bounds
+  vary independently, so any mix of literal and relative is fine. Anywhere else —
+  the right of `eq`, an item of an `in` list, a `call` argument, a child of
+  `and` — is `APERTURE_RULE_INVALID`. It resolves to a date the author never
+  sees, so being compared as anything but a date is a silent wrong answer.
+- **Anchors, units, and snaps are closed sets checked in the AST**, not free
+  strings resolved at runtime, so a typo fails when the rule is **saved** rather
+  than denying quietly on every decision after. Each field has its own message:
+  `relative date has an unknown anchor` / `… an unknown offset unit` / `… an
+  unknown snap` / `relative date offset must be a whole number`.
+
+**How it compiles.** The node renders to the internal dispatcher
+`$rel(__now, anchor, n, unit, snap)` — the reference instant, then the four fields
+as **literals**:
+
+```
+$date("before", __notes, "object.hired_at", object?.hired_at, "",
+      $rel(__now, "NOW", -3, "months", "none"), "", nil)
+```
+
+`$rel` returns a canonical date **string** — byte-for-byte what a literal in the
+same position would be — so `$date` parses both operands through one path and a
+relative date is interchangeable with a fixed one. `$rel` is the **only**
+dispatcher that reads `__now`; `$date` never sees it and its arity is unchanged.
+
+The literal arguments are the whole point. Exposing the instant as a `NOW`
+variable root instead would make `NOW.AddDate(0, -3, 0)` a well-formed var path,
+because reflective method calls survive `expr.DisableAllBuiltins` — an unclamped
+calendar walk reachable from any rule. `allowedRoots` is unchanged, and `$rel` is
+unreachable from a rule for the same structural reason as `$op` and `$date`.
+
+**Showing an author what a relative date currently means** is
+`ResolveRelativeDates(ast, now) []ResolvedRelativeDate` — one entry per
+relative-date operand, in document order, each carrying its AST path, the four
+field values as authored, and `Resolved` (the canonical date, or `""` for an
+operand that resolves to nothing, which is the deny the evaluation applies). It
+goes through the **same** `resolveRelativeDate` the `$rel` dispatcher calls, so a
+preview and a decision cannot disagree about what an operand means at a given
+instant. It never fails and never raises. The rule builder's what-if
+(`service.EvaluateRulePreview`) is its caller; anything else that renders a
+relative date must use it rather than re-deriving the arithmetic.
+
+### UTC, clamping, and the order of operations
+
+Resolution is three steps in a fixed order: **anchor → snap → offset**.
+
+**Snap first, then offset.** The node reads left to right the way it is spoken —
+"the start of the year, five years back". The two orders are different functions,
+not a rearrangement: `startOfMonth` then `+1 day` is the **2nd of this month**,
+while `+1 day` then `startOfMonth` is the **1st of next month** when the anchor is
+a month end. The order is API, and a test pins a case where the two disagree.
+
+**Calendar offsets clamp at month end.** Offsetting by the three calendar units
+(`years`, `quarters`, `months`) pins the day to the last valid day of the target
+month rather than normalising the way `time.AddDate` does:
+
+| | this engine | `time.AddDate` |
+|---|---|---|
+| `2026-03-31` − 1 month | `2026-02-28` | `2026-03-03` |
+| `2026-05-31` − 1 month | `2026-04-30` | `2026-05-01` |
+| `2024-02-29` − 1 year | `2023-02-28` | `2023-03-01` |
+| `2026-01-31` + 1 month | `2026-02-28` | `2026-03-03` |
+| `2024-01-31` + 1 month | `2024-02-29` (leap) | `2024-03-02` |
+
+Clamping matches `java.time`, Luxon, and `date-fns`, so it is what an author who
+has met any other date library expects — and the standard library's answer is
+wrong here in the worst way: silently, and only when the anchor happens to fall on
+a long month end. Clamping never *extends* a date: `2023-02-28` + 1 year is
+`2024-02-28`, not the 29th. `weeks` / `days` / `hours` / `minutes` are
+fixed-length, are added as durations, and never clamp.
+
+**`start*` is midnight; `end*` is `23:59:59` on the period's last day** — the last
+representable instant, not the start of the next period. `between` is inclusive at
+both bounds, so an `endOfMonth` upper bound has to admit the whole final day; an
+exclusive next-boundary would admit the following day as well. Seconds rather than
+nanoseconds because the value model floors to whole seconds.
+
+**Week boundaries are ISO 8601 — Monday through Sunday.** A Sunday anchor snaps
+*back* six days to the Monday that started its week; `endOfWeek` is that Sunday at
+`23:59:59`. Quarters are calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec),
+so any day in February snaps back to January 1st.
+
+**Everything is UTC.** No `time.Local`, no `time.LoadLocation`, no timezone knob —
+asserted structurally over the package's sources, not just by fixture. DST is a
+non-issue by construction: UTC has no transitions, so a day offset is always
+exactly 24 hours.
+
+**Out of range denies.** An offset that leaves the four-digit year range the
+canonical forms can write (or that overflows a duration) resolves to **nothing**,
+and the enclosing operator denies with the ordinary `shape_mismatch` note — the
+same answer a missing reference instant gets. An instant that cannot be written in
+the canonical form is not a date this system has.
+
+**No reference instant, no date.** `rules.Input.Now`'s zero value means "no
+reference instant is available" — a hand-built `Input`; an `Engine` always
+supplies one. A relative date then resolves to nothing and **denies** rather than
+resolving against the year 1, and it never raises.
 
 ### How each operator compiles
 
@@ -107,6 +321,17 @@ registers:
   nothing. Neither `$op` nor `__notes` is reachable from a rule — `$` is outside
   the name grammar `Validate` enforces, and `__notes` is not an exposed context
   root — so the guard is compiler-only by construction, not by denylist.
+- **Dates are always guarded.** Every date operator renders to the internal
+  dispatcher `$date(op, __notes, leftPath, left, rightPath, right, right2Path,
+  right2)` — the last pair is `between`'s upper bound and is `""`/`nil` for
+  every other date operator, so one arity covers the binary and the ternary
+  operators. There is **no** native fallback, and that is a hard rule: the values
+  are canonical date *strings*, so a native `<` would compare text (which orders
+  `"2026-03-04"` before `"2026-03-04T00:00:00Z"` although they are the same
+  instant), and parsing to `time.Time` first is worse — `time.Time < string` is a
+  **compile** error in expr, so one mistyped operand would make the entire rule
+  uncompilable instead of degrading one comparison. `$date` is unreachable from a
+  rule for the same structural reason as `$op`.
 
 **expr's predicate builtins are denied.** `expr.DisableAllBuiltins()` does not
 reach `all`, `any`, `none`, `one`, `filter`, `map`, `count`, `sum`, `find`,
@@ -124,6 +349,79 @@ an unknown variable, rejected at validation:
   attributes come from a `PrincipalResolver` (`WithPrincipalResolver`).
 - `account` — account attributes (reserved; empty until wired).
 - `action` — the action verb (a string).
+
+There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per
+decision" below: the reference instant reaches evaluation as an argument, never as
+a variable.
+
+## The clock, and one `NOW` per decision
+
+Date comparisons need a reference instant, and evaluation still has to be pure —
+every `expr-lang` builtin is disabled, so nothing a rule can *call* reads a clock.
+The instant is therefore **data**, fixed before the program runs.
+
+**One clock.** `rules.WithClock` injects the engine's **single** time source. It
+drives two things:
+
+1. compiled-rule cache **TTL expiry** (`WithCacheTTL`), and
+2. the per-decision reference instant, `NOW`.
+
+Two independent clocks inside one engine can disagree — an entry expiring against
+one instant while a date rule decides against another — and that is a worse
+failure than the coupling. **The coupling is real and intended: pinning the clock
+so a month-end date fixture is reproducible also freezes cache expiry**, so a TTL'd
+entry under a frozen clock never expires. `TestPinnedClockAlsoFreezesCacheExpiry`
+asserts both halves so the consequence cannot quietly stop being true.
+
+**One instant per decision.** The clock is read **once per decision**, not once per
+reference and not once per rule:
+
+```
+Clock → DecisionInstant (scope) → Input.Now → __now (evaluation environment)
+```
+
+A decision evaluates a rule per candidate grant — twice per candidate for a
+rule-backed `Enumerate` — so the decision engine opens a scope
+(`rules.WithDecisionInstant`) at each decision boundary (`Check`, `Enumerate`,
+`Explain`) and every evaluation underneath shares the **first** instant taken.
+Nesting is idempotent, so a per-candidate decision inside an enumeration keeps the
+enumeration's instant. Outside a scope — a host driving `rules.Engine` directly —
+each evaluation takes its own snapshot from the same clock. Either way a rule that
+refers to `NOW` twice **cannot straddle a tick**.
+
+The scope is a **memo, not an injection point**: the value always comes from the
+engine's `Clock`. There is no API for a caller to supply its own instant, because
+two callers disagreeing about "now" is exactly the defect the single clock exists
+to prevent. Likewise there is **no timezone knob**: the instant is converted to
+UTC at the snapshot boundary *and* again when the evaluation environment is built,
+so no zone can reach a comparison however an injected clock is implemented.
+
+**`NOW` is not a variable root, and must never become one.** It is exposed to the
+compiled program as `__now`, which is absent from the four roots above — exactly
+as the notes sink `__notes` is. That is a security boundary, not a style choice:
+reflective **method calls survive `expr.DisableAllBuiltins`**, so an exposed root
+would make `NOW.AddDate(0, -3, 0)` and `NOW.Unix()` well-formed var paths — an
+unclamped calendar walk reachable from any rule. The `relativeDate` node renders
+literal arguments to the `$rel` dispatcher and reads `__now` as one of them, the
+way `$date` already reads `__notes` — see "Relative dates".
+`TestNowIsNotReachableFromARule` fails if the identifier is ever added to
+`allowedRoots`.
+
+**The cache never carries an instant.** The rendered source names the identifier,
+never a resolved timestamp, so a cached program cannot answer against a stale
+`NOW`: compile, advance the clock, re-evaluate, and the cache **hits** while the
+evaluation sees the new instant.
+
+**`Explain` records it.** `Trace.Now` is the instant the decision's rules resolved
+against — always UTC, taken once for the whole trace, zero when the decision
+evaluated no rule. It makes a date-sensitive verdict reproducible: replay the
+request with the clock pinned to it and the verdict must be identical. It is
+deliberately **not** rendered by `Trace.String()`, which promises byte-identical
+output for the same decision.
+
+**Testing.** Time-dependent tests pin the clock and never assert against
+`time.Now()` — an expectation derived from the real clock only exercises the
+interesting calendar path on the days the calendar happens to cooperate.
 
 ## Missing fields: nested access is nil-safe, but `nin` grants
 
@@ -194,6 +492,41 @@ Which shapes each operator accepts:
 | `isEmpty` `isNotEmpty` | array, object, or string | `array, object, or string` |
 | `exists` | anything — a nil test cannot mismatch | — |
 
+## Malformed dates: deny-safe, and noted
+
+Date operators follow the same policy, for the same reason: metadata reaches the
+evaluator from host-implemented `ObjectProvider`s and from the principal
+attribute bag, neither of which any loader validates, so one malformed date must
+not break every `Check` that touches the field.
+
+**Any operand that will not parse makes the comparison `false`.** Never an
+`APERTURE_RULE_EVAL` error. Both operands are parsed to instants on every
+evaluation — comparing the canonical strings is not a permissible shortcut,
+because the date-only form is a strict prefix of the timestamp form.
+
+| operand | result | note |
+|---|---|---|
+| absent (`nil`) | **`false`** | `shape_mismatch`, `expected date, got absent` |
+| a number, bool, array, or object | **`false`** | `shape_mismatch`, `expected date, got number` |
+| a string that is not one of the two canonical forms | **`false`** | `date_invalid` |
+| `between` whose lower bound is after its upper bound | **`false`** | `date_bounds_inverted` |
+| a `relativeDate` that cannot be resolved (no reference instant, or an offset that leaves the four-digit year range) | **`false`** | `shape_mismatch`, `expected date, got absent`, path `(expression)` |
+
+**Note the asymmetry with the collection operators, and that it is deliberate.**
+A collection operator gives an absent field a meaning — it reads as an *empty
+collection*, and the operator's own polarity decides from there, which is why
+`hasNone` grants on missing data. A date operator has no such reading: there is
+no empty date, and all eight date operators are **positive**, so none of them can
+match on an absence. Absent is therefore uniformly `false`, exactly as a
+wrong-shaped operand is, and no date operator ever records `absent_field`. (A
+negative date operator, were one ever added, would need it.)
+
+An unparseable string is kept **separate** from a shape mismatch because the fix
+differs: the shape was right and the content was not, so the answer is to
+canonicalise the data — or to declare the field as a date in the loader (a CSV
+`:date` / `:datetime` column, or the seed document's `field_types:`) so it is
+validated at load instead of denying silently at decision time.
+
 ### Evaluation notes
 
 A silent `false` is how an access-control bug hides, so every mismatch is
@@ -202,16 +535,25 @@ Twirp `trace_json`, MCP):
 
 ```
 object.tags: expected collection, got string
+object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z
+object.hired_at: between bounds are inverted; the lower bound is after the upper bound, so nothing can match
 ```
 
 Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
-`Actual` — carrying **shape and path only, never a metadata value**. Two kinds
-are recorded today:
+`Actual` — carrying **shape and path only, never a metadata value**. That last
+point is not a nicety for dates: a date is often personal data (a birth date, a
+termination date), and the same trace crosses the Twirp and MCP surfaces. Four
+kinds are recorded today:
 
-- `shape_mismatch` — a collection operator met a non-collection.
+- `shape_mismatch` — a collection operator met a non-collection, **or** a date
+  operator met a value that is not a string (including an absent field).
 - `absent_field` — an operator **matched because the field is missing** (the
   `nin` / `hasNone` / `subsetOf` / `isEmpty` grant above), which is otherwise
-  invisible in the verdict.
+  invisible in the verdict. No date operator records this.
+- `date_invalid` — a date operator met a **string** that is not one of the two
+  canonical forms. `Expected` names the forms; the offending value never appears.
+- `date_bounds_inverted` — a `between` was written with its lower bound after its
+  upper bound, so it matches nothing. `Path` names the compared field.
 
 The channel is opt-in and costs the decision path nothing: `Check` and
 `Enumerate` install no collector, so nothing is recorded and nothing is
@@ -235,14 +577,16 @@ evaluation, surfacing coded errors:
 - `APERTURE_RULE_INVALID` — malformed AST (bad arity, missing operand, a right
   operand on a unary op, the wrong operand shape for a collection op, non-scalar
   literal, non-identifier variable path, a `call` naming a denied predicate
-  builtin).
+  builtin, a `relativeDate` outside a date operator or carrying an anchor / unit
+  / snap outside its closed set or a non-integer offset).
 - `APERTURE_RULE_UNKNOWN_VARIABLE` — a variable root outside `object` /
   `principal` / `account` / `action`.
 - `APERTURE_RULE_TYPE_ERROR` — type-incompatible comparison, non-boolean result,
   or a call to an unregistered function (caught by the expression type-checker).
 - `APERTURE_RULE_EVAL` — a runtime failure (e.g. an ordered comparison against a
   metadata field the object lacks) or a non-boolean result. A wrong-shaped
-  collection operand is **not** one of these: it denies with a note.
+  collection operand is **not** one of these, and neither is an absent,
+  wrong-shaped, or unparseable **date** operand: both deny with a note.
 - `APERTURE_RULE_NOT_FOUND` — a scope rule reference the `RuleSource` cannot
   resolve.
 
@@ -256,14 +600,29 @@ Note that `contains`, `startsWith` and `endsWith` are reserved as **infix
 operators** by expr's grammar, so they are registered but not reachable through a
 `call` node; the other nine are.
 
+Date operators do not break that: the reference instant is **data** (`__now`),
+fixed for the whole evaluation, not a function a rule could call. See "The clock,
+and one `NOW` per decision".
+
 ## Compile-once, cache
 
 A rule is rendered to its canonical expr-lang expression, hashed (sha256), and the
 compiled program is cached by that hash — so distinct rule references whose ASTs
 render identically share one compiled program, and per-`Check` cost is bounded
 (the NFR lever E4-S4 tunes). The cache is concurrency-safe with an optional TTL
-read from an injected `Clock` (`WithCacheTTL` / `WithClock`); `CacheStats`
-exposes hit/miss/eviction counters.
+read from the engine's injected `Clock` (`WithCacheTTL` / `WithClock`);
+`CacheStats` exposes hit/miss/eviction counters. That `Clock` is the **same** one
+the per-decision `NOW` is snapshotted from — see "The clock, and one `NOW` per
+decision" for what pinning it does to expiry.
+
+A cache **hit** takes only the read lock: the counters are `sync/atomic`, so
+concurrent evaluations no longer serialise on a counter bump they never read.
+That matters most for rule-backed `Enumerate`, which evaluates the rule once per
+candidate to gather a grant's members and again per candidate in the decision
+walk — see [benchmarks](../docs/benchmarks.md), "Rule-backed `Enumerate`". The
+counters' meaning is unchanged, and `CacheStats` samples them atomically rather
+than under a lock, so the four fields are not one instant's snapshot; they are
+exact for a sequential caller.
 
 What the cache removes is the **expr-lang compile**, not the AST walk: `Selected`
 calls `Engine.Compile` per evaluation, and `Compile` re-validates, re-renders, and

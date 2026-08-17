@@ -10,8 +10,8 @@ import (
 // implicitResolver covers every object of the permission's type that falls
 // within the grant's pattern scope — "all objects of the type (unfettered)".
 // Membership is the conjunction of the pattern match and a terminal-type check,
-// so Contains never enumerates. Members must list the type and so depends on the
-// ObjectLister (E2-S2).
+// so Contains never enumerates. Members must list the type and so requires an
+// ObjectLister.
 type implicitResolver struct {
 	gc   GrantContext
 	deps Deps
@@ -41,9 +41,9 @@ func (r implicitResolver) Members(ctx context.Context, pattern identity.Pattern)
 }
 
 // inclusiveResolver covers only the objects named by an explicit id-list (the
-// list path, fully implemented here) or selected by a rule (the rule path, a
-// clean seam wired in E2-S3). The grant's pattern still bounds membership, so a
-// listed object outside the pattern is not covered.
+// list path) or selected by a rule (the rule path, which consults the
+// RuleEvaluator). The grant's pattern still bounds membership, so a listed
+// object outside the pattern is not covered.
 type inclusiveResolver struct {
 	gc   GrantContext
 	deps Deps
@@ -68,45 +68,79 @@ func (r inclusiveResolver) Contains(ctx context.Context, object identity.Identit
 	if idInList(r.gc.Spec.IDs, object) {
 		return true, nil
 	}
-	// Rule path (E2-S3 seam): consult the rule evaluator only when a rule is
-	// declared, so a pure list-backed grant never touches the rule dependency.
+	// Rule path: consult the rule evaluator only when a rule is declared, so a
+	// pure list-backed grant never touches the rule dependency.
 	if r.gc.Spec.Rule != "" {
 		return r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object, r.gc.Principal, r.gc.Action)
 	}
 	return false, nil
 }
 
+// Members is the union of the two membership paths, which is exactly what
+// Contains answers object-by-object — the two must not disagree, or Check and
+// Enumerate answer differently about the same grant.
+//
+// The list half needs no lister: the members are the listed identities that fall
+// within both the grant pattern and the query pattern. The rule half is
+// list-then-filter, exactly as exclusive does it — a rule is an arbitrary
+// expression over object metadata and is not invertible in general, so there is
+// nothing to invert and no reverse index to consult. It therefore requires an
+// ObjectLister, and reports APERTURE_SCOPE_LISTER_UNCONFIGURED when none is
+// wired rather than returning an empty set: an empty member list is an answer,
+// and a missing dependency must not be able to impersonate one.
 func (r inclusiveResolver) Members(ctx context.Context, pattern identity.Pattern) ([]identity.Identity, error) {
-	// The list path needs no lister: the members are the listed identities that
-	// fall within both the grant pattern and the query pattern.
 	limit := boundLimit(0)
 	out := make([]identity.Identity, 0, len(r.gc.Spec.IDs))
+	// seen deduplicates across the two halves: an id that is both listed and
+	// rule-selected is one member, not two. It is built only for the id-list —
+	// Contains stays map-free on the hot path.
+	seen := make(map[string]struct{}, len(r.gc.Spec.IDs))
 	for _, raw := range r.gc.Spec.IDs {
 		id, err := identity.Parse(raw)
 		if err != nil {
 			return nil, aerr.Wrapf(aerr.APERTURE_SCOPE_INVALID, err,
 				"inclusive scope id %q is not a valid identity", raw)
 		}
-		if r.gc.Pattern.Matches(id) && pattern.Matches(id) {
-			out = append(out, id)
-			if len(out) >= limit {
-				break
-			}
+		if !r.gc.Pattern.Matches(id) || !pattern.Matches(id) {
+			continue
+		}
+		key := id.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
+		if len(out) >= limit {
+			return out, nil
 		}
 	}
-	// A rule-only inclusive grant cannot enumerate its members without the rule
-	// evaluator's reverse index; that arrives in E2-S3.
-	if len(r.gc.Spec.IDs) == 0 && r.gc.Spec.Rule != "" {
-		return nil, aerr.New(aerr.APERTURE_SCOPE_RULE_UNCONFIGURED,
-			"scope: enumerating a rule-backed inclusive grant arrives in E2-S3")
+	if r.gc.Spec.Rule == "" {
+		return out, nil
+	}
+	// Contains applies the grant pattern, the id-list, and the rule, so a
+	// candidate the list already contributed is simply filtered out below.
+	selected, err := enumerateOfType(ctx, r.deps, r.gc, pattern, r.Contains)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range selected {
+		key := id.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
 	}
 	return out, nil
 }
 
 // exclusiveResolver covers every object of the type within the pattern scope
-// EXCEPT those named by the minus id-list (full) or excluded by a rule (E2-S3
-// seam). Contains needs no enumeration; Members must enumerate the type and so
-// depends on the ObjectLister (E2-S2).
+// EXCEPT those named by the minus id-list or excluded by a rule (which consults
+// the RuleEvaluator). Contains needs no enumeration; Members must enumerate the
+// type and so requires an ObjectLister.
 type exclusiveResolver struct {
 	gc   GrantContext
 	deps Deps
@@ -135,7 +169,7 @@ func (r exclusiveResolver) Contains(ctx context.Context, object identity.Identit
 	if idInList(r.gc.Spec.IDs, object) {
 		return false, nil
 	}
-	// Rule path (E2-S3 seam): excluded iff the rule selects the object.
+	// Rule path: excluded iff the rule selects the object.
 	if r.gc.Spec.Rule != "" {
 		excluded, err := r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object, r.gc.Principal, r.gc.Action)
 		if err != nil {
@@ -172,9 +206,9 @@ func idInList(ids []string, object identity.Identity) bool {
 
 // enumerateOfType lists every object of the grant's type bounded by both the
 // grant pattern and the query pattern, optionally filtering each candidate
-// through keep (used by exclusive to drop excluded objects). It depends on the
-// ObjectLister and returns APERTURE_SCOPE_LISTER_UNCONFIGURED until E2-S2 wires
-// one.
+// through keep (used by exclusive to drop excluded objects, and by inclusive to
+// keep rule-selected ones). It requires an ObjectLister and surfaces
+// APERTURE_SCOPE_LISTER_UNCONFIGURED when none is wired.
 func enumerateOfType(
 	ctx context.Context,
 	deps Deps,

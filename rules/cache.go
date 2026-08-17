@@ -2,12 +2,25 @@ package rules
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Clock is the time source the cache reads for TTL expiry. It is injected so
-// tests drive expiry deterministically instead of sleeping; production uses the
-// real clock.
+// Clock is the engine's SINGLE time source. It is read for two things:
+//
+//   - compiled-rule cache TTL expiry (this file), and
+//   - the per-decision reference instant a rule's date comparisons resolve
+//     against (now.go).
+//
+// One clock rather than two is deliberate. An engine holding two independent
+// ideas of "now" can have them disagree — a cache entry expiring against one
+// instant while a date rule decides against another — and that is a worse failure
+// than the coupling it would avoid. The coupling's visible cost is that a test
+// pinning the clock for a month-end date fixture also freezes cache expiry; see
+// WithClock.
+//
+// It is injected so tests drive both behaviours deterministically instead of
+// sleeping; production uses the real clock.
 type Clock interface {
 	Now() time.Time
 }
@@ -31,15 +44,29 @@ type CacheStats struct {
 // injected clock) bounds entry lifetime; TTL <= 0 keeps entries until explicitly
 // invalidated. The cache is the NFR lever that keeps per-Check rule cost bounded:
 // the expensive expr-lang compile happens once per canonical form.
+//
+// mu guards the entries map only. The counters are atomics, so the hot path — a
+// hash that is present and unexpired — takes the READ lock and nothing else.
+// They used to be plain fields guarded by mu, which meant a cache HIT had to
+// acquire the WRITE lock purely to bump a number: every concurrent rule
+// evaluation serialised on that bump even though none of them touched the map.
+// That was tolerable while a decision meant one rule evaluation, but a
+// rule-backed Enumerate evaluates the rule once per candidate (twice, in fact —
+// once to gather the grant's members and once in the per-candidate decision), so
+// the contention multiplies by the candidate count.
+//
+// The counters' meaning is unchanged: hits counts every get that returned a
+// live entry, misses every get that did not, evictions every entry dropped for
+// expiry or invalidation. Only the synchronisation changed.
 type compiledCache struct {
 	mu      sync.RWMutex
 	ttl     time.Duration
 	clock   Clock
 	entries map[string]cacheEntry
 
-	hits      uint64
-	misses    uint64
-	evictions uint64
+	hits      atomic.Uint64
+	misses    atomic.Uint64
+	evictions atomic.Uint64
 }
 
 type cacheEntry struct {
@@ -60,14 +87,16 @@ func newCompiledCache(ttl time.Duration, clock Clock) *compiledCache {
 
 // get returns the cached program for hash when present and unexpired. An expired
 // entry is dropped and counted as a miss (and an eviction).
+//
+// The hit path holds only the read lock; the counter bump is atomic. The write
+// lock is taken solely when the map may have to change (an expired entry to
+// delete) or when a second look is needed because the first read found nothing.
 func (c *compiledCache) get(hash string) (*Compiled, bool) {
 	c.mu.RLock()
 	e, ok := c.entries[hash]
 	c.mu.RUnlock()
 	if ok && !c.expired(e) {
-		c.mu.Lock()
-		c.hits++
-		c.mu.Unlock()
+		c.hits.Add(1)
 		return e.compiled, true
 	}
 	c.mu.Lock()
@@ -75,13 +104,13 @@ func (c *compiledCache) get(hash string) (*Compiled, bool) {
 	// Re-read under the write lock: another goroutine may have refreshed it.
 	if e, ok := c.entries[hash]; ok {
 		if !c.expired(e) {
-			c.hits++
+			c.hits.Add(1)
 			return e.compiled, true
 		}
 		delete(c.entries, hash)
-		c.evictions++
+		c.evictions.Add(1)
 	}
-	c.misses++
+	c.misses.Add(1)
 	return nil, false
 }
 
@@ -110,7 +139,7 @@ func (c *compiledCache) invalidate(hash string) bool {
 	defer c.mu.Unlock()
 	if _, ok := c.entries[hash]; ok {
 		delete(c.entries, hash)
-		c.evictions++
+		c.evictions.Add(1)
 		return true
 	}
 	return false
@@ -120,17 +149,23 @@ func (c *compiledCache) invalidate(hash string) bool {
 func (c *compiledCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.evictions += uint64(len(c.entries))
+	c.evictions.Add(uint64(len(c.entries)))
 	c.entries = make(map[string]cacheEntry)
 }
 
+// stats samples the counters and the entry count. Each counter is read
+// atomically; the four values are not a single instant's snapshot, because
+// taking one would mean re-serialising the hit path on a lock that exists only
+// for observability. Callers use it for observability and for sequential tests,
+// where it is exact.
 func (c *compiledCache) stats() CacheStats {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	entries := len(c.entries)
+	c.mu.RUnlock()
 	return CacheStats{
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Evictions: c.evictions,
-		Entries:   len(c.entries),
+		Hits:      c.hits.Load(),
+		Misses:    c.misses.Load(),
+		Evictions: c.evictions.Load(),
+		Entries:   entries,
 	}
 }

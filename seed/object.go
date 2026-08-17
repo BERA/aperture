@@ -63,7 +63,9 @@ type objectGroup struct {
 // malformed declaration fails the load whether or not its type is ultimately
 // discarded in favour of a providers: entry. Validation that depended on wiring
 // would mean a document silently stopped being checked the day someone added a
-// CSV for one of its types.
+// CSV for one of its types. The field_types: declarations are applied in that
+// same first pass, for the same reason: a declared date is validated and
+// canonicalised even for a type whose entries lose to a providers: entry.
 //
 // Precedence is TYPE-LEVEL and total: a type already served by the providers:
 // section keeps that file-backed provider, and every inline entry for that type
@@ -74,8 +76,8 @@ type objectGroup struct {
 // was added. StrictProviderCollision makes the collision fatal for hosts that
 // would rather read it as an authoring mistake, and ProviderCollisions lets any
 // host report the discard.
-func (d *Document) registerObjects(reg *provider.Registry, cfg buildConfig) error {
-	groups, err := d.groupObjects()
+func (d *Document) registerObjects(reg *provider.Registry, cfg buildConfig, declared map[string]map[string]string) error {
+	groups, err := d.groupObjects(declared)
 	if err != nil {
 		return err
 	}
@@ -190,7 +192,12 @@ func (d *Document) ProviderCollisions() []string {
 // Ids are deduplicated across the WHOLE section, not per type: two entries with
 // the same id are the same object declared twice however they are spelled, and
 // the second would silently shadow the first.
-func (d *Document) groupObjects() ([]objectGroup, error) {
+//
+// declared is the validated field_types: index (object-type -> field -> type),
+// nil when the document declares none. It is applied AFTER the value model has
+// accepted the metadata, because a declared date is a string scalar either way:
+// the declaration narrows which strings are legal, it never widens the model.
+func (d *Document) groupObjects(declared map[string]map[string]string) ([]objectGroup, error) {
 	if len(d.Objects) == 0 {
 		return nil, nil
 	}
@@ -218,6 +225,9 @@ func (d *Document) groupObjects() ([]objectGroup, error) {
 			return nil, err
 		}
 		typ := terminalType(id)
+		if err := applyFieldTypes(key, typ, md, declared[typ]); err != nil {
+			return nil, err
+		}
 		slot, ok := index[typ]
 		if !ok {
 			slot = len(groups)

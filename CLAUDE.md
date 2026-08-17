@@ -77,11 +77,22 @@ non-skippable CI failure. The rule itself is documented in
 | A `skills/*.md` doc | its YAML frontmatter (`name` matching the file stem + `description`) | `TestEverySkillHasFrontmatter` |
 | The Update-Demand rule | `skills/update-demand.md` (must remain present with frontmatter) | `TestUpdateDemandDocPresent` |
 | A rule operator (`Op*` / `opSpecs` in `rules/ast.go`) | `OP_SPECS` in `internal/server/static/js/rules-serializer.js`, the palette in `rules.js`, and `skills/rules-engine.md` | `TestEditorOperatorTablesAgree`, `TestEditorASTContractCoversEveryOperator` |
+| A right-operand shape (`rightShape` in `rules/ast.go`) | `RIGHT` in `rules-serializer.js` **and** `jsShapeNames` + `editorJSONForOp` in `rules/editor_js_contract_test.go` | `TestEditorOperatorTablesAgree`, `TestEditorASTContractCoversEveryOperator` |
 | A collection operator's shape expectation (`collOps` in `rules/shape.go`) | the matching `opSpecs` entry in `rules/ast.go` | `TestCollectionOperatorTablesAgree` |
+| A date operator's runtime policy (`dateOps` in `rules/date.go`) | the matching `opSpecs` entry in `rules/ast.go`, and the deny-safe policy in `skills/rules-engine.md` | `TestDateOperatorTablesAgree` |
+| The date-operator SET (an `opSpecs` entry gaining or losing `kind: renderDate`) | `DATE_OPS` in `rules-serializer.js` (it cannot live on an `OP_SPECS` entry — the Go scanner requires the literal `{ right: RIGHT.X }` form) and the serializer section of `skills/ui-shell.md` | `TestEditorOperatorTablesAgree` |
+| What `rules.Clock` drives (`rules/engine.go` `WithClock`, `rules/now.go`) | the `WithClock` doc comment and "The clock, and one `NOW` per decision" in `skills/rules-engine.md` | reviewed; no registry gate |
+| A `rules.NoteKind` (`rules/notes.go`) | its `Note.String()` case and the note-kind list in `skills/rules-engine.md` | reviewed; no registry gate |
 | A callable rule function (`defaultFunctions` in `rules/compiler.go`) or a blocked builtin (`blockedCallNames`) | `FUNCTIONS` / `BLOCKED_CALLS` in `rules-serializer.js` | `TestEditorVocabularyTablesAgree` |
 | An AST node type, variable root, or var-path grammar | `TYPES` / `ROOTS` / `VAR_PATH` in `rules-serializer.js` | `TestEditorVocabularyTablesAgree` |
+| A relative-date vocabulary (`relativeAnchors` / `relativeUnits` / `relativeSnaps` in `rules/relative.go`) | `ANCHORS` / `UNITS` / `SNAPS` in `rules-serializer.js`, the four controls in `rules.js`, and "Relative dates" in `skills/rules-engine.md` | `TestEditorVocabularyTablesAgree` |
+| The relative-date node's JSON shape or field validation (`Node.Anchor/Offset/Unit/Snap`, `validateRelativeDate`) | the node's validator + `NODE_SPECS` entry in `rules-serializer.js` and "Relative dates" in `skills/rules-engine.md` | `TestEditorValidationMessagesAgree`, `TestEditorASTContract` |
+| The relative-date resolution semantics (`rules/calendar.go`: month-end clamping, the snap-then-offset order, `endOf*` precision, ISO-Monday weeks, the representable range) | "UTC, clamping, and the order of operations" in `skills/rules-engine.md` | reviewed; no registry gate — behaviour by `rules/calendar_test.go`, including a source scan that forbids `AddDate` / `time.Local` in `rules/` |
 | The metadata value model (`provider/metadata.go`: legal shapes, depth cap, size cap) | `skills/metadata-values.md` and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/metadata_test.go` |
-| A loader's spelling of the value model (CSV column suffix, seed `objects:`) | `skills/metadata-values.md` ("How each loader spells the model") | reviewed; no registry gate |
+| The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | `skills/metadata-values.md` ("Dates") and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/date_test.go` |
+| A loader's spelling of the value model (a CSV column suffix — `:int`, `:list<T>`, `:json`, `:date`, `:datetime` — or a seed key such as `objects:` / `field_types:`) | `skills/metadata-values.md` ("How each loader spells the model"), the loader's package doc, `docs/src/concepts/providers.md`, and `docs/src/concepts/seed.md` for a seed key | reviewed; no registry gate |
+| How the rule editor displays a date (anything in `internal/server/static/js/rules.js` or `rules-serializer.js` that renders a stored date, a resolved bound, or the reference instant) | "Reading a saved rule back" + "The date diagnostics" in `skills/ui-shell.md` | `TestRuleEditorNeverFormatsADateThroughADateObject` — scans the served JS and fails on `new Date` / `toLocale*String` / `Intl.DateTimeFormat` and friends |
+| The rule what-if preview's response fields (`EvaluateRuleResponse` in `service.proto`, `service.RulePreview`) | `skills/ui-shell.md` ("The date diagnostics"), `skills/api-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/library/service-facade.md` — **and `make proto`** | reviewed; no registry gate |
 
 The Go↔JS rows matter more than they look: **CI is node-free**, so
 `rules-serializer.test.js` never runs in the pipeline.
@@ -113,6 +124,12 @@ audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage gate in
   byte-stable AST JSON case, so coverage cannot fall behind the registry.
 - `TestCollectionOperatorTablesAgree` — `collOps` (`rules/shape.go`) stays in
   lockstep with `opSpecs` (`rules/ast.go`).
+- `TestDateOperatorTablesAgree` — `dateOps` (`rules/date.go`) stays in lockstep
+  with `opSpecs` (`rules/ast.go`), membership and ternary arity alike.
+- `TestRuleEditorNeverFormatsADateThroughADateObject` — the rule editor's served
+  JS (`rules.js`, `rules-serializer.js`) constructs no JS `Date` and calls no
+  locale date formatter, so a stored UTC date is never restated in the viewer's
+  zone. Comments are stripped first, so documenting the hazard is still allowed.
 
 Gated, NOT in `make test` (a loaded runner would flake them):
 

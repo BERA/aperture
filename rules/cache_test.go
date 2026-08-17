@@ -1,8 +1,12 @@
 package rules
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/frankbardon/aperture/identity"
 )
 
 // fakeClock is a manually advanced clock so TTL expiry is exercised without
@@ -154,5 +158,80 @@ func TestCacheConcurrent(t *testing.T) {
 	}
 	if st := eng.CacheStats(); st.Entries != 1 {
 		t.Fatalf("concurrent compiles of one rule must yield a single entry; stats = %+v", st)
+	}
+}
+
+// TestCacheHitCountIsExactUnderConcurrency is what makes the atomic counters
+// CORRECT rather than merely faster.
+//
+// The hit path no longer takes the write lock to bump its counter, so nothing in
+// the mutex discipline serialises two concurrent hits any more — a non-atomic
+// increment would lose updates, and would lose them silently: every decision
+// would still be right, only the observability number would drift. Run it with
+// -race and the count is also the race detector's target.
+//
+// The arithmetic is exact by construction, not approximate:
+//
+//   - the cache is warmed FIRST, so exactly one miss is recorded and every
+//     subsequent get finds a live entry;
+//   - no TTL is configured, so nothing can expire mid-run and turn a hit into a
+//     miss + eviction;
+//   - each Selected performs exactly one cache get (Engine.compile), so the
+//     final hit count must be goroutines x perGoroutine on the nose.
+func TestCacheHitCountIsExactUnderConcurrency(t *testing.T) {
+	const (
+		goroutines   = 32
+		perGoroutine = 100
+	)
+	eng := newTestEngine()
+	ctx := context.Background()
+	object := identity.MustParse("account:acme/document:1")
+
+	// Warm: the single compile that populates the entry, so the concurrent phase
+	// below is all hits and the miss count is pinned at one.
+	if _, err := eng.Selected(ctx, "public", object, "alice", "read"); err != nil {
+		t.Fatalf("warm Selected: %v", err)
+	}
+	if st := eng.CacheStats(); st.Hits != 0 || st.Misses != 1 {
+		t.Fatalf("after warming, stats = %+v, want hits=0 misses=1", st)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	start := make(chan struct{})
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release everyone at once, so the bumps genuinely overlap
+			for i := 0; i < perGoroutine; i++ {
+				if _, err := eng.Selected(ctx, "public", object, "alice", "read"); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Selected: %v", err)
+	}
+
+	st := eng.CacheStats()
+	const wantHits = goroutines * perGoroutine
+	if st.Hits != wantHits {
+		t.Errorf("hits = %d, want exactly %d (one per evaluation); a lost update means "+
+			"the counter increment is not atomic", st.Hits, wantHits)
+	}
+	if st.Misses != 1 {
+		t.Errorf("misses = %d, want 1 (only the warming compile); stats = %+v", st.Misses, st)
+	}
+	if st.Evictions != 0 {
+		t.Errorf("evictions = %d, want 0 (no TTL is configured); stats = %+v", st.Evictions, st)
+	}
+	if st.Entries != 1 {
+		t.Errorf("entries = %d, want 1; stats = %+v", st.Entries, st)
 	}
 }

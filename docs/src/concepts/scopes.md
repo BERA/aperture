@@ -117,10 +117,17 @@ must list the type, so it depends on the `ObjectLister`.
 misconfiguration. `Contains` first requires the pattern match, then: the object's
 canonical id is in the list (exact string equality), or — only when a rule is
 declared — the `RuleEvaluator` selects it. A pure list-backed grant never touches
-the rule dependency. `Members` on the list path needs no lister (the members are
-the listed ids within both patterns); a rule-only inclusive grant cannot
-enumerate without the evaluator's reverse index and reports
-`APERTURE_SCOPE_RULE_UNCONFIGURED`.
+the rule dependency. `Members` returns the **union** of the two halves, with both
+patterns applied to each and no identity repeated — it has to, or `Check` and
+`Enumerate` would disagree about the same grant. The list half needs no lister
+(the members are the listed ids within both patterns). The rule half is
+list-then-filter, exactly as exclusive does it: list the type through the
+`ObjectLister` and keep what `Contains` selects. There is no reverse index and no
+attempt to invert the rule — a rule is an arbitrary expression over object
+metadata and is not invertible in general. A rule-backed grant enumerated with no
+`ObjectLister` therefore reports `APERTURE_SCOPE_LISTER_UNCONFIGURED` rather than
+returning nothing, because an empty member list is a legitimate answer; with no
+`RuleEvaluator` it reports `APERTURE_SCOPE_RULE_UNCONFIGURED`.
 
 **exclusive** — an opt-out. It requires a minus id-list or a rule (declaring
 neither would make it identical to implicit). `Contains` requires the pattern
@@ -159,7 +166,7 @@ ok, _ := resolver.Contains(ctx, identity.MustParse("account:acme/document:42"))
 
 ## Where this leads
 
-The `ObjectLister` that implicit and exclusive enumeration depend on is the
+The `ObjectLister` that every non-list-backed enumeration depends on is the
 [provider Registry](providers.md); the `RuleEvaluator` the rule-backed paths
 consult is the [rules Engine](rules.md). For how the decision engine assembles
 grants, resolvers, and specificity into a verdict, see the

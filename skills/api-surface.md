@@ -76,6 +76,14 @@ Full surface:
   metadata snapshot. No account/principal/grant is involved — the rule reads only
   `object.*` — so the rule builder can sample an object (via `ObjectIdentifiers`)
   and show whether the rule selects it. Requires an authenticated principal.
+  `EvaluateRulePreview` is the same evaluation returning the diagnostics too —
+  the reference instant, what each relative-date operand resolved to at it, and
+  the evaluation's deny-safe notes (`RulePreview`); `EvaluateRule` is its narrow
+  projection. **This path supplies the reference instant itself** (from the
+  facade clock, `WithClock`) because it compiles the AST directly rather than
+  going through the decision engine's `rules.WithDecisionInstant` scope: without
+  it every relative date resolves to nothing and the preview denies a rule that
+  a real `Check` allows.
 - **Delegation**: `Bestow`, `Revoke`.
 - **Impersonation**: `ImpersonationStart`, `ImpersonationStop`.
 - **Provisioning (E5-S1)**: `Put/Get/List/Delete` for `Template` (named,

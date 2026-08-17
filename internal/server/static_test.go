@@ -238,3 +238,107 @@ func TestStaticDoesNotShadowAPI(t *testing.T) {
 		t.Errorf("GET missing asset: status = %d, want 404", nf.StatusCode)
 	}
 }
+
+// dateConstructors are the JavaScript spellings that turn a stored date string
+// into a value in the VIEWER'S timezone. Each is listed with what it would do to
+// a stored 2026-01-01T00:00:00Z read in UTC-5.
+var dateConstructors = []struct {
+	token string
+	why   string
+}{
+	{"new Date", "constructs a local-zone Date; every formatter below then reads it in the viewer's offset"},
+	{"Date.parse", "parses to an epoch, discarding the fact that the source text was already canonical"},
+	{"Date.UTC", "builds an epoch from parts, which only a Date can then render"},
+	{"toLocaleString", "renders 2026-01-01T00:00:00Z as 12/31/2025, 7:00:00 PM — a different calendar YEAR"},
+	{"toLocaleDateString", "renders 2026-01-01T00:00:00Z as 12/31/2025 — a different calendar year"},
+	{"toLocaleTimeString", "renders 00:00:00Z as 19:00:00 — a different day"},
+	{"toDateString", "a Date rendering, so it is a local-zone rendering"},
+	{"toTimeString", "a Date rendering, so it is a local-zone rendering"},
+	{"Intl.DateTimeFormat", "formats through a Date and a locale, which is the same hazard with more ceremony"},
+	{"getFullYear", "reads the LOCAL calendar year off a Date"},
+	{"getMonth", "reads the LOCAL calendar month off a Date"},
+	{"getDate", "reads the LOCAL calendar day off a Date"},
+}
+
+// TestRuleEditorNeverFormatsADateThroughADateObject is the display half of the
+// rule editor's date contract, enforced the only way a node-free pipeline can
+// enforce it: by scanning the SERVED source.
+//
+// The rule it guards. Aperture is UTC end to end, and the two canonical forms
+// (2006-01-02 and 2006-01-02T15:04:05Z) are already unambiguous, so the editor
+// renders a stored date string VERBATIM — Z included — and never reformats it.
+// The moment a stored date goes through a JS Date it is restated in the viewer's
+// offset: a viewer in UTC-5 reads a stored 2026-01-01T00:00:00Z as
+// "12/31/2025, 7:00:00 PM", a different calendar YEAR from the one the rule
+// compares against. The data is right, the arithmetic is right, and the screen is
+// wrong — which is the worst of the three, because nothing looks broken.
+//
+// The same reasoning bans the resolved relative-date bound and the decision
+// instant from being prettified: both arrive from the server already canonical.
+//
+// Scope. Only the rule editor's two files are scanned. js/audit.js legitimately
+// renders event timestamps through toLocaleString — an audit trail is read in
+// the operator's own zone, and it is not comparing anything. This test is about
+// the surface where a displayed date must equal the date a decision uses.
+//
+// A grep-level guard is the right instrument here: CI is node-free, so there is
+// no runtime in which to assert the rendering, and the property being protected
+// is genuinely syntactic — the hazard is the CALL, not its result.
+func TestRuleEditorNeverFormatsADateThroughADateObject(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	for _, path := range []string{"/js/rules.js", "/js/rules-serializer.js"} {
+		t.Run(path, func(t *testing.T) {
+			res, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", path, err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("GET %s: status = %d, want 200", path, res.StatusCode)
+			}
+			// Comments are stripped first: both files DOCUMENT the hazard by
+			// naming toLocaleString, and a guard that fired on the warning
+			// against the thing it guards would be worse than no guard —
+			// whoever hit it would delete the explanation to get green.
+			src := stripJSLineComments(readAll(t, res))
+			for _, bad := range dateConstructors {
+				if strings.Contains(src, bad.token) {
+					t.Errorf("%s calls %s — the rule editor renders stored dates verbatim, `Z` included (%s)",
+						path, bad.token, bad.why)
+				}
+			}
+		})
+	}
+}
+
+// stripJSLineComments removes // line comments and /* block comments */ so the
+// scan reads code only. It is deliberately naive — it does not track string
+// literals — which is safe in ONE direction: a "//" inside a string could hide
+// code from the scan, but the rule-editor files contain no such literal, and the
+// failure mode of a miss is a lost warning rather than a false alarm that
+// pressures someone into deleting a comment.
+func stripJSLineComments(src string) string {
+	var b strings.Builder
+	for i := 0; i < len(src); {
+		if strings.HasPrefix(src[i:], "/*") {
+			end := strings.Index(src[i+2:], "*/")
+			if end < 0 {
+				break
+			}
+			i += 2 + end + 2
+			continue
+		}
+		if strings.HasPrefix(src[i:], "//") {
+			end := strings.IndexByte(src[i:], '\n')
+			if end < 0 {
+				break
+			}
+			i += end
+			continue
+		}
+		b.WriteByte(src[i])
+		i++
+	}
+	return b.String()
+}

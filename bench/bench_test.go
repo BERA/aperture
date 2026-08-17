@@ -199,7 +199,7 @@ func TestCheckNFR(t *testing.T) {
 			m := buildModel(t)
 			svc, closeFn := newService(t, m, withAudit)
 			defer closeFn()
-			assertCheckNFR(t, svc, toQuery(m.req), name, fullSamples)
+			assertCheckNFR(t, svc, toQuery(m.req), name, true, fullSamples)
 		})
 	}
 }
@@ -212,9 +212,9 @@ const (
 )
 
 // nfrSamples is how many Checks a gate run measures over. The thresholds above
-// are rates and are unaffected by the sample count, so the collection variants
-// can use a smaller sample without weakening the assertion — they only need it
-// because the gate multiplies out over ten variant/audit combinations and the
+// are rates and are unaffected by the sample count, so the per-variant gate can
+// use a smaller sample without weakening the assertion — it only needs it because
+// the gate multiplies out over every rule variant times the audit axis, and the
 // cap-sized array is an order of magnitude slower per Check.
 type nfrSamples struct{ p99, throughput int }
 
@@ -226,9 +226,15 @@ var (
 // assertCheckNFR is the hard gate's body: warm the query, assert p99 < 1ms over
 // n.p99 cached Checks, then assert sustained single-goroutine throughput clears
 // the floor. label names the case in the failure and log lines.
-func assertCheckNFR(t *testing.T, svc *service.Service, q service.Query, label string, n nfrSamples) {
+//
+// wantAllow is the verdict the warm-up asserts. It is a parameter rather than a
+// constant true because the gate covers a case that DENIES by design (the
+// malformed-date variant): a deny is a different branch through the comparison,
+// not an excuse to leave it unmeasured, and stating the expected verdict per case
+// is what keeps a fixture that silently stops deciding from passing anyway.
+func assertCheckNFR(t *testing.T, svc *service.Service, q service.Query, label string, wantAllow bool, n nfrSamples) {
 	t.Helper()
-	warm(t, svc, q, true)
+	warm(t, svc, q, wantAllow)
 	ctx := context.Background()
 
 	p99 := measureP99(ctx, svc, q, n.p99)

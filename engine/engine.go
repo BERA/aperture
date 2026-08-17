@@ -47,6 +47,7 @@ import (
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/scope"
 )
 
@@ -505,6 +506,12 @@ func (e *Engine) Check(ctx context.Context, req Request) (Decision, error) {
 // "never returns a denied object" guarantee in Enumerate is the exact same
 // decision the hot path makes.
 func (e *Engine) evaluate(ctx context.Context, req Request, object identity.Identity, grants []model.Grant, permCache map[string]*model.Permission) (Decision, error) {
+	// One reference instant for the whole decision, whatever a rule-backed scope
+	// resolver asks for later. The call is idempotent, so an Enumerate that
+	// already opened a scope for the enumeration keeps ITS instant across every
+	// per-candidate decision rather than taking a fresh one each time.
+	ctx, _ = rules.WithDecisionInstant(ctx)
+
 	candidates := make([]candidate, 0, len(grants))
 	for _, g := range grants {
 		ok, err := e.actionMatches(ctx, g, req.Action, permCache)

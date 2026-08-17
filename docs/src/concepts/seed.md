@@ -23,12 +23,13 @@ templates:     [ ... ]
 rules:         [ ... ]
 providers:     [ ... ]   # runtime wiring, not model state (see below)
 objects:       [ ... ]   # inline object metadata — also wiring, not model state
+field_types:   [ ... ]   # declared types for inline metadata fields — also wiring
 ```
 
 Every field mirrors its `model` counterpart in declarative form. The `Document`
 started as a minimal seed shape and was generalized to the complete model, so **an
 export file is a strict superset of a seed file**: a seed that omits
-`templates`/`rules`/`providers`/`objects` loads unchanged, and a full export
+`templates`/`rules`/`providers`/`objects`/`field_types` loads unchanged, and a full export
 reloads through the very same path. The field set is additive-only, so old seeds
 keep loading.
 
@@ -143,6 +144,85 @@ id is `APERTURE_IDENTITY_INVALID`. Ids are deduplicated across the **whole**
 section, not per type — the same id declared twice is the same object declared
 twice, however it is spelled.
 
+### Declared field types
+
+A CSV header can say `hired_at:date`; a YAML mapping has nowhere to put that, so
+`hired_at: 2026-02-30` in an `objects:` entry loads happily as an ordinary string
+and only shows up months later as a rule that silently never matches. The
+optional `field_types:` section is the missing declaration:
+
+```yaml
+field_types:
+  - object_type: brand
+    fields:
+      hired_at: date
+      last_seen: datetime
+
+objects:
+  - id: account:acme/brand:1
+    metadata:
+      hired_at: "2026-03-04"
+      last_seen: "2026-03-04T12:30:00Z"
+```
+
+Each entry names an `object_type` — matched against the identity's terminal
+segment, exactly as `providers:` is — and maps field names to a type. The
+vocabulary is exactly two words, `date` and `datetime`, **lower-case and exact**:
+the CSV loader's column-suffix spelling with the colon removed, so the same two
+words mean the same two things in both loaders. `timestamp`, `Date`, and `time`
+are `APERTURE_CONFIG_INVALID`, never a silently ignored declaration. Each object
+type may be declared at most once.
+
+> **Quote date values in YAML.** YAML resolves an *unquoted* calendar day as a
+> `!!timestamp`, and the loader's YAML path normalises through JSON, so
+> `hired_at: 2026-03-04` arrives already widened to `2026-03-04T00:00:00Z` and a
+> field declared `date` rejects it. The widening happens inside the YAML decoder,
+> before the seed package sees the document, so it cannot be undone — the
+> rejection names the fix when the instant is exactly midnight. A JSON seed has
+> no such trap, and the two formats agree on every quoted value.
+
+Declared values are validated and canonicalised **at `BuildRegistry` time**,
+through the same [`provider.ParseDateValue`](providers.md#dates-are-string-scalars-in-two-canonical-forms)
+the CSV loader uses — this document never re-implements what a date is. The
+**canonical** text is what is stored, so `2026-03-04T01:02:03.456Z` and
+`2026-03-04T01:02:03` both become `2026-03-04T01:02:03Z` and two objects naming
+one instant hold one string, which is what makes a `Filter.Fields` equality
+predicate over the field mean anything. The declared type also **fixes the
+granularity**: a `date` field rejects a timestamp and a `datetime` field rejects
+a bare day, rather than quietly widening the day to midnight.
+
+Four properties are worth stating because each is the first question a reader
+asks:
+
+- **A declared field is not a required field.** The section declares a *type*,
+  not a requirement: an object that omits the field is perfectly valid. An
+  explicitly **empty** value omits the field rather than storing `""` — the same
+  rule an empty CSV cell follows, because an absent date differs meaningfully
+  from any date and a zero time would silently satisfy every `before` rule ever
+  written against the field.
+- **Declaring a type for an object type with no `objects:` entries is legal.**
+  The entries may be arriving, or the type may be served by a `providers:` entry.
+  It registers nothing on its own; the declaration itself is still validated, so
+  a typo fails the build rather than waiting for an entry to expose it.
+- **It applies to `objects:` only, never to provider-loaded rows.** A `providers:`
+  entry carries its own typing (the CSV `:date` / `:datetime` suffix). One type
+  declaration living in two places could disagree with itself, which is exactly
+  what this document's derive-the-type-from-the-identity rule avoids elsewhere.
+- **It is not a general metadata schema.** No `required:`, no `default:`, no
+  `enum:`, no `pattern:`, no `int`/`float`/`bool`, no nested field paths. The
+  [value model](providers.md#the-metadata-value-model) already governs shape,
+  depth, and size; the one thing it cannot govern is which strings a host means
+  as dates, because nothing in a string says so.
+
+A rejection is `APERTURE_CONFIG_INVALID` naming the **object id and the field**
+and carrying the `provider.DateReason` for a parse failure (a granularity
+mismatch is not a parse failure and carries no `reason`, so `DateReasonOf`
+correctly reports none). It **never carries the value** — a date is frequently
+personal data, and an error is a thing that gets logged.
+
+Like `providers:` and `objects:`, this is runtime **wiring**: `Apply` writes no
+row for it and an export never reproduces it.
+
 ### When both sections claim a type
 
 `providers:` and `objects:` can each claim the same object type. **Precedence is
@@ -201,10 +281,13 @@ declaration of what exists, and the choice to make an ambiguous one fatal sits i
 code, where a reviewer sees it.
 
 **Validation is independent of precedence.** Every inline entry is checked —
-`id`, identity, duplicates, the value model — *before* any type is discarded, so
-a malformed declaration fails the load whether or not its type ultimately loses
-to a `providers:` entry. Otherwise a document would silently stop being validated
-the day someone added a CSV for one of its types.
+`id`, identity, duplicates, the value model, and its
+[declared field types](#declared-field-types) — *before* any type is discarded,
+so a malformed declaration fails the load whether or not its type ultimately
+loses to a `providers:` entry. Otherwise a document would silently stop being
+validated the day someone added a CSV for one of its types. The canonicalised
+values are then discarded along with the rest of those entries: a `field_types:`
+declaration never reaches the rows the file-backed provider serves.
 
 Two `providers:` entries for one type remain a duplicate registration,
 `APERTURE_PROVIDER_INVALID` — that is a straight contradiction with no winner to
@@ -217,15 +300,16 @@ Two things are deliberately excluded from the model state file:
 - **Live host domain-object metadata** — that is the [provider](providers.md)
   cache: derived, disposable, never source of truth. Because `Export` reads storage
   back, and a provider produces no model rows, it is never reproduced.
-- **Runtime *wiring*** — the `providers:` and `objects:` sections are runtime
-  wiring, not model state. `Apply` never writes either to storage; instead
-  `Document.BuildRegistry(baseDir)` turns both into a live `*provider.Registry`.
-  **The seed file is the source of truth for both**, exactly as auth config is —
-  and exactly as for `providers:`, an export never reproduces `objects:`. A
-  declared provider names an `object_type`, a `kind` (currently only `csv`), a
-  `path` (resolved relative to the seed file), and optional cache `ttl`/`max_size`.
-  A malformed entry is `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
-  When both sections claim one type, `providers:` wins the type outright — see
+- **Runtime *wiring*** — the `providers:`, `objects:`, and `field_types:`
+  sections are runtime wiring, not model state. `Apply` never writes any of them
+  to storage; instead `Document.BuildRegistry(baseDir)` turns all three into a
+  live `*provider.Registry`. **The seed file is the source of truth for them**,
+  exactly as auth config is — and an export reproduces none of them. A declared
+  provider names an `object_type`, a `kind` (currently only `csv`), a `path`
+  (resolved relative to the seed file), and optional cache `ttl`/`max_size`. A
+  malformed entry is `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
+  When `providers:` and `objects:` claim one type, `providers:` wins the type
+  outright — see
   [When both sections claim a type](#when-both-sections-claim-a-type).
 
 ## Related

@@ -69,6 +69,10 @@ type Engine struct {
 	principal PrincipalResolver
 	compiler  *Compiler
 	cache     *compiledCache
+	// clock is the engine's single time source: the compiled-rule cache expires
+	// entries against it AND every decision takes its reference instant from it.
+	// See Clock and WithClock.
+	clock Clock
 }
 
 // Option configures an Engine.
@@ -93,8 +97,21 @@ func WithCacheTTL(ttl time.Duration) Option {
 	return func(c *engineConfig) { c.ttl = ttl }
 }
 
-// WithClock injects the clock the cache TTL reads, so tests drive expiry without
-// sleeping. Defaults to the real clock.
+// WithClock injects the engine's SINGLE time source. Defaults to the real clock.
+//
+// It drives BOTH of the engine's time-dependent behaviours:
+//
+//   - compiled-rule cache TTL expiry (WithCacheTTL), and
+//   - the per-decision reference instant rule date comparisons resolve against
+//     (now.go), snapshotted once per decision and always converted to UTC.
+//
+// The second of those is the wider promise: an injected clock now decides what
+// "now" MEANS to a rule, not merely when a cached program is dropped. Pinning the
+// clock is therefore how a date rule is tested reproducibly — and, as the flip
+// side of one time source, a pinned clock also FREEZES cache expiry, so a TTL'd
+// entry under a clock that never advances never expires. That coupling is
+// intended: two independent clocks inside one engine can disagree, which is worse
+// than the coupling (see Clock).
 func WithClock(clk Clock) Option {
 	return func(c *engineConfig) { c.clock = clk }
 }
@@ -118,12 +135,19 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 	if cfg.principal != nil {
 		principal = cfg.principal
 	}
+	// One clock, resolved once here and shared: the cache and the decision
+	// instant must never be able to read different sources.
+	var clock Clock = realClock{}
+	if cfg.clock != nil {
+		clock = cfg.clock
+	}
 	return &Engine{
 		source:    source,
 		fetcher:   fetcher,
 		principal: principal,
 		compiler:  NewCompiler(cfg.compilerOpts...),
-		cache:     newCompiledCache(cfg.ttl, cfg.clock),
+		cache:     newCompiledCache(cfg.ttl, clock),
+		clock:     clock,
 	}
 }
 
@@ -133,9 +157,9 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 // covers an object Selected reports true for, an exclusive grant excludes one.
 //
 // The flow is: resolve the rule reference, compile-and-cache its AST, fetch the
-// object's metadata, build the context, and evaluate. Any failure is an
-// APERTURE_* coded error and the resolver treats it as a non-decision — there is
-// no select-on-error.
+// object's metadata, build the context (including the decision's reference
+// instant), and evaluate. Any failure is an APERTURE_* coded error and the
+// resolver treats it as a non-decision — there is no select-on-error.
 func (e *Engine) Selected(ctx context.Context, rule string, object identity.Identity, principal, action string) (bool, error) {
 	r, err := e.source.Lookup(ctx, rule)
 	if err != nil {
@@ -162,6 +186,13 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 		Principal: principalAttrs,
 		Account:   map[string]any{},
 		Action:    action,
+		// The reference instant, read from the engine's one clock. Under a
+		// decision scope (the decision engine opens one per Check / Enumerate /
+		// Explain) every evaluation in that decision shares the first instant
+		// taken; unscoped, this evaluation takes its own. Either way it is read
+		// ONCE here and threaded as data, so a rule referring to it twice cannot
+		// straddle a tick. See now.go.
+		Now: decisionInstantFrom(ctx).snapshot(e.clock),
 	}
 
 	// Fast path: no collector installed (Check, Enumerate), so evaluation records

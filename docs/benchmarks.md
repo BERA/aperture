@@ -48,7 +48,7 @@ measured on exactly the subject set and candidate grants it was measured on
 before. (Attaching them to `role0` instead moved that baseline by +5 allocs/op
 and +2 KB/op — a fixture that changes the number it is the control for.)
 
-All five variants check the **same object**, so the provider fetch and its cache
+Every variant checks the **same object**, so the provider fetch and its cache
 hit are byte-identical across them and the measured delta is purely the rule:
 
 | Variant | Rule | Renders to |
@@ -58,6 +58,47 @@ hit are byte-identical across them and the measured delta is purely the rule:
 | `rule-nested` | `object.owner.dept == "platform"` | E2-S2 **optional chaining**: `object?.owner?.dept` |
 | `rule-tags-typical` | `object.tags hasAny [...]` over 12 tags | E5-S1 **guarded dispatcher** `$op("hasAny", …)` — the collection operand is a *variable* |
 | `rule-tags-at-cap` | the same over **7 281** tags | the same guarded dispatcher |
+
+#### The date extension
+
+Date comparisons add a second kind of per-evaluation work: both operands are
+canonical **strings** and both are **parsed to instants on every evaluation**,
+because comparing the text is wrong across granularities. A relative bound adds
+calendar arithmetic on top, and then formats a canonical string the comparison
+immediately re-parses. Eight more variants cover it, all against the same object
+and all inside the asserted gate:
+
+| Variant | Rule | What it is here for |
+|---|---|---|
+| `rule-date-compare` | `object.hired_at before "2026-12-31T23:59:59Z"` | the binary literal comparison — 2 parses |
+| `rule-date-between` | `object.reviewed_at between ["2026-01-01", …]` | the ternary form — **3** parses over the same dispatcher arity |
+| `rule-date-same-year` | `object.hired_at sameYear "2026-07-15"` | the calendar-**bucket** branch, which reads components rather than comparing instants |
+| `rule-date-relative` | `… before $rel(NOW, −1 quarters, startOfQuarter)` | the bound **resolved per evaluation** instead of read from a literal |
+| `rule-date-rel-bounds` | a `between` whose **both** bounds are relative | the most expensive shape the AST can express |
+| `rule-date-clamped` | `… after $rel(NOW, −6 months, endOfMonth)` | the **clamping** branch: a 31-day month end offset into a 28-day month |
+| `rule-date-multi` | five date comparisons under one `and` | a date-heavy policy, and where `onOrAfter`, `onOrBefore`, `sameDay` and `sameMonth` meet the floor |
+| `rule-date-deny` | `object.malformed_at before …` | the **deny** branch, and the one allocating parse failure |
+
+Three properties of that set are deliberate and are asserted rather than assumed:
+
+- **The reference instant is pinned** (`benchNow` = `2026-08-31T12:00:00Z`,
+  injected with `rules.WithClock`). A relative bound moves with the clock, so a
+  fixture built on `time.Now()` decides a different comparison every day, and the
+  clamping variant would only reach the branch it exists to measure during part of
+  the year. `TestDateFixtureActuallyClamps` asserts the clamp genuinely runs at
+  that instant — a clamping fixture that has quietly stopped clamping still passes
+  every latency and allocation assertion here, it simply measures the other
+  branch. Note the documented coupling: the engine has **one** time source, so
+  pinning it also freezes compiled-rule cache expiry. That is inert for this
+  fixture (the rules engine takes the default TTL, under which entries live until
+  invalidated) and, if anything, keeps the measured window in the cached steady
+  state the NFR is about.
+- **One variant denies**, so the expected verdict is declared per variant and
+  asserted on every warm-up rather than assumed to be `allow`. A deny is a
+  different branch through the comparison, not an excuse to leave it unmeasured.
+- **All eight date operators are inside the asserted set**, which
+  `TestDateBenchCoverage` enforces by reading the operator registry out of
+  `rules/ast.go` — see [the coverage guard](#the-coverage-guard).
 
 ##### Why 7 281 tags
 
@@ -95,6 +136,11 @@ real tag list does not guarantee.
 | `BenchmarkRuleEval/<variant>` | the rule **in isolation** — compiled once, evaluated over the same metadata, so the fixture's ~60 µs of grant resolution cannot mask it |
 | `BenchmarkCollectionScaling/tags-N` | the guarded collection operator swept across array sizes, with the field's `ValueBytes` reported alongside |
 | `BenchmarkRuleCompileCached/<variant>` | the AST work a `Check` pays on **every** decision even when the compiled program is cached, with the AST's node count alongside |
+| `BenchmarkEnumerateRuleBacked/candidates-N` | a **rule-backed** `Enumerate` swept across candidate-set sizes, reporting a derived `ns/candidate` and the returned `ids` count |
+| `BenchmarkEnumerateRuleBackedRuleEval` | the same number of `rules.Engine.Selected` calls with no engine around them, so the rule half of the enumeration cost is separable from the decision half |
+| `BenchmarkDateOpEval/<op>` | each of the **eight** date operators in isolation, so the post-parse cost of an ordering operator and a calendar-bucket one come apart |
+| `BenchmarkRelativeDateComplexity/<stage>` | the relative-date cost **ladder** — no `$rel`, anchor, offset, snap, snap + offset, snap + clamping offset, two relative bounds — where adjacent rows differ by exactly one stage |
+| `BenchmarkRelativeDateVocabulary/<member>` | every anchor, unit and snap, so no vocabulary member's arithmetic goes unmeasured |
 
 `make bench` runs them all with `-benchmem`. The **audit toggle** is the
 benchmark axis: audit-off is the `s.audit == nil` path; audit-on wires a sampled
@@ -125,11 +171,13 @@ Methodology inside the gate:
   parallelises well above it — see the throughput benchmark).
 - both are run with audit **on** and **off**.
 
-`TestCheckNFRCollections` (E5-S2) applies the **same two thresholds** to each
-rule variant, audit on and off. Its name deliberately contains `TestCheckNFR` so
-the invocation above — whose `-run` pattern is an unanchored regexp — picks it up
-with no command change. It measures over 20 000 samples rather than 100 000/200
-000 because the gate multiplies out over ten variant × audit combinations; the
+`TestCheckNFRCollections` applies the **same two thresholds** to each rule
+variant, audit on and off — the date variants included, so a date comparison is
+held to exactly the floor every other cached `Check` is. Its name deliberately
+contains `TestCheckNFR` so the invocation above — whose `-run` pattern is an
+unanchored regexp — picks it up with no command change. It measures over 20 000
+samples rather than 100 000/200 000 because the gate multiplies out over every
+variant × the audit axis (26 combinations today, ~105 s end to end); the
 thresholds are *rates*, so the smaller sample does not weaken them.
 
 ### The allocation guard (E5-S2)
@@ -152,6 +200,58 @@ fixed per-evaluation overhead exactly and leaves **bytes per array element** —
 which is the actual signature of a copy. Sharing by reference reads as ~0 B per
 element; materialising the array into a fresh `[]any` costs 16 B per element for
 the backing store alone, so the budget sits at 8 B, well clear of both.
+
+`TestDateCheckAllocations` is the same idea for the date path, and it is budgeted
+per **mechanism** rather than per absolute number, so a regression fails with the
+cause rather than with a figure. A date rule has three plausible places for a
+copy-shaped mistake to hide — a constant bound re-parsed per evaluation, an
+intermediate `time.Time` per calendar step, and an error value built on a failed
+parse — and each has a budget naming it:
+
+| Budget | Claim | Measured |
+|---|---|---:|
+| a date comparison over the scalar control ≤ 8 allocs/op | the cost is the `$date` dispatcher's fixed **eight-argument call boxing**, and nothing else | +7.0 |
+| `between` over `before` ≤ 1 alloc/op | **parsing allocates nothing** — `between` parses three operands to `before`'s two | +0.0 |
+| clamping over non-clamping ≤ 1 alloc/op | the month-end clamp is a comparison and a substitution; no intermediate instants | +0.0 |
+| the deny path over the matching allow ≤ 6 allocs/op | the one allocating step is the `*time.ParseError` the standard library builds and `provider` discards | **−2.0** |
+| a second relative bound ≤ 6 allocs/op | a second relative operand pays a second *resolution*, not a second per-decision setup | +3.0 |
+| each date comparison after the first ≤ 7 allocs/op | a rule's date cost is **linear** in comparison count | +4.2 |
+
+The deny row is negative because a rule that denies also leaves the grant
+unselected, so the decision does less afterwards than an allow — more than paying
+for the four extra allocations. The isolated figure is `BenchmarkRuleEval`, where
+`rule-date-deny` is **+4 allocs / +120 B** over `rule-date-compare` with no
+decision around it. The budget here is a ceiling on the whole branch, and a coded
+error constructed on that path — exactly what `provider.DateValueOf` exists to
+avoid — would clear it easily.
+
+### The coverage guard
+
+`TestDateBenchCoverage` is ungated, cheap, and about the fixture that **does not**
+exist. It reads the date-operator registry out of `rules/ast.go` (the `opSpecs`
+entries whose kind is `renderDate`) and the three relative-date vocabularies out
+of `rules/relative.go`, and fails if any member has no bench fixture. Nothing
+about adding a ninth date operator or a twelfth snap makes anyone open `bench/`,
+which is precisely why a hand-maintained list would fall behind — and the repo
+already gates the Go↔JS editor contract, the collection operator tables and the
+scope strategy matrix the same way.
+
+The two tiers are held to **different** standards on purpose:
+
+- an **operator** must appear in the *asserted* set (`ruleVariants()`), because an
+  operator is a comparison on the `Check` hot path and throughput is the only
+  thing that can see a regression there — a fixture outside the assertion proves
+  nothing;
+- a **vocabulary member** must appear somewhere in the corpus, asserted or
+  informational. Holding 20 anchor/unit/snap combinations to a wall-clock floor
+  would multiply the gate's runtime for arithmetic that is bounded by construction
+  (it touches no metadata, allocates nothing per element, and scales with
+  nothing), while the two shapes that *do* reach the hot path — one resolution and
+  two resolutions in one comparison — are both already asserted.
+
+Like `rules/editor_js_contract_test.go` it scans **source text**, so restructuring
+a table declaration can break the scanner even when the tables agree. It therefore
+fails loudly with the file and the pattern it could not find, and never skips.
 
 ## Committed results
 
@@ -223,6 +323,171 @@ realistic 12-tag collection adds ~270 ns and ~500 B per `Check` — noise agains
 54 µs decision. Note the collection variants' B/op no longer grows with array
 length: `rule-tags-at-cap` allocates 11 286 B against `rule-tags-typical`'s
 11 285, over 600× the elements.
+
+### Date comparisons
+
+Re-measured on the same Apple M1 Max, default `-benchtime`, against the pinned
+reference instant. **The gate passes on every date variant, with the smallest
+margin at 1.57× the throughput floor** — the slowest case in the whole suite
+remains `rule-tags-at-cap`, not a date rule.
+
+`TestCheckNFRCollections`, single-goroutine over 20 000 samples:
+
+| Variant | p99 (audit off / on) | checks/sec (audit off / on) | verdict |
+|---|---|---|---|
+| `rule-date-compare` | 227 µs / 212 µs | 17 192 / 17 484 | pass |
+| `rule-date-between` | 219 µs / 202 µs | 17 038 / 17 186 | pass |
+| `rule-date-same-year` | 233 µs / 209 µs | 17 241 / 17 702 | pass |
+| `rule-date-relative` | 230 µs / 210 µs | 16 960 / 17 477 | pass |
+| `rule-date-rel-bounds` | 235 µs / 214 µs | 16 677 / 17 326 | pass |
+| `rule-date-clamped` | 237 µs / 195 µs | 16 956 / 17 552 | pass |
+| `rule-date-multi` | 250 µs / 221 µs | **15 664** / 16 274 | pass |
+| `rule-date-deny` | 225 µs / 191 µs | 16 947 / 17 640 | pass |
+
+For scale, on the same run the literal-scope baseline was 296 µs / 14 150 and the
+collection variants 212–254 µs / 11 934–17 624. Absolute numbers have varied ~12 %
+run to run on this machine under load; the *ordering* has not.
+
+The rule in isolation (`BenchmarkRuleEval`), which strips the ~55 µs of grant
+resolution out of the numbers above:
+
+| Variant | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `rule-scalar` (control) | 156.3 | 128 | 3 |
+| `rule-date-same-year` | 526.4 | 704 | 7 |
+| `rule-date-compare` | 590.6 | 704 | 7 |
+| `rule-date-deny` | 661.5 | 824 | 11 |
+| `rule-date-between` | 751.5 | 704 | 7 |
+| `rule-date-clamped` | 897.0 | 872 | 10 |
+| `rule-date-relative` | 898.3 | 872 | 10 |
+| `rule-date-rel-bounds` | 1 334 | 976 | 12 |
+| `rule-date-multi` | 2 112 | 1 344 | 14 |
+
+Four things are readable off that, and each is a claim a future regression has to
+break:
+
+1. **The parse itself allocates nothing.** `rule-date-between` parses *three*
+   operands to `rule-date-compare`'s two and is byte-identical at 704 B / 7
+   allocs. The ~576 B a date comparison costs over the scalar control is the
+   `$date` dispatcher's fixed **eight-argument call boxing**, not parsing.
+2. **Clamping is free.** `rule-date-clamped` genuinely clamps (asserted, not
+   assumed) and measures 897.0 ns / 872 B / 10 allocs against the non-clamping
+   `rule-date-relative`'s 898.3 / 872 / 10.
+3. **A second relative operand costs a second full resolution.** The per-decision
+   `NOW` snapshot is shared — that is what makes a decision reproducible — but
+   only the *instant* is shared, not the arithmetic. `rule-date-rel-bounds` is
+   +583 ns and +2 allocs over `rule-date-between`: two resolutions at ~290 ns
+   each, not one amortised. That follows from the design (`$rel` is an ordinary
+   call per operand) rather than being a defect, but it means a rule's cost scales
+   with its **relative-operand count**.
+4. **The deny path allocates, and is bounded** — +4 allocs / +120 B, the
+   `*time.ParseError` described above.
+
+`rule-date-multi` is the slowest date case (15 664 checks/sec, still 1.57× the
+floor) and only part of that is its five comparisons: at 16 AST nodes it also pays
+the largest per-decision **AST re-walk** in the suite — 4 112 ns / 18 allocs in
+`BenchmarkRuleCompileCached`, against 913 ns / 8 allocs for the single-comparison
+`rule-date-compare`. That is the known walk cost documented under
+[Findings](#findings), scaling with node count exactly as described there, and it
+is not specific to dates: any rule with five comparisons of any kind pays it. It
+is worth knowing before reading the multi-comparison row as a date number.
+
+#### Where the cost of a relative date actually is
+
+`BenchmarkRelativeDateComplexity` is a ladder whose adjacent rows differ by
+exactly one stage, so each stage's contribution is a difference rather than part
+of an aggregate:
+
+| Stage | ns/op | B/op | allocs/op | delta |
+|---|---:|---:|---:|---|
+| `literal-bound` (no `$rel`) | 420.4 | 688 | 6 | — |
+| `anchor` | 769.9 | 856 | 9 | **+349 ns, +168 B, +3 allocs** |
+| `offset` | 789.0 | 856 | 9 | +19 ns, +0 B, +0 |
+| `snap` | 792.8 | 856 | 9 | +23 ns, +0 B, +0 |
+| `snap-offset` | 846.2 | 856 | 9 | +76 ns, +0 B, +0 |
+| `snap-offset-clamped` | 859.7 | 856 | 9 | +13 ns, +0 B, +0 |
+| `two-relative-bounds` | 1 300 | 960 | 11 | a second full resolution |
+
+**The calendar arithmetic is not the expensive part.** Snapping, offsetting and
+clamping together are ~90 ns and *zero* allocations on top of the bare anchor. The
++349 ns and all three allocations arrive with the very first `$rel`, and they are
+its call boxing plus the canonical string it formats for `$date` to immediately
+re-parse.
+
+That round trip is the one date optimization with real headroom behind it, and it
+is **deliberately not done**: removing it means `$rel` returning something `$date`
+accepts without re-parsing, which changes the dispatcher's operand contract. The
+same is true of `$date`'s fixed eight-argument arity. Both are recorded here as
+measured, accepted costs — the floors hold comfortably with them in, and this
+suite measures rather than tunes.
+
+`BenchmarkRelativeDateVocabulary` reports every anchor, unit and snap at a flat
+~1.1 µs / 960 B / 11 allocs per evaluation (two resolutions each — a
+self-comparison is true exactly when the node resolved, which is the only way to
+prove from outside the package that the arithmetic ran). No vocabulary member is
+materially dearer than another, ISO-week and quarter boundaries included, so there
+is no member-specific cost for a rule author to route around.
+
+`BenchmarkDateOpEval` reports all eight operators at an identical 704 B / 7 allocs
+and 496–659 ns, `between` dearest (three parses) and the inclusive ordering
+operators cheapest.
+
+### Rule-backed `Enumerate`
+
+`Enumerate` is a different shape from `Check`, and until now nothing measured it
+through a rule. A rule is not invertible, so an `inclusive;rule=…` grant's
+members are found by **listing the object type and filtering each candidate
+through the rule** — and the engine then runs its ordinary deny-overrides
+decision over every survivor, which consults the same grant again. One
+`Enumerate` is therefore up to **2 × candidates** rule evaluations.
+
+`bench/enumerate_test.go` builds its own store, registry and rules engine (so the
+cached-`Check` baseline above is untouched) with one account-wide
+`inclusive;rule=…` grant over N documents, all of which the rule selects — the
+worst case, since a rejected candidate skips the second evaluation.
+`BenchmarkEnumerateRuleBacked`, Apple M1 Max, `-benchtime=2s`, audit off:
+
+| candidates | ns/op | ns/candidate | allocs/op | B/op | ids returned |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 40 472 | 4 047 | 532 | 37 223 | 10 |
+| 100 | 391 125 | 3 911 | 5 075 | 367 144 | 100 |
+| 1 000 | 4 195 286 | 4 195 | 50 118 | 3 690 931 | 1 000 |
+| 2 000 | 4 434 250 | 4 434 | 50 123 | 3 725 176 | 1 000 |
+
+And the rule half in isolation (`BenchmarkEnumerateRuleBackedRuleEval`, 1 000
+`Selected` calls): **1 235 ns/eval, 14 allocs/eval, ~945 B/eval**.
+
+- **~4.2 µs and ~50 allocations per candidate**, flat across three orders of
+  magnitude — linear in the candidate count, with no super-linear term in the
+  resolver.
+- **The rule is ~60% of it.** Two evaluations at 1 235 ns is ~2.5 µs of the
+  ~4.2 µs and 28 of the ~50 allocations; the rest is the decision engine's own
+  per-candidate work. Inside the rule half the largest line item is the
+  per-decision AST re-walk (`BenchmarkRuleCompileCached`).
+- **The 1 000 and 2 000 rows are the same** to within run-to-run noise. Past
+  `scope.DefaultMaxMembers` the extra objects are never visited, so the worst
+  case is a constant a host can budget for rather than a function of the object
+  population. `TestEnumerateRuleBackedStaysBounded` pins that ungated.
+- **A bound-limit enumeration is ~4.2 ms**, roughly 1 000× a cached `Check`.
+  That is arithmetic (it *is* ~2 000 evaluations plus 1 000 decisions), but it
+  makes rule-backed `Enumerate` an interactive operation, not a hot-path one.
+- One asymmetry: a smaller `EnumerateRequest.Limit` shortens only the **second**
+  half. The member set is gathered first and bounded by
+  `scope.DefaultMaxMembers` regardless, so `Limit=10` over 1 000 candidates still
+  pays ~1 000 evaluations to build it, then ~10 decisions.
+
+These are **informational**. They are deliberately outside `TestCheckNFR`'s
+asserted gate, which is about the cached single-`Check` NFR; rule-backed
+enumeration has no agreed threshold. The numbers are published so a future change
+that regresses them has something to regress against.
+
+The counters in the compiled-rule cache are `sync/atomic` for this reason. The
+hit path used to take the cache's **write** lock purely to bump `hits`, which
+serialised concurrent evaluations on a number none of them read; at one rule
+evaluation per decision that was a rounding error, but rule-backed enumeration
+multiplies it by the candidate count. `TestCacheHitCountIsExactUnderConcurrency`
+(in `rules/`) asserts the counter stays exact — 32 goroutines × 100 evaluations
+must report exactly 3 200 hits — so the change is correct, not merely faster.
 
 ## Findings
 
@@ -374,6 +639,16 @@ the default build, but they are wired and runnable on demand and in a dedicated 
 job/cron where the runner is known to be unloaded.
 `TestMetadataIsSharedByReference` is the one guard that is **not** gated: it is
 structural rather than timed, so it runs in every `make test`.
+`TestDateBenchCoverage` and `TestDateFixtureActuallyClamps` are ungated on the
+same principle — the first is a source scan, the second is calendar arithmetic,
+and neither has a wall clock in it. They cover the two ways a date fixture fails
+silently: a new operator or vocabulary member that no fixture exercises, and a
+clamping fixture that has stopped clamping.
+`TestEnumerateRuleBackedStaysBounded` is ungated for the same reason: it asserts
+that a rule-backed `Enumerate` over twice `scope.DefaultMaxMembers` candidates
+returns **exactly** the bound — not more (an unbounded member set) and not less
+(a second, tighter limit having crept in, which would be a wrong access-control
+answer rather than a performance tradeoff).
 
 **All gates now pass.** Three were failing by design as of E5-S2, left asserting
 the honest budget rather than relaxed to green — the numbers were the
@@ -389,3 +664,16 @@ ratchet rather than an open finding — see [Findings](#findings):
 The `rule-literal-in` budget in particular is now tight on purpose: any
 per-literal decode reintroduced into the AST walk scales with literal count and
 blows straight past 2.
+
+The date budgets are newer and were **met on first measurement** — unlike the
+three above, nothing had to be fixed to make them green. They are set at the
+measured value plus a small margin rather than at a round number, so they function
+as ratchets from the outset:
+
+| Gate | Case | Budget | Measured |
+|---|---|---|---:|
+| `TestCheckNFRCollections` | every date variant | ≥ 10 000 checks/sec, p99 < 1 ms | 15 664–17 702 / 191–250 µs |
+| `TestDateCheckAllocations` | parsing allocates nothing | ≤ 1 alloc/op for a third operand | +0.0 |
+| `TestDateCheckAllocations` | clamping allocates nothing | ≤ 1 alloc/op over a non-clamping offset | +0.0 |
+| `TestDateCheckAllocations` | date cost is linear in comparisons | ≤ 7 allocs/op per comparison after the first | +4.2 |
+| `TestDateBenchCoverage` | no operator or vocabulary member is unmeasured | every member has a fixture; operators must be in the **asserted** set | 8/8 operators, 2 anchors, 7 units, 11 snaps |

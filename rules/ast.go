@@ -59,6 +59,12 @@ const (
 	NodeList NodeType = "list"
 	// NodeCall is a call to a registered pure function.
 	NodeCall NodeType = "call"
+	// NodeRelativeDate is a date expressed RELATIVE to the decision's reference
+	// instant — an anchor, a whole-number offset in one of seven units, and a
+	// snap. It is an operand, never a predicate: it is legal only on either side
+	// of a date operator (including as one bound of a between), and it is the
+	// only node type whose value is not written into the rule. See relative.go.
+	NodeRelativeDate NodeType = "relativeDate"
 )
 
 // Comparison operators carried in a NodeCompare's Op field.
@@ -89,6 +95,32 @@ const (
 	OpExists     = "exists"     // object.owner.dept exists      (any path)      — unary
 )
 
+// The DATE operators. They compare a metadata field carrying one of the two
+// canonical date strings (provider.DateLayout / provider.DateTimeLayout) against
+// another date operand — a literal, a variable, or whatever later node types the
+// right-hand socket comes to accept.
+//
+// GRANULARITY NEVER AFFECTS ORDERING: "2026-03-04" and "2026-03-04T00:00:00Z"
+// name the same instant and compare EQUAL. Ordering is over instants, never over
+// text, so a date operator can never be built on string comparison.
+//
+// None of them renders to a native infix operator, and that is a hard rule rather
+// than a style choice — see opSpecs.
+const (
+	OpBefore     = "before"     // object.hired_at before "2026-01-01"       — strict
+	OpAfter      = "after"      // object.hired_at after "2026-01-01"        — strict
+	OpOnOrBefore = "onOrBefore" // object.hired_at on or before "2026-01-01" — inclusive
+	OpOnOrAfter  = "onOrAfter"  // object.hired_at on or after "2026-01-01"  — inclusive
+	// OpBetween tests a date against two bounds, INCLUSIVE AT BOTH ENDS, so
+	// `between [lo, hi]` is exactly `onOrAfter lo and onOrBefore hi`. It is the
+	// only operator whose right operand is a two-element list; see rightBounds.
+	OpBetween = "between" // object.hired_at between ["2026-01-01", "2026-12-31"]
+
+	OpSameDay   = "sameDay"   // object.hired_at falls on the same calendar day   (UTC)
+	OpSameMonth = "sameMonth" // object.hired_at falls in the same calendar month (UTC)
+	OpSameYear  = "sameYear"  // object.hired_at falls in the same calendar year  (UTC)
+)
+
 // rightShape constrains what a comparison's right operand may be — the
 // operand-shape half of an operator's contract, enforced by Validate.
 type rightShape uint8
@@ -104,6 +136,41 @@ const (
 	rightElement
 	// rightNone requires Right to be omitted entirely: the unary operators.
 	rightNone
+	// rightBounds requires a list literal holding EXACTLY TWO operand nodes — the
+	// ternary shape, used only by between.
+	//
+	// WHY THIS SHAPE, and what was rejected (this decision is load-bearing: it
+	// becomes persisted rule JSON, the editor's serializer contract, and public
+	// API, so changing it later breaks stored rules).
+	//
+	// between needs two right-hand bounds and NodeCompare carries one Right. Four
+	// directions were on the table:
+	//
+	//  1. A SECOND right field (Right2 / High) used only by ternary operators.
+	//     Rejected: it adds a JSON key every other node type must omit, a field
+	//     with no meaning for 16 of 17 existing operators, and a second place the
+	//     round-trip can drift. The exported Node struct would carry it forever.
+	//  2. An operand LIST subsuming Right. Rejected: it changes the JSON of every
+	//     comparison that already exists, so previously persisted rules stop
+	//     loading — the one outcome this decision may not have.
+	//  3. A dedicated node TYPE. Rejected: NodeType is the editor's palette, and a
+	//     between node is a comparison in every way that matters. A new type buys
+	//     nothing the operator token does not already carry, and costs a new
+	//     primitive on both sides of the Go/JS contract.
+	//  4. DESUGARING to `and(onOrAfter, onOrBefore)` at construction time.
+	//     Rejected, and it was the close call: it costs no new shape and no
+	//     serializer change, but the AST is the editor's serialization target, so
+	//     the author's ONE between node reads back as an `and` of two comparisons
+	//     unless the editor re-sugars a specific two-child pattern on load. That
+	//     re-sugaring is a heuristic (it must not swallow an `and` the author
+	//     genuinely wrote), it is duplicated in Go and JS, and it makes the
+	//     round-trip lossy in the one way this AST promises it never is. Paying a
+	//     shape rule to keep the round-trip exact is the cheaper trade.
+	//
+	// So: Right stays one node, and for between it is a NodeList of two items. No
+	// new field, no new node type, no new JSON key, and every rule persisted
+	// before this operator existed loads and re-marshals byte-identically.
+	rightBounds
 )
 
 // renderKind is how a comparison operator turns into expr-lang source.
@@ -120,6 +187,10 @@ const (
 	// renderFunc writes `<text>(left)` or `<text>(left, right)`, calling one of
 	// the backing functions registered in defaultFunctions().
 	renderFunc
+	// renderDate writes a call to the guarded date dispatcher (renderDate method).
+	// It is unconditional for the date operators — there is no native form to fall
+	// back to, by design.
+	renderDate
 )
 
 // opSpec is one comparison operator's contract: the shape its right operand must
@@ -141,18 +212,32 @@ type opSpec struct {
 // function registered in defaultFunctions().
 //
 //   - eq ne lt le gt ge in nin — NATIVE infix, unchanged.
+//
 //   - has, hasKey — NATIVE, a flipped `in`: `(right in left)`. expr's `in` is
 //     element membership over a slice AND KEY membership over a map, so hasKey is
 //     pure spelling over behavior that already exists and neither operator needs
 //     a backing function.
+//
 //   - exists — NATIVE: `(left != nil)`. Together with the optional chaining
 //     renderVar emits, a missing intermediate reads as nil, so
 //     `object.owner.dept exists` is false rather than a runtime error.
+//
 //   - hasAll hasAny hasNone subsetOf isEmpty isNotEmpty — REGISTERED FUNCTIONS.
 //     Their native spellings would be expr's `all`/`any`/`len`, which are either
 //     genuinely disabled (len) or reachable only through a `#` pointer this AST
 //     cannot emit — and which validateCall explicitly denies. Each is backed by a
 //     deterministic, side-effect-free func in defaultFunctions().
+//
+//   - before after onOrBefore onOrAfter between sameDay sameMonth sameYear —
+//     the DATE operators, which render to the guarded date dispatcher `$date` and
+//     to nothing else. NEVER to a native infix operator: the values being
+//     compared are canonical date STRINGS, so a native `<` would compare text
+//     (where "2026-03-04" and "2026-03-04T00:00:00Z" are ordered, though they
+//     name the same instant), and parsing them to time.Time first is worse still
+//     — `time.Time < string` is a COMPILE error in expr, so one mistyped operand
+//     would make the whole rule uncompilable instead of degrading one comparison.
+//     The dispatcher parses both sides and applies the deny-safe policy, so a
+//     malformed host-supplied date denies with a note like any other bad shape.
 //
 // GUARDING OVERRIDES ALL OF THE ABOVE (E5-S1). Whenever an operator's collection
 // operand is not statically known to be a collection — i.e. anything but a list
@@ -178,6 +263,21 @@ var opSpecs = map[string]opSpec{
 	OpIsEmpty:    {shape: rightNone, kind: renderFunc, text: fnIsEmpty},
 	OpIsNotEmpty: {shape: rightNone, kind: renderFunc, text: fnIsNotEmpty},
 	OpExists:     {shape: rightNone, kind: renderNotNil},
+
+	// The date operators. Eight take a SINGLE right-hand date operand, so they
+	// reuse rightElement — the shape rule is about the operand's AST structure
+	// (one value, never a set), not about its type: date-ness is a RUNTIME
+	// question the dispatcher answers deny-safely, exactly as the metadata value
+	// model stays deliberately date-blind. between is the one exception and takes
+	// rightBounds, a two-element list.
+	OpBefore:     {shape: rightElement, kind: renderDate},
+	OpAfter:      {shape: rightElement, kind: renderDate},
+	OpOnOrBefore: {shape: rightElement, kind: renderDate},
+	OpOnOrAfter:  {shape: rightElement, kind: renderDate},
+	OpBetween:    {shape: rightBounds, kind: renderDate},
+	OpSameDay:    {shape: rightElement, kind: renderDate},
+	OpSameMonth:  {shape: rightElement, kind: renderDate},
+	OpSameYear:   {shape: rightElement, kind: renderDate},
 }
 
 // blockedCallNames are expr-lang's PREDICATE builtins. expr.DisableAllBuiltins
@@ -221,11 +321,19 @@ var varPath = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-
 //	and/or   Children (>= 2)
 //	not      Children (exactly 1)
 //	compare  Op, Left, Right — Right is OMITTED for the unary operators
-//	         (isEmpty, isNotEmpty, exists) and required for every other operator
+//	         (isEmpty, isNotEmpty, exists) and required for every other operator.
+//	         For between, Right is a `list` of exactly two bounds; the ternary
+//	         operator needs no field of its own (see rightBounds).
 //	var      Name (dotted path)
 //	literal  Value (scalar JSON: string, number, bool, or null)
 //	list     Items
 //	call     Name (function), Items (arguments)
+//	relativeDate
+//	         Anchor, Offset, Unit, Snap — ALL FOUR, always. Unlike every other
+//	         node type, none of its fields is ever omitted: "no offset" is n = 0
+//	         and "no snap" is the vocabulary member "none", so absence never
+//	         means anything and the four editor controls are never empty. See
+//	         relative.go.
 type Node struct {
 	Type     NodeType        `json:"type"`
 	Op       string          `json:"op,omitempty"`
@@ -235,6 +343,15 @@ type Node struct {
 	Right    *Node           `json:"right,omitempty"`
 	Children []*Node         `json:"children,omitempty"`
 	Items    []*Node         `json:"items,omitempty"`
+
+	// The relativeDate fields. Offset is a JSON number TOKEN rather than an int
+	// so that Validate — not encoding/json — owns the rejection of a
+	// non-integer offset, and so the token a rule was authored with survives the
+	// round-trip verbatim. See Node.offsetCount.
+	Anchor string      `json:"anchor,omitempty"`
+	Offset json.Number `json:"n,omitempty"`
+	Unit   string      `json:"unit,omitempty"`
+	Snap   string      `json:"snap,omitempty"`
 }
 
 // And returns a logical-and over children.
@@ -258,6 +375,18 @@ func Compare(op string, left, right *Node) *Node {
 // for these three operators.
 func Unary(op string, left *Node) *Node {
 	return &Node{Type: NodeCompare, Op: op, Left: left}
+}
+
+// Between returns the ternary date comparison `left between [low, high]`,
+// INCLUSIVE AT BOTH ENDS — it is exactly `onOrAfter low && onOrBefore high`, kept
+// as one node so the rule an author writes is the rule that reads back.
+//
+// It is a plain NodeCompare whose Right is a two-item NodeList; see rightBounds
+// for why that shape was chosen over a second right field, a wider operand list,
+// a dedicated node type, or desugaring. Bounds are not reordered: a low above the
+// high is a range that matches nothing, which is what the author wrote.
+func Between(left, low, high *Node) *Node {
+	return &Node{Type: NodeCompare, Op: OpBetween, Left: left, Right: List(low, high)}
 }
 
 // Var returns a variable reference for a dotted path (e.g. object.classification).
@@ -319,10 +448,40 @@ func (n *Node) Validate() error {
 		return validateAll(n.Items)
 	case NodeCall:
 		return n.validateCall()
+	case NodeRelativeDate:
+		// A relative date is an OPERAND OF A DATE OPERATOR and nothing else, so
+		// reaching it through the general walk — as a logical child, a call
+		// argument, an item of an `in` list, or the right side of `eq` — is an
+		// error. validateCompare reaches the legal positions through
+		// validateDateOperand instead, which is the only caller that accepts one.
+		//
+		// The restriction is not decoration. The node resolves to a date the
+		// author never sees, so anywhere it is not being compared AS a date it
+		// would either be compared as an opaque string (`eq "2026-03-04T…Z"`,
+		// which is string equality against a value that changes every second) or
+		// silently deny. Refusing it at validation makes the mistake visible when
+		// the rule is saved.
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: a relative date is only valid as an operand of a date operator",
+			map[string]any{"anchor": n.Anchor})
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: unknown node type", map[string]any{"type": string(n.Type)})
 	}
+}
+
+// validateDateOperand validates one operand of a comparison, accepting a
+// relative-date node only when the operator is a date operator.
+//
+// It is the single seam through which NodeRelativeDate becomes legal: everywhere
+// else in the AST it is validated by Node.Validate, which rejects it outright. A
+// bounds list's items are operands in their own right, so between's two bounds
+// may each independently be a literal, a variable, or a relative date.
+func validateDateOperand(n *Node, dateOp bool) error {
+	if dateOp && n != nil && n.Type == NodeRelativeDate {
+		return n.validateRelativeDate()
+	}
+	return n.Validate()
 }
 
 // validateCompare checks a NodeCompare against its operator's opSpec: the
@@ -345,6 +504,11 @@ func (n *Node) validateCompare() error {
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: comparison requires a left operand", map[string]any{"op": n.Op})
 	}
+	// A date operator's operands are the only place a relative-date node is
+	// legal; every other operand is validated by the general walk, which rejects
+	// one. The flag rides along rather than being re-derived per operand so the
+	// two sides of a comparison cannot disagree about it.
+	dateOp := spec.kind == renderDate
 	if spec.shape == rightNone {
 		if n.Right != nil {
 			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
@@ -357,7 +521,7 @@ func (n *Node) validateCompare() error {
 		return aerr.New(aerr.APERTURE_RULE_INVALID,
 			"rule: comparison requires a left and a right operand")
 	}
-	if err := n.Left.Validate(); err != nil {
+	if err := validateDateOperand(n.Left, dateOp); err != nil {
 		return err
 	}
 	switch spec.shape {
@@ -373,8 +537,33 @@ func (n *Node) validateCompare() error {
 				"rule: operator requires a single element on the right; use hasAll/hasAny/hasNone for a set",
 				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
 		}
+	case rightBounds:
+		// The ternary shape: exactly two bounds, in a list. Both failure modes
+		// share one message — an author who supplied the wrong container and one
+		// who supplied the wrong number of bounds need the same correction — and
+		// differ only in the context key that names what was actually found.
+		if n.Right.Type != NodeList {
+			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+				"rule: operator requires a list of exactly two bounds on the right",
+				map[string]any{"op": n.Op, "right": string(n.Right.Type)})
+		}
+		if len(n.Right.Items) != 2 {
+			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+				"rule: operator requires a list of exactly two bounds on the right",
+				map[string]any{"op": n.Op, "bounds": len(n.Right.Items)})
+		}
+		// Each bound is its own date operand, so the two may independently be a
+		// literal, a variable, or a relative date. (Validating the items here
+		// rather than through the list node is what carries that permission down;
+		// NodeList.Validate is the same walk minus the permission.)
+		for _, bound := range n.Right.Items {
+			if err := validateDateOperand(bound, dateOp); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return n.Right.Validate()
+	return validateDateOperand(n.Right, dateOp)
 }
 
 // validateCall checks a NodeCall's function name. Beyond the identifier shape it
@@ -511,6 +700,8 @@ func (n *Node) render(b *bytes.Buffer) error {
 		}
 		b.WriteByte(')')
 		return nil
+	case NodeRelativeDate:
+		return n.renderRelativeDate(b)
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: cannot render unknown node type", map[string]any{"type": string(n.Type)})
@@ -563,6 +754,10 @@ func (n *Node) renderCompare(b *bytes.Buffer) error {
 		}
 		b.WriteByte(')')
 		return nil
+
+	case renderDate:
+		// Unconditional: a date operator has no native form to fall back to.
+		return n.renderDateOp(b)
 
 	case renderNotNil:
 		// Because renderVar emits optional chaining, a path through a missing
@@ -652,6 +847,126 @@ func (n *Node) renderGuarded(b *bytes.Buffer) error {
 	} else if err := n.Right.render(b); err != nil {
 		return err
 	}
+	b.WriteByte(')')
+	return nil
+}
+
+// renderDateOp writes a date comparison as a call to the guarded date
+// dispatcher:
+//
+//	$date("before", __notes, "object.hired_at", object?.hired_at, "", "2026-01-01", "", nil)
+//	$date("between", __notes, "object.hired_at", object?.hired_at, "", "2026-01-01", "", "2026-12-31")
+//
+// The arguments are, in order: the operator; the evaluation-notes sink; then
+// three path/value PAIRS — the left operand, the first right operand, and the
+// second right operand. The second pair is between's upper bound and renders as
+// ""/nil for every other date operator, so the dispatcher keeps one fixed arity
+// and one registered signature.
+//
+// Each path is the operand's dotted variable path when it is a plain variable
+// reference and "" otherwise, exactly as renderGuarded does — a note names the
+// field, never the value.
+//
+// `$date` is unreachable from a rule for the same structural reason as `$op`: the
+// '$' is outside the identifier grammar varPath enforces, so no NodeCall can name
+// it and no blockedCallNames entry is needed. `__notes` is likewise not one of
+// allowedRoots.
+//
+// The dispatcher returns a bool, so a date comparison composes exactly like any
+// other — including as a whole rule under expr.AsBool.
+func (n *Node) renderDateOp(b *bytes.Buffer) error {
+	b.WriteString(fnDateOp)
+	b.WriteByte('(')
+	b.WriteString(strconv.Quote(n.Op))
+	b.WriteString(", ")
+	b.WriteString(notesVar)
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(varPathOf(n.Left)))
+	b.WriteString(", ")
+	if err := n.Left.render(b); err != nil {
+		return err
+	}
+	first, second := dateOperands(n)
+	for _, arg := range [2]*Node{first, second} {
+		b.WriteString(", ")
+		b.WriteString(strconv.Quote(varPathOf(arg)))
+		b.WriteString(", ")
+		if arg == nil {
+			b.WriteString("nil")
+			continue
+		}
+		if err := arg.render(b); err != nil {
+			return err
+		}
+	}
+	b.WriteByte(')')
+	return nil
+}
+
+// dateOperands splits a date comparison's right-hand side into the one or two
+// operands the dispatcher takes. For between that is the two items of the bounds
+// list; for every other date operator it is Right and nothing.
+//
+// The defensive nil returns are unreachable through a validated AST — Validate
+// has already proven the bounds list holds exactly two items — but rendering an
+// unvalidated node must not panic, since Expr is exported.
+func dateOperands(n *Node) (*Node, *Node) {
+	if opSpecs[n.Op].shape != rightBounds {
+		return n.Right, nil
+	}
+	if n.Right == nil || len(n.Right.Items) != 2 {
+		return nil, nil
+	}
+	return n.Right.Items[0], n.Right.Items[1]
+}
+
+// renderRelativeDate writes a relative-date operand as a call to the relative
+// dispatcher:
+//
+//	$rel(__now, "NOW", -3, "months", "none")
+//	$rel(__now, "TODAY", 0, "days", "startOfYear")
+//
+// The arguments are, in order: the decision's reference instant, then the node's
+// four fields exactly as they are persisted — anchor, offset count, offset unit,
+// snap. Every one of them is a LITERAL: the instant is the only thing that is not
+// baked into the source, so the rendered text is stable across decisions and the
+// compiled-program cache keys on a rule rather than on a moment.
+//
+// THE ARGUMENTS ARE LITERALS BECAUSE THE ALTERNATIVE IS A CALENDAR WALK. The
+// instant arrives as `__now`, an environment entry whose identifier is not one of
+// allowedRoots, so no NodeVar can name it — exactly the arrangement `$date` uses
+// for `__notes`. Were `NOW` a variable root instead, `NOW.AddDate(0, -3, 0)`
+// would be a well-formed var path, because reflective method calls survive
+// expr.DisableAllBuiltins. The vocabularies are quoted strings that a closed-set
+// check has already passed, so nothing an author writes reaches the expression as
+// syntax.
+//
+// `$rel` is unreachable from a rule for the same structural reason as `$op` and
+// `$date`: '$' is outside the identifier grammar varPath enforces, so no NodeCall
+// can name it and no blockedCallNames entry is needed.
+//
+// The dispatcher returns a date VALUE (a canonical date string, or nil when it
+// cannot be resolved), not a bool — this node is an operand, and it is
+// interchangeable with a date literal everywhere one is accepted.
+func (n *Node) renderRelativeDate(b *bytes.Buffer) error {
+	// Rendering an UNVALIDATED node must not emit garbage: Expr is exported, and
+	// an unparseable offset written into the source would surface as an opaque
+	// expr-lang compile failure instead of the validator's own message.
+	count, err := n.offsetCount()
+	if err != nil {
+		return err
+	}
+	b.WriteString(fnRelativeDate)
+	b.WriteByte('(')
+	b.WriteString(nowVar)
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Anchor))
+	b.WriteString(", ")
+	b.WriteString(strconv.Itoa(count))
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Unit))
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Snap))
 	b.WriteByte(')')
 	return nil
 }

@@ -47,7 +47,24 @@ const (
 	// "negative operator grants on missing data" shape — nin / hasNone /
 	// subsetOf / isEmpty over an object that simply lacks the field — which grants
 	// access and is otherwise invisible.
+	//
+	// No DATE operator records this: all eight are positive, so an absent operand
+	// can only deny (see the policy note in date.go).
 	NoteAbsentField NoteKind = "absent_field"
+	// NoteDateInvalid records that a date operator was applied to a STRING that is
+	// not one of the two canonical date forms. The shape was right and the content
+	// was not, which is why it is distinct from NoteShapeMismatch: the fix is to
+	// canonicalise the data (or to declare the field as a date in the loader, so
+	// it is validated at load) rather than to change its type. The comparison
+	// evaluated to false (deny-safe).
+	NoteDateInvalid NoteKind = "date_invalid"
+	// NoteDateBoundsInverted records that a `between` was written with its lower
+	// bound after its upper bound. That range matches nothing — bounds are never
+	// reordered, because reordering would silently decide the author meant
+	// something other than what they wrote — so the comparison is false for every
+	// object, which is indistinguishable from a rule nothing satisfies unless it
+	// is said out loud.
+	NoteDateBoundsInverted NoteKind = "date_bounds_inverted"
 )
 
 // Note is one diagnostic observation recorded during rule evaluation.
@@ -80,6 +97,8 @@ const anonymousOperand = "(expression)"
 //
 //	object.tags: expected collection, got string
 //	object.tags: absent; hasNone matched because the field is missing
+//	object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z
+//	object.hired_at: between bounds are inverted; the lower bound is after the upper bound, so nothing can match
 func (n Note) String() string {
 	path := n.Path
 	if path == "" {
@@ -90,6 +109,11 @@ func (n Note) String() string {
 		return fmt.Sprintf("%s: absent; %s matched because the field is missing", path, n.Op)
 	case NoteShapeMismatch:
 		return fmt.Sprintf("%s: expected %s, got %s", path, n.Expected, n.Actual)
+	case NoteDateInvalid:
+		return fmt.Sprintf("%s: not a canonical date; %s expects %s", path, n.Op, n.Expected)
+	case NoteDateBoundsInverted:
+		return fmt.Sprintf("%s: %s bounds are inverted; the lower bound is after the upper "+
+			"bound, so nothing can match", path, n.Op)
 	default:
 		return fmt.Sprintf("%s: %s (%s)", path, n.Kind, n.Op)
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
@@ -26,31 +27,63 @@ import (
 // it), so it is reachable only from the expression the renderer emits. It may be
 // nil — the decision hot path leaves it unset, and every NoteCollector method is
 // nil-safe.
+//
+// Now is the decision instant (now.go) the same way: a per-decision snapshot of
+// the engine's clock, exposed under an identifier that is not a variable root, so
+// only a renderer-emitted expression can read it. Keeping it OUT of allowedRoots
+// is a security boundary, not a style choice — reflective method calls survive
+// expr.DisableAllBuiltins, so an exposed `NOW` root would make
+// `NOW.AddDate(0, -3, 0)` a well-formed var path. It is always UTC, and its zero
+// value means no reference instant was supplied (a directly-built Input); a date
+// operator that needs one denies rather than resolving against year 1.
 type evalEnv struct {
 	Object    map[string]any `expr:"object"`
 	Principal map[string]any `expr:"principal"`
 	Account   map[string]any `expr:"account"`
 	Action    string         `expr:"action"`
 	Notes     *NoteCollector `expr:"__notes"`
+	Now       time.Time      `expr:"__now"`
 }
 
 // notesVar is the identifier evalEnv.Notes is exposed under, and the name
 // renderGuarded passes to the dispatcher.
 const notesVar = "__notes"
 
+// nowVar is the identifier evalEnv.Now is exposed under — the name a renderer
+// passes to a dispatcher that needs the decision instant. Like notesVar it is
+// absent from allowedRoots, so no rule can name it.
+const nowVar = "__now"
+
 // Input is the per-evaluation context a compiled rule reads. Object is the
 // object's metadata snapshot (treated read-only — never mutated), Principal and
 // Account are attribute bags, and Action is the action verb. A nil map is read as
 // empty.
+//
+// Now is the decision's reference instant — the value a rule's date arithmetic
+// resolves against. An Engine fills it from its injected Clock exactly once per
+// decision (see now.go), so a rule that refers to "now" twice cannot straddle a
+// tick and an Explain trace can be reproduced against a recorded instant. A
+// caller building an Input by hand may leave it zero: that means "no reference
+// instant is available", which any date operator needing one treats as deny-safe
+// rather than resolving against year 1. It is normalised to UTC when the
+// evaluation environment is built, so a non-UTC value cannot reach a comparison.
 type Input struct {
 	Object    map[string]any
 	Principal map[string]any
 	Account   map[string]any
 	Action    string
+	Now       time.Time
 }
 
 // env builds the tagged evaluation environment from the public Input, binding the
-// per-evaluation notes sink (nil on the decision hot path).
+// per-evaluation notes sink (nil on the decision hot path) and the decision
+// instant.
+//
+// The UTC conversion is repeated here rather than trusted from the snapshot
+// boundary: env is the last point before evaluation and it is also the path a
+// direct library caller takes with a hand-built Input, so normalising here means
+// no zone reaches a comparison by any route. It costs nothing — Time.UTC only
+// rewrites the value's location pointer.
 func (in Input) env(notes *NoteCollector) evalEnv {
 	return evalEnv{
 		Object:    in.Object,
@@ -58,6 +91,7 @@ func (in Input) env(notes *NoteCollector) evalEnv {
 		Account:   in.Account,
 		Action:    in.Action,
 		Notes:     notes,
+		Now:       in.Now.UTC(),
 	}
 }
 
@@ -146,6 +180,11 @@ func Function(name string, fn func(args ...any) (any, error)) CompilerOption {
 // isNotEmpty); all of expr-lang's builtins are disabled, so no wall-clock or
 // random function is reachable and evaluation stays deterministic. Host functions
 // added with Function join that set.
+//
+// That determinism survives the date operators because the reference instant is
+// DATA, not a function: it arrives as Input.Now and is exposed to the program as
+// the __now environment entry, fixed for the whole evaluation. Nothing a rule can
+// call reads a clock.
 func NewCompiler(opts ...CompilerOption) *Compiler {
 	c := &Compiler{}
 	// The typed env, a required boolean result, and a disabled builtin library
@@ -223,6 +262,21 @@ const (
 	// rejects it, so no NodeCall can name this function — the guard is
 	// structurally compiler-only rather than denylisted.
 	fnCollectionOp = "$op"
+
+	// fnDateOp is the guarded dispatcher every DATE comparison renders to
+	// (renderDateOp), unconditionally — a date operator has no native spelling
+	// that could be correct. The '$' is load-bearing for the same reason as
+	// fnCollectionOp's.
+	fnDateOp = "$date"
+
+	// fnRelativeDate is the dispatcher a relative-date OPERAND renders to
+	// (renderRelativeDate). Unlike the other two it returns a value rather than a
+	// bool: it resolves the decision's reference instant plus a literal
+	// anchor/offset/snap into a canonical date string, which the enclosing date
+	// operator then compares like any other operand. Its '$' is load-bearing in
+	// the same way, and it is the ONLY dispatcher that reads the instant — $date
+	// never sees it.
+	fnRelativeDate = "$rel"
 )
 
 // defaultFunctions is the curated pure function set every Compiler exposes. They
@@ -307,6 +361,58 @@ func defaultFunctions() []expr.Option {
 			rightPath, _ := args[4].(string)
 			return evalCollectionOp(op, sink, leftPath, args[3], rightPath, args[5]), nil
 		}, new(func(string, any, string, any, string, any) bool)),
+
+		// $date is the guarded date dispatcher (renderDateOp). Its arguments are
+		// the operator, the notes sink read out of the environment, and THREE
+		// path/value pairs: the left operand, the first right operand, and the
+		// second right operand (between's upper bound, ""/nil otherwise). One
+		// fixed arity covers both the binary and the ternary operators, so there
+		// is a single registered signature for the type-checker to see.
+		expr.Function(fnDateOp, func(args ...any) (any, error) {
+			if len(args) != 8 {
+				return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+					"rule: guarded date operator takes exactly eight operands",
+					map[string]any{"args": len(args)})
+			}
+			op, _ := args[0].(string)
+			sink, _ := args[1].(*NoteCollector)
+			leftPath, _ := args[2].(string)
+			rightPath, _ := args[4].(string)
+			right2Path, _ := args[6].(string)
+			return evalDateOp(op, sink,
+				leftPath, args[3], rightPath, args[5], right2Path, args[7]), nil
+		}, new(func(string, any, string, any, string, any, string, any) bool)),
+
+		// $rel resolves a relative-date OPERAND (renderRelativeDate). Its
+		// arguments are the decision's reference instant — the only place __now
+		// is ever read — followed by the node's four literal fields: anchor,
+		// offset count, offset unit, snap.
+		//
+		// It returns a canonical date STRING, which is byte-for-byte what a date
+		// literal in the same position would be, so `$date` parses both operands
+		// through one path and a relative date is interchangeable with a fixed
+		// one. When the date cannot be resolved — no reference instant, or an
+		// offset that leaves the representable year range — it returns nil, and
+		// the enclosing operator applies its ordinary deny-safe policy (false, with a
+		// shape note). It never raises: a rule must not fail to evaluate because
+		// of the date it is measured against.
+		expr.Function(fnRelativeDate, func(args ...any) (any, error) {
+			if len(args) != 5 {
+				return nil, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+					"rule: relative date takes exactly five operands",
+					map[string]any{"args": len(args)})
+			}
+			now, _ := args[0].(time.Time)
+			anchor, _ := args[1].(string)
+			count, _ := args[2].(int)
+			unit, _ := args[3].(string)
+			snap, _ := args[4].(string)
+			v, ok := resolveRelativeDate(now, anchor, count, unit, snap)
+			if !ok {
+				return nil, nil
+			}
+			return v.String(), nil
+		}, new(func(time.Time, string, int, string, string) any)),
 	}
 }
 

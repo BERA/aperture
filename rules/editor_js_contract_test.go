@@ -61,6 +61,7 @@ var jsShapeNames = map[rightShape]string{
 	rightCollection: "COLLECTION",
 	rightElement:    "ELEMENT",
 	rightNone:       "NONE",
+	rightBounds:     "BOUNDS",
 }
 
 // goBackingFuncConsts resolves the fn* constants compiler.go registers its
@@ -75,6 +76,8 @@ var goBackingFuncConsts = map[string]string{
 	"fnIsEmpty":      fnIsEmpty,
 	"fnIsNotEmpty":   fnIsNotEmpty,
 	"fnCollectionOp": fnCollectionOp,
+	"fnDateOp":       fnDateOp,
+	"fnRelativeDate": fnRelativeDate,
 }
 
 // TestEditorOperatorTablesAgree is the drift gate proper: every operator in Go's
@@ -144,6 +147,28 @@ func TestEditorOperatorTablesAgree(t *testing.T) {
 	if !strings.Contains(js, "const OPS = Object.keys(OP_SPECS)") {
 		t.Errorf("%s: `OPS` must stay derived as `Object.keys(OP_SPECS)`; "+
 			"a hand-written list can drift from the registry", serializerPath)
+	}
+
+	// DATE_OPS is the one operator property the JS carries OUTSIDE OP_SPECS: an
+	// OP_SPECS entry has to stay in the literal `{ right: RIGHT.X }` form for
+	// jsOpSpecs to read it, so date-ness lives in its own list. Date-ness is a
+	// POSITIONAL permission — a relativeDate operand is legal only under one of
+	// these operators — so a list that falls behind opSpecs means the editor
+	// refuses a rule the server accepts, or saves one it rejects.
+	var goDateOps []string
+	for op, spec := range opSpecs {
+		if spec.kind == renderDate {
+			goDateOps = append(goDateOps, op)
+		}
+	}
+	diffSets(t, "date operator", goDateOps, jsStringArray(t, jsConstBody(t, js, "DATE_OPS")),
+		"Go opSpecs entries with kind renderDate (rules/ast.go)", "JS DATE_OPS ("+serializerPath+")")
+
+	// ...and the JS validator must decide from that list rather than from a
+	// scattered set of per-operator conditionals, for the same reason isUnaryOp
+	// must decide from OP_SPECS.
+	if !strings.Contains(js, "DATE_OPS.indexOf(op) >= 0") {
+		t.Errorf("%s: isDateOp must decide from DATE_OPS, not from a separate list", serializerPath)
 	}
 }
 
@@ -220,6 +245,25 @@ func TestEditorVocabularyTablesAgree(t *testing.T) {
 		diffSets(t, "pure function", goDefaultFunctionNames(t), jsStringArray(t, jsConstBody(t, js, "FUNCTIONS")),
 			"Go defaultFunctions (rules/compiler.go)", "JS FUNCTIONS ("+serializerPath+")")
 	})
+
+	// The relative-date node's three closed vocabularies. Each drives one editor
+	// control, so a member the editor does not offer is a rule an author cannot
+	// write, and a member the editor offers but Go does not know is a rule the
+	// server rejects on save. Both directions are drift, so both are compared.
+	t.Run("ANCHORS vs relativeAnchors", func(t *testing.T) {
+		diffSets(t, "relative-date anchor", keysOf(relativeAnchors), jsStringArray(t, jsConstBody(t, js, "ANCHORS")),
+			"Go relativeAnchors (rules/relative.go)", "JS ANCHORS ("+serializerPath+")")
+	})
+
+	t.Run("UNITS vs relativeUnits", func(t *testing.T) {
+		diffSets(t, "relative-date offset unit", keysOf(relativeUnits), jsStringArray(t, jsConstBody(t, js, "UNITS")),
+			"Go relativeUnits (rules/relative.go)", "JS UNITS ("+serializerPath+")")
+	})
+
+	t.Run("SNAPS vs relativeSnaps", func(t *testing.T) {
+		diffSets(t, "relative-date snap", keysOf(relativeSnaps), jsStringArray(t, jsConstBody(t, js, "SNAPS")),
+			"Go relativeSnaps (rules/relative.go)", "JS SNAPS ("+serializerPath+")")
+	})
 }
 
 // TestEditorValidationMessagesAgree asserts the JS validator reports the Go
@@ -244,12 +288,34 @@ func TestEditorValidationMessagesAgree(t *testing.T) {
 		{"unary with a right operand", Compare(OpIsEmpty, Var("object.tags"), Lit("a")), aerr.APERTURE_RULE_INVALID},
 		{"collection operand is neither list nor var", Compare(OpHasAll, Var("object.tags"), Lit("a")), aerr.APERTURE_RULE_INVALID},
 		{"element operand is a list", Compare(OpHas, Var("object.tags"), List(Lit("a"))), aerr.APERTURE_RULE_INVALID},
+		{"ternary operand is not two bounds", &Node{Type: NodeCompare, Op: OpBetween,
+			Left: Var("object.hired_at"), Right: List(Lit("2026-01-01"))}, aerr.APERTURE_RULE_INVALID},
 		{"not requires exactly one child", &Node{Type: NodeNot}, aerr.APERTURE_RULE_INVALID},
 		{"not a dotted path", Var("object..tags"), aerr.APERTURE_RULE_INVALID},
 		{"unexposed root", Var("secrets.key"), aerr.APERTURE_RULE_UNKNOWN_VARIABLE},
 		{"blocked call", Call("filter", Var("object.tags")), aerr.APERTURE_RULE_INVALID},
 		{"literal has no value", &Node{Type: NodeLiteral}, aerr.APERTURE_RULE_INVALID},
 		{"composite literal", &Node{Type: NodeLiteral, Value: []byte(`["a"]`)}, aerr.APERTURE_RULE_INVALID},
+
+		// The relative-date node. Its four fields fail independently, because
+		// each names a different correction, and the editor renders whichever
+		// message it is handed beside the offending control.
+		{"relative date outside a date operator",
+			Compare(OpEq, Var("object.hired_at"), RelativeDate(AnchorNow, -3, UnitMonths, SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown anchor",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate("YESTERDAY", 0, UnitDays, SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown unit",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate(AnchorNow, -3, "fortnights", SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown snap",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate(AnchorNow, -3, UnitMonths, "startOfFiscalYear")),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date offset is not a whole number",
+			Compare(OpBefore, Var("object.hired_at"),
+				&Node{Type: NodeRelativeDate, Anchor: AnchorNow, Offset: "1.5", Unit: UnitMonths, Snap: SnapNone}),
+			aerr.APERTURE_RULE_INVALID},
 	}
 
 	for _, tc := range cases {
@@ -317,6 +383,10 @@ func editorJSONForOp(t *testing.T, op string, shape rightShape) string {
 		return head + `}`
 	case rightCollection:
 		return head + `,"right":{"type":"list","items":[{"type":"literal","value":"a"}]}}`
+	case rightBounds:
+		// The ternary shape: a list of EXACTLY two bounds, and no new JSON key.
+		return head + `,"right":{"type":"list","items":[` +
+			`{"type":"literal","value":"2026-01-01"},{"type":"literal","value":"2026-12-31"}]}}`
 	case rightAny, rightElement:
 		return head + `,"right":{"type":"literal","value":"a"}}`
 	default:

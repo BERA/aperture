@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
@@ -48,6 +49,20 @@ type Trace struct {
 	// Notes are DIAGNOSTIC ONLY: they never influence the verdict, and Check /
 	// Enumerate do not collect them at all.
 	Notes []EvaluationNote
+	// Now is the reference instant this decision's rule evaluation resolved
+	// against — the snapshot the rules engine took from its injected clock,
+	// always UTC, taken ONCE for the whole decision however many rules it
+	// evaluated. It is what makes a date-sensitive trace reproducible: replay the
+	// same request with the clock pinned here and the verdict must be identical.
+	//
+	// ZERO when the decision evaluated no rule (a literal-scope grant needs no
+	// reference instant, so none is invented for it).
+	//
+	// Deliberately NOT rendered by String. The rendered report promises to be
+	// byte-identical for the same decision, and printing a wall-clock instant
+	// would make two explains of one decision differ for a reason that has
+	// nothing to do with the derivation. Read the field when you need it.
+	Now time.Time
 	// Decision is the final verdict, reason, and deciding grant ids — identical
 	// to what Check returns for the same request.
 	Decision Decision
@@ -109,7 +124,8 @@ type EvaluationNote struct {
 	GrantID string
 	// Rule is the rule reference that was evaluated.
 	Rule string
-	// Kind classifies the observation ("shape_mismatch", "absent_field").
+	// Kind classifies the observation ("shape_mismatch", "absent_field",
+	// "date_invalid", "date_bounds_inverted").
 	Kind string
 	// Op is the comparison operator that made the observation ("hasAll", ...).
 	Op string
@@ -183,6 +199,12 @@ func (e *Engine) Explain(ctx context.Context, req Request) (Trace, error) {
 // derivation against a different subject set. req.Principal stays the requesting
 // principal in the trace's Request; the caller attaches any impersonation context.
 func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object identity.Identity, subjects []model.Subject) (Trace, error) {
+	// One reference instant for the whole trace. Explain evaluates a rule per
+	// candidate grant, so without the scope a wide trace could resolve its first
+	// grant against one instant and its last against another — and the recorded
+	// Now would then be true of only part of the report.
+	ctx, instant := rules.WithDecisionInstant(ctx)
+
 	grants, err := e.store.GrantsForSubjects(ctx, req.Account, subjects)
 	if err != nil {
 		return Trace{}, aerr.Wrap(aerr.APERTURE_STORAGE,
@@ -252,6 +274,12 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 		if _, ok := deciding[tr.Considered[i].GrantID]; ok {
 			tr.Considered[i].Deciding = true
 		}
+	}
+	// Record the instant the rules actually decided against, when any rule ran.
+	// A trace with no rule-backed grant leaves it zero rather than stamping a
+	// "now" nothing consulted.
+	if at, ok := instant.At(); ok {
+		tr.Now = at
 	}
 	return tr, nil
 }

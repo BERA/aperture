@@ -7,6 +7,7 @@ import (
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/rules"
 )
 
 // DefaultEnumerateLimit bounds Enumerate's result when the caller imposes no
@@ -84,6 +85,13 @@ func (e *Engine) Enumerate(ctx context.Context, req EnumerateRequest) ([]string,
 // no impersonation-specific decision logic. decReq.Principal stays the requesting
 // principal so a rule-backed scope strategy still sees the real operator.
 func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest, query identity.Pattern, subjects []model.Subject) ([]string, error) {
+	// One reference instant for the WHOLE enumeration — the member gather and
+	// every per-candidate decision underneath it. A rule-backed Enumerate
+	// evaluates its rule twice per candidate, so this is where a long-running
+	// enumeration would otherwise straddle a tick and return a set no single
+	// instant justifies.
+	ctx, _ = rules.WithDecisionInstant(ctx)
+
 	grants, err := e.store.GrantsForSubjects(ctx, req.Account, subjects)
 	if err != nil {
 		return nil, aerr.Wrap(aerr.APERTURE_STORAGE,
