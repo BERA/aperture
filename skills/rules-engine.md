@@ -29,7 +29,7 @@ file (E5-S2) persists the same shape. There is no second rule format.
 |---|---|---|
 | `and` / `or` | `children` (>= 2) | logical conjunction / disjunction |
 | `not` | `children` (exactly 1) | logical negation |
-| `compare` | `op`, `left`, `right` | comparison; `right` is omitted for the unary ops |
+| `compare` | `op`, `left`, `right` | comparison; `right` is omitted for the unary ops, and is a two-item `list` for `between` |
 | `var` | `name` (dotted path) | context variable reference |
 | `literal` | `value` (scalar JSON) | string / number / bool / null constant |
 | `list` | `items` | list literal (right side of a collection op) |
@@ -71,6 +71,46 @@ Collection operators. `left` is the collection (or, for `exists`, any path);
 | `isNotEmpty` | `object.tags is not empty` | array, object | **omitted** |
 | `exists` | `object.owner.dept exists` | any path | **omitted** |
 
+Date operators. `left` is the date-valued field; `right` is another date operand
+— a literal or a variable — except for `between`, which takes **two bounds**:
+
+| `op` | Reads as | `right` |
+|---|---|---|
+| `before` | `object.hired_at before "2026-01-01"` | one element (strict) |
+| `after` | `object.hired_at after "2026-01-01"` | one element (strict) |
+| `onOrBefore` | `object.hired_at on or before "2026-01-01"` | one element (inclusive) |
+| `onOrAfter` | `object.hired_at on or after "2026-01-01"` | one element (inclusive) |
+| `between` | `object.hired_at between ["2026-01-01","2026-12-31"]` | a `list` of exactly two bounds |
+| `sameDay` | `object.hired_at same day as "2026-03-04"` | one element |
+| `sameMonth` | `object.hired_at same month as "2026-03-04"` | one element |
+| `sameYear` | `object.hired_at same year as "2026-03-04"` | one element |
+
+A date operand is one of the two canonical strings the value model defines —
+`2006-01-02` or `2006-01-02T15:04:05Z` (see the `metadata-values` skill). Two
+properties are worth stating outright:
+
+- **`between` is INCLUSIVE AT BOTH ENDS.** `between [lo, hi]` is exactly
+  `onOrAfter lo && onOrBefore hi`. Bounds are never reordered: a `lo` above the
+  `hi` is a range that matches nothing, which is what the author wrote.
+- **Granularity never affects ordering.** `"2026-03-04"` and
+  `"2026-03-04T00:00:00Z"` name the same instant and compare **equal**. Ordering
+  is over instants, never over text — which is also why no date operator renders
+  to a native `<`.
+
+`between` needs two right-hand operands and `compare` carries one `right`, so
+`right` is a `list` of exactly two items. **No new node type, no new field, and
+no new JSON key**: every rule persisted before dates existed loads and
+re-marshals byte-identically, and the author's one `between` node reads back as
+one node rather than as an `and` of two comparisons.
+
+```json
+{"type":"compare","op":"between",
+ "left":{"type":"var","name":"object.hired_at"},
+ "right":{"type":"list","items":[
+   {"type":"literal","value":"2026-01-01"},
+   {"type":"literal","value":"2026-12-31"}]}}
+```
+
 Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
 
 - The three unary ops require `right == nil`; supplying one is an error, not
@@ -78,10 +118,13 @@ Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
 - Every other op requires both operands.
 - `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf` need a `list` or a `var` on
   the right — a set.
-- `has` `hasKey` need a single element on the right; a `list` there is an error
-  pointing at `hasAll`/`hasAny`/`hasNone`.
+- `has` `hasKey` and the eight single-operand date ops need a single element on
+  the right; a `list` there is an error.
+- `between` needs a `list` of **exactly two** bounds on the right — one bound,
+  three bounds, an empty list, or a bare operand are all rejected.
 
-Build a unary node with `rules.Unary(op, left)`; everything else with
+Build a unary node with `rules.Unary(op, left)`, a `between` node with
+`rules.Between(left, low, high)`, and everything else with
 `rules.Compare(op, left, right)`.
 
 ### How each operator compiles
@@ -107,6 +150,17 @@ registers:
   nothing. Neither `$op` nor `__notes` is reachable from a rule — `$` is outside
   the name grammar `Validate` enforces, and `__notes` is not an exposed context
   root — so the guard is compiler-only by construction, not by denylist.
+- **Dates are always guarded.** Every date operator renders to the internal
+  dispatcher `$date(op, __notes, leftPath, left, rightPath, right, right2Path,
+  right2)` — the last pair is `between`'s upper bound and is `""`/`nil` for
+  every other date operator, so one arity covers the binary and the ternary
+  operators. There is **no** native fallback, and that is a hard rule: the values
+  are canonical date *strings*, so a native `<` would compare text (which orders
+  `"2026-03-04"` before `"2026-03-04T00:00:00Z"` although they are the same
+  instant), and parsing to `time.Time` first is worse — `time.Time < string` is a
+  **compile** error in expr, so one mistyped operand would make the entire rule
+  uncompilable instead of degrading one comparison. `$date` is unreachable from a
+  rule for the same structural reason as `$op`.
 
 **expr's predicate builtins are denied.** `expr.DisableAllBuiltins()` does not
 reach `all`, `any`, `none`, `one`, `filter`, `map`, `count`, `sum`, `find`,

@@ -223,6 +223,12 @@ const (
 	// rejects it, so no NodeCall can name this function — the guard is
 	// structurally compiler-only rather than denylisted.
 	fnCollectionOp = "$op"
+
+	// fnDateOp is the guarded dispatcher every DATE comparison renders to
+	// (renderDateOp), unconditionally — a date operator has no native spelling
+	// that could be correct. The '$' is load-bearing for the same reason as
+	// fnCollectionOp's.
+	fnDateOp = "$date"
 )
 
 // defaultFunctions is the curated pure function set every Compiler exposes. They
@@ -307,6 +313,27 @@ func defaultFunctions() []expr.Option {
 			rightPath, _ := args[4].(string)
 			return evalCollectionOp(op, sink, leftPath, args[3], rightPath, args[5]), nil
 		}, new(func(string, any, string, any, string, any) bool)),
+
+		// $date is the guarded date dispatcher (renderDateOp). Its arguments are
+		// the operator, the notes sink read out of the environment, and THREE
+		// path/value pairs: the left operand, the first right operand, and the
+		// second right operand (between's upper bound, ""/nil otherwise). One
+		// fixed arity covers both the binary and the ternary operators, so there
+		// is a single registered signature for the type-checker to see.
+		expr.Function(fnDateOp, func(args ...any) (any, error) {
+			if len(args) != 8 {
+				return false, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+					"rule: guarded date operator takes exactly eight operands",
+					map[string]any{"args": len(args)})
+			}
+			op, _ := args[0].(string)
+			sink, _ := args[1].(*NoteCollector)
+			leftPath, _ := args[2].(string)
+			rightPath, _ := args[4].(string)
+			right2Path, _ := args[6].(string)
+			return evalDateOp(op, sink,
+				leftPath, args[3], rightPath, args[5], right2Path, args[7]), nil
+		}, new(func(string, any, string, any, string, any, string, any) bool)),
 	}
 }
 

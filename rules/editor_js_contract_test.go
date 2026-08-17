@@ -61,6 +61,7 @@ var jsShapeNames = map[rightShape]string{
 	rightCollection: "COLLECTION",
 	rightElement:    "ELEMENT",
 	rightNone:       "NONE",
+	rightBounds:     "BOUNDS",
 }
 
 // goBackingFuncConsts resolves the fn* constants compiler.go registers its
@@ -75,6 +76,7 @@ var goBackingFuncConsts = map[string]string{
 	"fnIsEmpty":      fnIsEmpty,
 	"fnIsNotEmpty":   fnIsNotEmpty,
 	"fnCollectionOp": fnCollectionOp,
+	"fnDateOp":       fnDateOp,
 }
 
 // TestEditorOperatorTablesAgree is the drift gate proper: every operator in Go's
@@ -244,6 +246,8 @@ func TestEditorValidationMessagesAgree(t *testing.T) {
 		{"unary with a right operand", Compare(OpIsEmpty, Var("object.tags"), Lit("a")), aerr.APERTURE_RULE_INVALID},
 		{"collection operand is neither list nor var", Compare(OpHasAll, Var("object.tags"), Lit("a")), aerr.APERTURE_RULE_INVALID},
 		{"element operand is a list", Compare(OpHas, Var("object.tags"), List(Lit("a"))), aerr.APERTURE_RULE_INVALID},
+		{"ternary operand is not two bounds", &Node{Type: NodeCompare, Op: OpBetween,
+			Left: Var("object.hired_at"), Right: List(Lit("2026-01-01"))}, aerr.APERTURE_RULE_INVALID},
 		{"not requires exactly one child", &Node{Type: NodeNot}, aerr.APERTURE_RULE_INVALID},
 		{"not a dotted path", Var("object..tags"), aerr.APERTURE_RULE_INVALID},
 		{"unexposed root", Var("secrets.key"), aerr.APERTURE_RULE_UNKNOWN_VARIABLE},
@@ -317,6 +321,10 @@ func editorJSONForOp(t *testing.T, op string, shape rightShape) string {
 		return head + `}`
 	case rightCollection:
 		return head + `,"right":{"type":"list","items":[{"type":"literal","value":"a"}]}}`
+	case rightBounds:
+		// The ternary shape: a list of EXACTLY two bounds, and no new JSON key.
+		return head + `,"right":{"type":"list","items":[` +
+			`{"type":"literal","value":"2026-01-01"},{"type":"literal","value":"2026-12-31"}]}}`
 	case rightAny, rightElement:
 		return head + `,"right":{"type":"literal","value":"a"}}`
 	default:
