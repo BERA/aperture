@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -206,20 +206,46 @@ loader normalises into the model — it never widens it.
 A header column carries `name:type[<elem>][(delim)]`:
 
 ```text
-id,tier,seats:int,tags:list,ranks:list<int>,aliases:list(;),owner:json
-brand:1,gold,40,premium|launch,3|5,acme;acme-co,"{""dept"":""eng"",""tags"":[""a""]}"
-brand:2,silver,,,,,
+id,tier,seats:int,hired_at:date,last_seen:datetime,tags:list,ranks:list<int>,aliases:list(;),owner:json
+brand:1,gold,40,2026-03-04,2026-03-04T12:30:00Z,premium|launch,3|5,acme;acme-co,"{""dept"":""eng"",""tags"":[""a""]}"
+brand:2,silver,,,,,,,
 ```
 
 | Suffix | Value |
 |---|---|
 | none / `:string`, `:int`, `:float`, `:bool` | a **scalar** (`int` → `int64`, `float` → `float64`) |
+| `:date` | a **string scalar** in `2006-01-02`, canonicalised at load through `provider.ParseDateValue` |
+| `:datetime` | a **string scalar** in `2006-01-02T15:04:05Z`, same parser |
 | `:list` | an **array** of strings, split on `\|` |
 | `:list<int>` / `:list<float>` / `:list<bool>` | an array whose elements go through the **same** scalar coercion |
 | `:list(;)` | the delimiter override, for that column only |
 | `:json` | an **object**, decoded from the cell — takes no `<elem>` and no `(delim)` |
 
-Four rules the value model does not impose, but the CSV encoding must:
+The suffix spelling is **lower-case and exact**. An unrecognised one — `:timestamp`,
+`:Date`, `:time` — is `APERTURE_CONFIG_INVALID` ("unknown column type"), never a
+silently untyped column. The header is cut at its **first** colon, so a column
+name cannot itself contain one: `hired:at:date` reads as the column `hired` with
+the unknown type `at:date`.
+
+Five rules the value model does not impose, but the CSV encoding must:
+
+- **A date column's cells are validated and canonicalised at load**, and the
+  **canonical** string is what is stored — not the cell as written. `:datetime`
+  turns `2026-03-04T12:30:00.750Z` and `2026-03-04T12:30:00` alike into
+  `2026-03-04T12:30:00Z`, so two rows naming one instant are one string and a
+  `Filter.Fields` equality predicate over the column means something. The
+  predicate must itself be canonical; range querying is not a provider concern.
+  **The declared type also fixes the granularity** — a `:date` column rejects a
+  timestamp and a `:datetime` column rejects a bare day, rather than quietly
+  widening it to midnight. **An empty cell omits the field**, following the
+  scalar rule: an absent date differs meaningfully from any date, and a zero time
+  would silently satisfy every `before` rule written against the column. A
+  rejection is `APERTURE_CONFIG_INVALID` naming the **column, line, and field**
+  and carrying the `DateReason` — never the cell. **`:list<date>` does not
+  exist**: arrays of dates are out of scope and rejected by name. Neither does a
+  time-of-day type. A date-shaped string inside a `:json` cell is **not**
+  date-validated — `:json` is opaque structured data, and only a declared column
+  gets date treatment.
 
 - **Element typing is mandatory for numeric membership.** expr does no
   numeric/string coercion, so `5 in object.seats` is `false` against `["3","5"]`.
@@ -242,10 +268,12 @@ Four rules the value model does not impose, but the CSV encoding must:
   `int64` becomes an `int64`, everything else a `float64`. That is what keeps
   `object.owner.seats == object.seats` from being a silent `false`.
 
-Grammar, coercion, and `:json` decode failures are `APERTURE_CONFIG_INVALID`; the
-value-model check that runs on every parsed cell is `APERTURE_METADATA_INVALID`.
-A `:json` rejection carries the column, the line, and the JSON kind or the
-decoder's message — never the cell.
+Grammar, coercion, `:date`/`:datetime`, and `:json` decode failures are
+`APERTURE_CONFIG_INVALID`; the value-model check that runs on every parsed cell —
+including a date, which reaches it as the plain string scalar it is — is
+`APERTURE_METADATA_INVALID`. A `:json` rejection carries the column, the line,
+and the JSON kind or the decoder's message; a date rejection carries the column,
+the line, the `reason`, and the layout `expected`. Neither ever carries the cell.
 
 ### The seed document's `objects:` section
 

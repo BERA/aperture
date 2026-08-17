@@ -138,7 +138,9 @@ calendar day and year.
 The value model itself stays date-blind — `ValidateField` cannot know which
 strings a host means as dates, so it keeps accepting any string. Declaring a
 field to be a date, and running its values through `provider.ParseDateValue`, is
-a loader's job. A rejection is `APERTURE_CONFIG_INVALID` carrying a machine-
+a loader's job — in `csvprovider` that is the
+[`:date` / `:datetime` column suffix](#date-columns). A rejection is
+`APERTURE_CONFIG_INVALID` carrying a machine-
 readable `reason` (`provider.DateReasonOf`) and never the value, because a date
 can be personal data. Comparison goes through `DateValue.Compare`, which compares
 **instants**: `"2026-03-04"` and `"2026-03-04T00:00:00Z"` are the same moment but
@@ -313,6 +315,57 @@ Scalar types are `string` (the default, no suffix), `int` (stored as `int64`),
 so a rule can supply its own default (row `brand:23` above has no `seats` or
 `budget`).
 
+#### Date columns
+
+The types `date` and `datetime` declare a column to hold
+[dates](#dates-are-string-scalars-in-two-canonical-forms), so every cell is
+validated and canonicalised **at load** through `provider.ParseDateValue`:
+
+```text
+id,tier,hired_at:date,last_seen:datetime
+brand:1,gold,2026-03-04,2026-03-04T12:30:00Z
+brand:2,silver,,
+```
+
+The point is where the failure lands. A typo'd or impossible date in an untyped
+column is a perfectly good *string* that no rule can compare, so it becomes a
+silent deny at decision time — months later, in production. Declared as a date it
+is a hard error on the line and column that hold it.
+
+The **canonical** string is what is stored, not the cell as written:
+`2026-03-04T12:30:00.750Z` and `2026-03-04T12:30:00` both become
+`2026-03-04T12:30:00Z`. Two rows naming one instant are therefore one string,
+which is what makes a `Filter.Fields` equality predicate over the column mean
+anything. That predicate must itself be canonical; **range** querying is not a
+provider concern — rules are where date ranges live.
+
+| Suffix | Cells | Stored as |
+|---|---|---|
+| `:date` | a calendar day | `2006-01-02` |
+| `:datetime` | an instant | `2006-01-02T15:04:05Z` |
+
+Four rules, each because the alternative is a silently wrong answer:
+
+- **The declared type fixes the granularity.** A `:date` column rejects a
+  timestamp and a `:datetime` column rejects a bare day, rather than quietly
+  widening it to midnight. Write the midnight out.
+- **An explicit offset is a load error, not a conversion.**
+  `2026-01-01T00:00:00+05:00` means January 1st to whoever wrote it, and its UTC
+  instant is `2025-12-31T19:00:00Z` — converting silently moves the year. A `Z`
+  suffix is accepted, and so is an offset-free timestamp (read as UTC).
+- **An empty cell omits the field**, following the scalar rule (row `brand:2`
+  above has neither). An absent date differs meaningfully from any date, and a
+  zero time would silently satisfy every `before` rule written against the
+  column.
+- **A date-shaped string in a `:json` cell is not date-validated.** `:json` is
+  opaque structured data; only a declared column gets date treatment.
+
+There is no `:list<date>` — arrays of dates are out of scope, and the suffix is
+rejected by name rather than by accident — and no time-of-day type. A rejection
+is `APERTURE_CONFIG_INVALID` naming the column, the line, and the field, carrying
+the `provider.DateReason` and the layout expected, and **never the cell**: a date
+is frequently personal data.
+
 #### Array columns
 
 The type `list` produces a real `[]any` — the [array](#the-metadata-value-model)
@@ -393,15 +446,18 @@ object is safe.
 
 A missing `id` column, a duplicate id, a wrong column count, an unknown type or
 malformed type suffix, a value that will not coerce to its declared type, a list
-cell with an empty element, or a json cell that is not valid JSON or does not
-decode to an object is an `APERTURE_CONFIG_INVALID` error naming the column —
+cell with an empty element, a json cell that is not valid JSON or does not
+decode to an object, or a date cell that is not a canonical date of its column's
+granularity is an `APERTURE_CONFIG_INVALID` error naming the column —
 and, for a cell, the line and the offending element. A malformed id passes
 through as the identity package's `APERTURE_IDENTITY_INVALID`. Every parsed value
 is then checked against the [value model](#validating-at-load) with
 `provider.ValidateField`, so a shape, depth, or size violation fails the **load**
 as `APERTURE_METADATA_INVALID` instead of surfacing as a runtime error on the
 `Check` hot path. A json cell's rejection carries the column, the line, and the
-JSON kind or the decoder's message — never the cell, which is host data.
+JSON kind or the decoder's message; a date cell's carries the column, the line,
+the `reason`, and the layout expected. Neither ever carries the cell, which is
+host data — and, for a date, frequently personal data.
 
 ### Loading and the read-only contract
 
