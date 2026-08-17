@@ -171,7 +171,18 @@ func BenchmarkRuleEval(b *testing.B) {
 			if err != nil {
 				b.Fatalf("compile %s: %v", v.name, err)
 			}
-			in := rules.Input{Object: md, Principal: map[string]any{"id": user(0)}, Action: v.name}
+			// Now is what an Engine supplies at every decision; a variant with a
+			// relative-date operand resolves to nothing without it and would
+			// measure the deny path rather than the arithmetic. The real clock is
+			// the same source the Check-path benchmarks run against, and the
+			// relative fixture is chosen to hold for any clock at or after its
+			// metadata's hire date.
+			in := rules.Input{
+				Object:    md,
+				Principal: map[string]any{"id": user(0)},
+				Action:    v.name,
+				Now:       time.Now().UTC(),
+			}
 			ok, err := compiled.Eval(ctx, in)
 			if err != nil || !ok {
 				b.Fatalf("%s: eval=%v err=%v (source: %s)", v.name, ok, err, compiled.Source())

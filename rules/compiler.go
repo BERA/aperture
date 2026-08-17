@@ -391,9 +391,9 @@ func defaultFunctions() []expr.Option {
 		// It returns a canonical date STRING, which is byte-for-byte what a date
 		// literal in the same position would be, so `$date` parses both operands
 		// through one path and a relative date is interchangeable with a fixed
-		// one. When the date cannot be resolved — no reference instant, or
-		// arithmetic the seam does not implement yet — it returns nil, and the
-		// enclosing operator applies its ordinary deny-safe policy (false, with a
+		// one. When the date cannot be resolved — no reference instant, or an
+		// offset that leaves the representable year range — it returns nil, and
+		// the enclosing operator applies its ordinary deny-safe policy (false, with a
 		// shape note). It never raises: a rule must not fail to evaluate because
 		// of the date it is measured against.
 		expr.Function(fnRelativeDate, func(args ...any) (any, error) {

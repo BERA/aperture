@@ -194,9 +194,10 @@ Six rules, each of which is API rather than convention:
   author who chose `TODAY` reads back `TODAY`.
 - **A snap composes on top of the anchor.** `anchor: TODAY, snap: startOfYear` is
   legal and means the start of the year — the wider snap simply subsumes the
-  anchor's start-of-day. The snap is applied **after** the offset, so
-  `NOW, n: -5, unit: years, snap: startOfYear` is "the start of the year five
-  years ago", not "five years before the start of this year".
+  anchor's start-of-day. The snap is applied **before** the offset (see "UTC,
+  clamping, and the order of operations"), so the node reads left to right the
+  way it is spoken: `NOW, n: -5, unit: years, snap: startOfYear` is "the start of
+  the year, five years back".
 - **The node is an operand, and only a date operator's operand.** It is legal on
   either side of `before` / `after` / `onOrBefore` / `onOrAfter` / `sameDay` /
   `sameMonth` / `sameYear`, and as either bound of a `between` — the two bounds
@@ -230,19 +231,56 @@ because reflective method calls survive `expr.DisableAllBuiltins` — an unclamp
 calendar walk reachable from any rule. `allowedRoots` is unchanged, and `$rel` is
 unreachable from a rule for the same structural reason as `$op` and `$date`.
 
-**UTC, and clamping.** Every boundary is computed in UTC; there is no timezone
-knob. Week boundaries are ISO 8601 (**Monday** start). Offsetting by the three
-calendar units (`years`, `quarters`, `months`) **clamps at month end** rather than
-normalising the way `time.AddDate` does — `2026-03-31` minus one month is
-`2026-02-28`, not `2026-03-03`. `weeks` / `days` / `hours` / `minutes` are
-fixed-length and unaffected.
+### UTC, clamping, and the order of operations
 
-> **Not implemented yet.** `rules.resolveRelativeDate` resolves the anchor (and so
-> `n: 0` with `snap: none`); the offset arithmetic and the ten non-identity snaps
-> are still to be written. Until they land, a node with a non-zero offset or a
-> snap other than `none` **resolves to nothing and its comparison denies**, with
-> the ordinary `shape_mismatch` note. Denying is the only safe placeholder: an
-> approximation would grant or withhold access against a date nobody chose.
+Resolution is three steps in a fixed order: **anchor → snap → offset**.
+
+**Snap first, then offset.** The node reads left to right the way it is spoken —
+"the start of the year, five years back". The two orders are different functions,
+not a rearrangement: `startOfMonth` then `+1 day` is the **2nd of this month**,
+while `+1 day` then `startOfMonth` is the **1st of next month** when the anchor is
+a month end. The order is API, and a test pins a case where the two disagree.
+
+**Calendar offsets clamp at month end.** Offsetting by the three calendar units
+(`years`, `quarters`, `months`) pins the day to the last valid day of the target
+month rather than normalising the way `time.AddDate` does:
+
+| | this engine | `time.AddDate` |
+|---|---|---|
+| `2026-03-31` − 1 month | `2026-02-28` | `2026-03-03` |
+| `2026-05-31` − 1 month | `2026-04-30` | `2026-05-01` |
+| `2024-02-29` − 1 year | `2023-02-28` | `2023-03-01` |
+| `2026-01-31` + 1 month | `2026-02-28` | `2026-03-03` |
+| `2024-01-31` + 1 month | `2024-02-29` (leap) | `2024-03-02` |
+
+Clamping matches `java.time`, Luxon, and `date-fns`, so it is what an author who
+has met any other date library expects — and the standard library's answer is
+wrong here in the worst way: silently, and only when the anchor happens to fall on
+a long month end. Clamping never *extends* a date: `2023-02-28` + 1 year is
+`2024-02-28`, not the 29th. `weeks` / `days` / `hours` / `minutes` are
+fixed-length, are added as durations, and never clamp.
+
+**`start*` is midnight; `end*` is `23:59:59` on the period's last day** — the last
+representable instant, not the start of the next period. `between` is inclusive at
+both bounds, so an `endOfMonth` upper bound has to admit the whole final day; an
+exclusive next-boundary would admit the following day as well. Seconds rather than
+nanoseconds because the value model floors to whole seconds.
+
+**Week boundaries are ISO 8601 — Monday through Sunday.** A Sunday anchor snaps
+*back* six days to the Monday that started its week; `endOfWeek` is that Sunday at
+`23:59:59`. Quarters are calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec),
+so any day in February snaps back to January 1st.
+
+**Everything is UTC.** No `time.Local`, no `time.LoadLocation`, no timezone knob —
+asserted structurally over the package's sources, not just by fixture. DST is a
+non-issue by construction: UTC has no transitions, so a day offset is always
+exactly 24 hours.
+
+**Out of range denies.** An offset that leaves the four-digit year range the
+canonical forms can write (or that overflows a duration) resolves to **nothing**,
+and the enclosing operator denies with the ordinary `shape_mismatch` note — the
+same answer a missing reference instant gets. An instant that cannot be written in
+the canonical form is not a date this system has.
 
 **No reference instant, no date.** `rules.Input.Now`'s zero value means "no
 reference instant is available" — a hand-built `Input`; an `Engine` always
@@ -461,7 +499,7 @@ because the date-only form is a strict prefix of the timestamp form.
 | a number, bool, array, or object | **`false`** | `shape_mismatch`, `expected date, got number` |
 | a string that is not one of the two canonical forms | **`false`** | `date_invalid` |
 | `between` whose lower bound is after its upper bound | **`false`** | `date_bounds_inverted` |
-| a `relativeDate` that cannot be resolved (no reference instant, or arithmetic the seam does not implement yet) | **`false`** | `shape_mismatch`, `expected date, got absent`, path `(expression)` |
+| a `relativeDate` that cannot be resolved (no reference instant, or an offset that leaves the four-digit year range) | **`false`** | `shape_mismatch`, `expected date, got absent`, path `(expression)` |
 
 **Note the asymmetry with the collection operators, and that it is deliberate.**
 A collection operator gives an absent field a meaning — it reads as an *empty

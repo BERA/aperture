@@ -623,37 +623,44 @@ func TestRelativeDateResolvesToTheCanonicalTimestampForm(t *testing.T) {
 	}
 }
 
-// TestRelativeDateCalendarArithmeticIsNotImplementedYet pins the seam's CURRENT
-// behaviour so filling it in is a deliberate change rather than an accident.
-//
-// Offsetting by a unit (with month-end clamping) and applying a snap are the half
-// of resolveRelativeDate still to be written. Until then anything that needs them
-// resolves to nothing and its comparison denies — an approximation would grant or
-// withhold access against a date nobody chose, and would do it silently.
-//
-// WHEN THAT ARITHMETIC LANDS, THIS TEST SHOULD FAIL. Replace it with the
-// arithmetic's own table; do not relax it.
-func TestRelativeDateCalendarArithmeticIsNotImplementedYet(t *testing.T) {
-	pending := []struct {
+// TestRelativeDateResolvesOffsetsAndSnaps is the successor to the placeholder
+// that pinned the unimplemented seam: every combination it used to assert denied
+// must now resolve, and resolve to a named value. The exhaustive arithmetic
+// tables live in calendar_test.go; this is the end-to-end assertion that the seam
+// is wired, including the two worked examples from the node's own documentation.
+func TestRelativeDateResolvesOffsetsAndSnaps(t *testing.T) {
+	// The reference instant is 2026-03-04T12:30:45Z, a Wednesday.
+	cases := []struct {
 		name string
 		n    int
 		unit string
 		snap string
+		want string
 	}{
-		{"a non-zero offset", -3, UnitMonths, SnapNone},
-		{"a forward offset", 1, UnitDays, SnapNone},
-		{"a snap", 0, UnitDays, SnapStartOfYear},
-		{"both", -5, UnitYears, SnapStartOfYear},
+		{"three months prior to today", -3, UnitMonths, SnapNone, "2025-12-04T12:30:45Z"},
+		{"a forward offset", 1, UnitDays, SnapNone, "2026-03-05T12:30:45Z"},
+		{"a snap alone", 0, UnitDays, SnapStartOfYear, "2026-01-01T00:00:00Z"},
+		{"start of the year, five years back", -5, UnitYears, SnapStartOfYear, "2021-01-01T00:00:00Z"},
 	}
-	for _, tc := range pending {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := resolveRelativeDate(pinnedInstant, AnchorNow, tc.n, tc.unit, tc.snap); ok {
-				t.Fatalf("resolveRelativeDate now implements %s — replace this test with the arithmetic's own", tc.name)
+			v, ok := resolveRelativeDate(pinnedInstant, AnchorNow, tc.n, tc.unit, tc.snap)
+			if !ok {
+				t.Fatalf("resolveRelativeDate denied %s; the arithmetic must resolve it", tc.name)
 			}
-			// Deny-safe end to end: the rule still compiles and still evaluates.
+			if got := v.String(); got != tc.want {
+				t.Errorf("resolved to %s, want %s", got, tc.want)
+			}
+			// And end to end through a compiled rule: a field one day before the
+			// resolved bound is on-or-before it, one day after is not.
 			n := Compare(OpOnOrBefore, Var("object.hired_at"), RelativeDate(AnchorNow, tc.n, tc.unit, tc.snap))
-			if got := evalAgainst(t, n, map[string]any{"hired_at": "2020-01-01"}, pinnedInstant); got {
-				t.Errorf("an unresolved relative date must deny")
+			before := v.Time().Add(-24 * time.Hour).Format("2006-01-02T15:04:05Z")
+			after := v.Time().Add(24 * time.Hour).Format("2006-01-02T15:04:05Z")
+			if got := evalAgainst(t, n, map[string]any{"hired_at": before}, pinnedInstant); !got {
+				t.Errorf("%s is not on or before the resolved bound %s", before, tc.want)
+			}
+			if got := evalAgainst(t, n, map[string]any{"hired_at": after}, pinnedInstant); got {
+				t.Errorf("%s must not be on or before the resolved bound %s", after, tc.want)
 			}
 		})
 	}

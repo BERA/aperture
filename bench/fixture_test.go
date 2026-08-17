@@ -106,6 +106,12 @@ const (
 	// evaluation rather than two. The pair makes the per-operand parse cost
 	// readable by difference rather than as one absolute number.
 	ruleDateBetween = "rule-date-between"
+	// ruleDateRelative is the same binary comparison with its bound RESOLVED per
+	// evaluation instead of read from a literal: calendar arithmetic (a snap and
+	// a clamping quarter offset) plus the canonical-string round trip $rel does
+	// on the way into $date. Read as a delta from rule-date-compare, this is the
+	// per-evaluation cost of a relative date rather than a fixed one.
+	ruleDateRelative = "rule-date-relative"
 )
 
 // The date fixture's field values. They are the two canonical granularities, so
@@ -190,6 +196,18 @@ func ruleVariants() []ruleVariant {
 			ast: rules.Between(rules.Var("object.reviewed_at"),
 				rules.Lit("2026-01-01"), rules.Lit("2026-12-31T23:59:59Z")),
 			render: `guarded dispatcher: $date("between", __notes, "object.reviewed_at", object?.reviewed_at, ...) — 3 parses`,
+		},
+		// The relative bound is resolved on EVERY evaluation — snap, offset,
+		// format, and then the parse $date does on the way back in — where the
+		// two cases above read a literal. The rule reads "hired before the start
+		// of the previous quarter", and it is a stable ALLOW for any clock at or
+		// after the fixture's hire date: the bound only moves forward with the
+		// wall clock, so this cannot start failing its warm-up assertion later.
+		{
+			name: ruleDateRelative,
+			ast: rules.Compare(rules.OpBefore, rules.Var("object.hired_at"),
+				rules.RelativeDate(rules.AnchorNow, -1, rules.UnitQuarters, rules.SnapStartOfQuarter)),
+			render: `guarded dispatcher: $date("before", ..., $rel(__now, "NOW", -1, "quarters", "startOfQuarter"), ...) — 2 parses + calendar arithmetic`,
 		},
 	}
 }

@@ -72,8 +72,8 @@ const (
 // calendar they are applied, so offsetting by them CLAMPS at month end rather
 // than normalising (Go's time.AddDate would turn 2026-03-31 minus one month into
 // 2026-03-03, which is not what "a month earlier" means to anyone). The last four
-// are FIXED-LENGTH and need no clamping. See resolveRelativeDate for where that
-// arithmetic lands.
+// are FIXED-LENGTH and need no clamping. calendar.go owns that arithmetic and the
+// rationale for diverging from the standard library.
 const (
 	UnitYears    = "years"
 	UnitQuarters = "quarters"
@@ -84,13 +84,18 @@ const (
 	UnitMinutes  = "minutes"
 )
 
-// The eleven snaps — what the offset result is rounded to once it is computed.
+// The eleven snaps — the calendar boundary the anchor is rounded to.
 //
-// A snap is applied AFTER the offset, so `NOW, n: -5, unit: years, snap:
-// startOfYear` is "the start of the year five years ago", not "five years before
-// the start of this year". Week boundaries are ISO 8601: a week starts on Monday.
-// Every boundary is computed in UTC, because every instant in the model is UTC
-// and there is no timezone knob anywhere in the engine.
+// A snap is applied BEFORE the offset, so the node reads left to right the way it
+// is spoken: `NOW, n: -5, unit: years, snap: startOfYear` is "the start of the
+// year, five years back". The order is API, not an implementation detail — for a
+// month-end anchor the two orders give different days — and it is documented at
+// the arithmetic itself (calendar.go). Week boundaries are ISO 8601: a week runs
+// Monday through Sunday. An `end*` boundary is the LAST REPRESENTABLE INSTANT of
+// its period (23:59:59, the model's precision), not the start of the next one, so
+// an `endOfMonth` upper bound of an inclusive `between` admits the whole final
+// day. Every boundary is computed in UTC, because every instant in the model is
+// UTC and there is no timezone knob anywhere in the engine.
 const (
 	// SnapNone is the identity: the offset result is used as computed. It is a
 	// real vocabulary member rather than an absent key, so the field always
@@ -223,30 +228,33 @@ func (n *Node) offsetCount() (int, error) {
 
 // resolveRelativeDate turns a validated relative date into a concrete date value,
 // reporting false when it cannot be resolved at all. It is the runtime half of
-// the node, called by the `$rel` dispatcher, and it is the SEAM the calendar
-// arithmetic fills.
+// the node, called by the `$rel` dispatcher.
 //
-// What it decides today:
+// Three steps, in this order:
 //
-//   - NO REFERENCE INSTANT, NO DATE. A zero `now` means the evaluation was handed
-//     no reference instant (a hand-built rules.Input; an Engine always supplies
-//     one). Resolving against year 1 would silently answer every "in the last 90
-//     days" question with a date in the year 1, so this denies instead — the
-//     dispatcher returns nil and the enclosing date operator applies its ordinary
-//     deny-safe policy.
 //   - THE ANCHOR. NOW is the instant to the second; TODAY is midnight of the
 //     instant's UTC day. Both are exact, neither can clamp, and TODAY is resolved
 //     here rather than desugared into a snap so that the persisted anchor and the
 //     resolved value stay one-to-one.
+//   - THE SNAP, applied to the anchor (calendar.go).
+//   - THE OFFSET, applied to the snapped boundary (calendar.go), clamping at
+//     month end for the three calendar units.
 //
-// WHAT IS NOT IMPLEMENTED YET, and is deliberately deny-safe until it is: the
-// calendar arithmetic — offsetting by the seven units (with month-end CLAMPING
-// for years, quarters, and months, which time.AddDate does not do) and the ten
-// non-identity snaps (with ISO-8601 Monday weeks). Until that lands, a node with
-// a non-zero offset or a snap other than "none" resolves to nothing and its
-// comparison is false. Denying is the only safe placeholder: an approximation
-// here would grant or withhold access against a date nobody chose, and would do
-// it silently.
+// SNAP FIRST, THEN OFFSET, because that is how the node reads aloud: "the start
+// of the year, five years back". The two orders are different functions, not a
+// rearrangement — start of the month then plus one day is the 2nd of this month,
+// while plus one day then start of the month is the 1st of NEXT month for a
+// month-end anchor — so the order is API. See calendar.go, which owns the
+// arithmetic and the clamping rationale.
+//
+// NO REFERENCE INSTANT, NO DATE. A zero `now` means the evaluation was handed no
+// reference instant (a hand-built rules.Input; an Engine always supplies one).
+// Resolving against year 1 would silently answer every "in the last 90 days"
+// question with a date in the year 1, so this denies instead — the dispatcher
+// returns nil and the enclosing date operator applies its ordinary deny-safe
+// policy. The same answer covers an offset that leaves the representable year
+// range and an anchor, unit, or snap outside its vocabulary (both unreachable
+// through a validated AST): every failure here is a deny, never a raise.
 //
 // The result is always the TIMESTAMP granularity. Granularity never affects
 // ordering (provider.DateValue compares instants, so "2026-03-04" and
@@ -265,13 +273,19 @@ func resolveRelativeDate(now time.Time, anchor string, n int, unit, snap string)
 		// Unreachable through a validated AST; deny-safe regardless.
 		return provider.DateValue{}, false
 	}
-	if n != 0 || snap != SnapNone {
-		// The calendar arithmetic — offsetting t by n of `unit` (clamping at
-		// month end for the three calendar units) and then applying `snap` (with
-		// ISO-8601 Monday weeks) — is the half of this seam that is still to be
-		// written. Until it is, anything that needs it resolves to nothing and
-		// the enclosing comparison denies. See the note above for why an
-		// approximation is not an acceptable placeholder.
+
+	t, ok := snapInstant(t, snap)
+	if !ok {
+		return provider.DateValue{}, false
+	}
+	t, ok = offsetInstant(t, n, unit)
+	if !ok {
+		return provider.DateValue{}, false
+	}
+	if !inCanonicalRange(t) {
+		// A fixed-length offset can leave the four-digit year range without
+		// overflowing a Duration; the canonical forms cannot write the result, so
+		// there is no date to compare against.
 		return provider.DateValue{}, false
 	}
 	return provider.DateTimeOf(t), true
