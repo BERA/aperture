@@ -6,9 +6,21 @@ import (
 	"time"
 )
 
-// Clock is the time source the cache reads for TTL expiry. It is injected so
-// tests drive expiry deterministically instead of sleeping; production uses the
-// real clock.
+// Clock is the engine's SINGLE time source. It is read for two things:
+//
+//   - compiled-rule cache TTL expiry (this file), and
+//   - the per-decision reference instant a rule's date comparisons resolve
+//     against (now.go).
+//
+// One clock rather than two is deliberate. An engine holding two independent
+// ideas of "now" can have them disagree — a cache entry expiring against one
+// instant while a date rule decides against another — and that is a worse failure
+// than the coupling it would avoid. The coupling's visible cost is that a test
+// pinning the clock for a month-end date fixture also freezes cache expiry; see
+// WithClock.
+//
+// It is injected so tests drive both behaviours deterministically instead of
+// sleeping; production uses the real clock.
 type Clock interface {
 	Now() time.Time
 }

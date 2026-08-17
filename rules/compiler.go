@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
@@ -26,31 +27,63 @@ import (
 // it), so it is reachable only from the expression the renderer emits. It may be
 // nil — the decision hot path leaves it unset, and every NoteCollector method is
 // nil-safe.
+//
+// Now is the decision instant (now.go) the same way: a per-decision snapshot of
+// the engine's clock, exposed under an identifier that is not a variable root, so
+// only a renderer-emitted expression can read it. Keeping it OUT of allowedRoots
+// is a security boundary, not a style choice — reflective method calls survive
+// expr.DisableAllBuiltins, so an exposed `NOW` root would make
+// `NOW.AddDate(0, -3, 0)` a well-formed var path. It is always UTC, and its zero
+// value means no reference instant was supplied (a directly-built Input); a date
+// operator that needs one denies rather than resolving against year 1.
 type evalEnv struct {
 	Object    map[string]any `expr:"object"`
 	Principal map[string]any `expr:"principal"`
 	Account   map[string]any `expr:"account"`
 	Action    string         `expr:"action"`
 	Notes     *NoteCollector `expr:"__notes"`
+	Now       time.Time      `expr:"__now"`
 }
 
 // notesVar is the identifier evalEnv.Notes is exposed under, and the name
 // renderGuarded passes to the dispatcher.
 const notesVar = "__notes"
 
+// nowVar is the identifier evalEnv.Now is exposed under — the name a renderer
+// passes to a dispatcher that needs the decision instant. Like notesVar it is
+// absent from allowedRoots, so no rule can name it.
+const nowVar = "__now"
+
 // Input is the per-evaluation context a compiled rule reads. Object is the
 // object's metadata snapshot (treated read-only — never mutated), Principal and
 // Account are attribute bags, and Action is the action verb. A nil map is read as
 // empty.
+//
+// Now is the decision's reference instant — the value a rule's date arithmetic
+// resolves against. An Engine fills it from its injected Clock exactly once per
+// decision (see now.go), so a rule that refers to "now" twice cannot straddle a
+// tick and an Explain trace can be reproduced against a recorded instant. A
+// caller building an Input by hand may leave it zero: that means "no reference
+// instant is available", which any date operator needing one treats as deny-safe
+// rather than resolving against year 1. It is normalised to UTC when the
+// evaluation environment is built, so a non-UTC value cannot reach a comparison.
 type Input struct {
 	Object    map[string]any
 	Principal map[string]any
 	Account   map[string]any
 	Action    string
+	Now       time.Time
 }
 
 // env builds the tagged evaluation environment from the public Input, binding the
-// per-evaluation notes sink (nil on the decision hot path).
+// per-evaluation notes sink (nil on the decision hot path) and the decision
+// instant.
+//
+// The UTC conversion is repeated here rather than trusted from the snapshot
+// boundary: env is the last point before evaluation and it is also the path a
+// direct library caller takes with a hand-built Input, so normalising here means
+// no zone reaches a comparison by any route. It costs nothing — Time.UTC only
+// rewrites the value's location pointer.
 func (in Input) env(notes *NoteCollector) evalEnv {
 	return evalEnv{
 		Object:    in.Object,
@@ -58,6 +91,7 @@ func (in Input) env(notes *NoteCollector) evalEnv {
 		Account:   in.Account,
 		Action:    in.Action,
 		Notes:     notes,
+		Now:       in.Now.UTC(),
 	}
 }
 
@@ -146,6 +180,11 @@ func Function(name string, fn func(args ...any) (any, error)) CompilerOption {
 // isNotEmpty); all of expr-lang's builtins are disabled, so no wall-clock or
 // random function is reachable and evaluation stays deterministic. Host functions
 // added with Function join that set.
+//
+// That determinism survives the date operators because the reference instant is
+// DATA, not a function: it arrives as Input.Now and is exposed to the program as
+// the __now environment entry, fixed for the whole evaluation. Nothing a rule can
+// call reads a clock.
 func NewCompiler(opts ...CompilerOption) *Compiler {
 	c := &Compiler{}
 	// The typed env, a required boolean result, and a disabled builtin library

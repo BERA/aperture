@@ -188,6 +188,78 @@ an unknown variable, rejected at validation:
 - `account` — account attributes (reserved; empty until wired).
 - `action` — the action verb (a string).
 
+There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per
+decision" below: the reference instant reaches evaluation as an argument, never as
+a variable.
+
+## The clock, and one `NOW` per decision
+
+Date comparisons need a reference instant, and evaluation still has to be pure —
+every `expr-lang` builtin is disabled, so nothing a rule can *call* reads a clock.
+The instant is therefore **data**, fixed before the program runs.
+
+**One clock.** `rules.WithClock` injects the engine's **single** time source. It
+drives two things:
+
+1. compiled-rule cache **TTL expiry** (`WithCacheTTL`), and
+2. the per-decision reference instant, `NOW`.
+
+Two independent clocks inside one engine can disagree — an entry expiring against
+one instant while a date rule decides against another — and that is a worse
+failure than the coupling. **The coupling is real and intended: pinning the clock
+so a month-end date fixture is reproducible also freezes cache expiry**, so a TTL'd
+entry under a frozen clock never expires. `TestPinnedClockAlsoFreezesCacheExpiry`
+asserts both halves so the consequence cannot quietly stop being true.
+
+**One instant per decision.** The clock is read **once per decision**, not once per
+reference and not once per rule:
+
+```
+Clock → DecisionInstant (scope) → Input.Now → __now (evaluation environment)
+```
+
+A decision evaluates a rule per candidate grant — twice per candidate for a
+rule-backed `Enumerate` — so the decision engine opens a scope
+(`rules.WithDecisionInstant`) at each decision boundary (`Check`, `Enumerate`,
+`Explain`) and every evaluation underneath shares the **first** instant taken.
+Nesting is idempotent, so a per-candidate decision inside an enumeration keeps the
+enumeration's instant. Outside a scope — a host driving `rules.Engine` directly —
+each evaluation takes its own snapshot from the same clock. Either way a rule that
+refers to `NOW` twice **cannot straddle a tick**.
+
+The scope is a **memo, not an injection point**: the value always comes from the
+engine's `Clock`. There is no API for a caller to supply its own instant, because
+two callers disagreeing about "now" is exactly the defect the single clock exists
+to prevent. Likewise there is **no timezone knob**: the instant is converted to
+UTC at the snapshot boundary *and* again when the evaluation environment is built,
+so no zone can reach a comparison however an injected clock is implemented.
+
+**`NOW` is not a variable root, and must never become one.** It is exposed to the
+compiled program as `__now`, which is absent from the four roots above — exactly
+as the notes sink `__notes` is. That is a security boundary, not a style choice:
+reflective **method calls survive `expr.DisableAllBuiltins`**, so an exposed root
+would make `NOW.AddDate(0, -3, 0)` and `NOW.Unix()` well-formed var paths — an
+unclamped calendar walk reachable from any rule. A relative-date node renders
+literal arguments to a `$`-prefixed dispatcher and reads `__now` as one of them,
+the way `$date` already reads `__notes`. `TestNowIsNotReachableFromARule` fails if
+the identifier is ever added to `allowedRoots`.
+
+**The cache never carries an instant.** The rendered source names the identifier,
+never a resolved timestamp, so a cached program cannot answer against a stale
+`NOW`: compile, advance the clock, re-evaluate, and the cache **hits** while the
+evaluation sees the new instant.
+
+**`Explain` records it.** `Trace.Now` is the instant the decision's rules resolved
+against — always UTC, taken once for the whole trace, zero when the decision
+evaluated no rule. It makes a date-sensitive verdict reproducible: replay the
+request with the clock pinned to it and the verdict must be identical. It is
+deliberately **not** rendered by `Trace.String()`, which promises byte-identical
+output for the same decision.
+
+**Testing.** Time-dependent tests pin the clock and never assert against
+`time.Now()` — an expectation derived from the real clock only exercises the
+interesting calendar path on the days the calendar happens to cooperate.
+
 ## Missing fields: nested access is nil-safe, but `nin` grants
 
 Metadata is ragged — one object carries `owner`, the next does not. Two rules of
@@ -363,14 +435,20 @@ Note that `contains`, `startsWith` and `endsWith` are reserved as **infix
 operators** by expr's grammar, so they are registered but not reachable through a
 `call` node; the other nine are.
 
+Date operators do not break that: the reference instant is **data** (`__now`),
+fixed for the whole evaluation, not a function a rule could call. See "The clock,
+and one `NOW` per decision".
+
 ## Compile-once, cache
 
 A rule is rendered to its canonical expr-lang expression, hashed (sha256), and the
 compiled program is cached by that hash — so distinct rule references whose ASTs
 render identically share one compiled program, and per-`Check` cost is bounded
 (the NFR lever E4-S4 tunes). The cache is concurrency-safe with an optional TTL
-read from an injected `Clock` (`WithCacheTTL` / `WithClock`); `CacheStats`
-exposes hit/miss/eviction counters.
+read from the engine's injected `Clock` (`WithCacheTTL` / `WithClock`);
+`CacheStats` exposes hit/miss/eviction counters. That `Clock` is the **same** one
+the per-decision `NOW` is snapshotted from — see "The clock, and one `NOW` per
+decision" for what pinning it does to expiry.
 
 A cache **hit** takes only the read lock: the counters are `sync/atomic`, so
 concurrent evaluations no longer serialise on a counter bump they never read.
