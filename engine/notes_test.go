@@ -82,14 +82,18 @@ func TestShapeMismatchIsDeniedNotErrored(t *testing.T) {
 		t.Fatalf("a shape mismatch must deny: %+v", bad)
 	}
 
-	// Enumerate is unchanged. Enumerating a RULE-BACKED inclusive grant is still
-	// unwired (it needs bounded Members, not per-object Contains), so it fails
-	// exactly as it did before this change — and notably NOT with a rule-eval
-	// error, which is what a shape mismatch used to produce.
-	_, err = eng.Enumerate(ctx, EnumerateRequest{
+	// Enumerate must agree with Check on the very same grant: the deny-safe policy
+	// is a property of the decision, not of one endpoint. A rule-backed inclusive
+	// grant enumerates by listing the type and keeping what the rule selects, so
+	// the mistyped object is filtered out of the member list rather than failing
+	// the whole enumeration.
+	members, err := eng.Enumerate(ctx, EnumerateRequest{
 		Account: acctAcme, Principal: "alice", Action: "read", Pattern: "account:acme/**"})
-	if code := aerr.CodeOf(err); code != aerr.APERTURE_SCOPE_RULE_UNCONFIGURED {
-		t.Fatalf("Enumerate code = %q, want the pre-existing APERTURE_SCOPE_RULE_UNCONFIGURED (err: %v)", code, err)
+	if err != nil {
+		t.Fatalf("a shape mismatch must not fail Enumerate: %v (code %s)", err, aerr.CodeOf(err))
+	}
+	if len(members) != 1 || members[0] != "account:acme/document:good" {
+		t.Fatalf("members = %v, want only the well-shaped document", members)
 	}
 }
 

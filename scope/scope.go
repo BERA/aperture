@@ -1,44 +1,45 @@
 // Package scope holds Aperture's pluggable scope-strategy resolvers: the seam
 // that decides HOW a grant enumerates the objects it covers (FR-7).
 //
-// In E1 a grant's object set was a single literal identity pattern. In E2 a
-// grant declares an "object access mode" — a scope strategy — that the decision
-// engine consults for object membership instead of (only) literal pattern
-// matching. This package ships the three built-in strategies and a registry so
-// host code can add its own:
+// A grant's object set is not always a single literal identity pattern. A
+// permission may declare an "object access mode" — a scope strategy — that the
+// decision engine consults for object membership instead of (only) literal
+// pattern matching. This package ships the three built-in strategies and a
+// registry so host code can add its own:
 //
-//   - literal   — the E1 behaviour: the grant covers exactly the objects its
-//     identity pattern matches. (Owned natively by the engine; the registry
-//     covers the three non-trivial strategies below.)
+//   - literal   — the grant covers exactly the objects its identity pattern
+//     matches. (Owned natively by the engine; the registry covers the three
+//     non-trivial strategies below.)
 //   - implicit  — every object of the permission's type within the grant's
 //     pattern scope (unfettered, opt-out-able via exclusive).
-//   - inclusive — opt-in: only the objects named by an explicit id-list (full
-//     list-backed path) OR selected by a rule (E2-S3 seam).
+//   - inclusive — opt-in: only the objects named by an explicit id-list OR
+//     selected by a rule.
 //   - exclusive — opt-out: every object of the type within the pattern scope
-//     EXCEPT those named by an id-list (full) or excluded by a rule (E2-S3 seam).
+//     EXCEPT those named by an id-list or excluded by a rule.
 //
 // Membership composes with the grant's identity pattern: the pattern always
 // bounds the scope (and supplies the specificity the engine's deny-overrides
 // tiebreak consumes), while the strategy decides membership WITHIN that bound.
 // A resolver never computes specificity — that stays the pattern's job in the
-// engine, so the E1 resolution semantics are untouched.
+// engine, so literal resolution semantics are untouched.
 //
 // Dependencies are deliberately minimal: scope imports only identity and errors,
 // never model, so it stays a leaf the engine adapts model.Grant/Permission into.
-// The two not-yet-built dependencies are isolated behind seam interfaces with
-// inert defaults:
+// The two runtime dependencies are isolated behind seam interfaces with inert
+// defaults, so a host that wires neither still gets working literal and
+// list-backed behaviour instead of a construction failure:
 //
-//   - ObjectLister enumerates "all objects of a type" for implicit/exclusive
-//     Members. E2-S2's object provider supplies the real one; until then the
-//     default returns APERTURE_SCOPE_LISTER_UNCONFIGURED. Contains never needs
-//     it (implicit/exclusive membership is computable without enumeration).
-//   - RuleEvaluator evaluates a rule-backed inclusive/exclusive path. E2-S3
-//     wires it; until then the default returns APERTURE_SCOPE_RULE_UNCONFIGURED.
+//   - ObjectLister enumerates "all objects of a type", which every Members path
+//     that is not purely list-backed needs. With none wired the default reports
+//     APERTURE_SCOPE_LISTER_UNCONFIGURED. Contains never needs it
+//     (implicit/exclusive membership is computable without enumeration).
+//   - RuleEvaluator evaluates a rule-backed inclusive/exclusive path. With none
+//     wired the default reports APERTURE_SCOPE_RULE_UNCONFIGURED.
 //
 // Resolver evaluation runs inside the engine's Check hot path, so construction
 // is cheap (small value structs, list membership by linear scan over the
-// typically-small id-list, no map allocation) and holds no cache — nothing here
-// precludes one (E4-S4).
+// typically-small id-list, no map allocation on the Contains path) and holds no
+// cache — nothing here precludes one.
 package scope
 
 import (
@@ -53,7 +54,7 @@ import (
 // Built-in strategy keys. literal is owned natively by the engine and is not in
 // the default registry; the other three are the resolvers this package ships.
 const (
-	// StrategyLiteral is the E1 default: cover exactly the pattern's matches.
+	// StrategyLiteral is the default: cover exactly the pattern's matches.
 	StrategyLiteral = "literal"
 	// StrategyImplicit covers every object of the type within the pattern scope.
 	StrategyImplicit = "implicit"
@@ -74,9 +75,9 @@ const DefaultMaxMembers = 1000
 //
 // Contains answers the hot-path question — "is this concrete object a member of
 // the grant's object set?" — and never needs to enumerate. Members performs a
-// bounded enumeration for Enumerate-style callers (E2-S4); strategies that
-// enumerate "all objects of the type" depend on the ObjectLister and surface
-// APERTURE_SCOPE_LISTER_UNCONFIGURED until E2-S2 supplies one.
+// bounded enumeration for Enumerate-style callers; strategies that enumerate
+// "all objects of the type" require an ObjectLister and surface
+// APERTURE_SCOPE_LISTER_UNCONFIGURED when none is wired.
 type ScopeResolver interface {
 	// Contains reports whether object is a member of the grant's object set.
 	Contains(ctx context.Context, object identity.Identity) (bool, error)
@@ -105,8 +106,8 @@ type Spec struct {
 	// IDs is the explicit object-identity list for the inclusive/exclusive
 	// list-backed path. Entries are canonical identity strings.
 	IDs []string
-	// Rule is the rule reference for the inclusive/exclusive rule-backed path
-	// (E2-S3). Empty when the strategy uses the list path.
+	// Rule is the rule reference for the inclusive/exclusive rule-backed path.
+	// Empty when the strategy uses the list path.
 	Rule string
 }
 
@@ -195,36 +196,41 @@ type GrantContext struct {
 }
 
 // ObjectLister enumerates the object identities of a type, bounded. It is the
-// minimal seam implicit/exclusive Members depend on; E2-S2's object provider
-// supplies the real implementation. limit <= 0 means DefaultMaxMembers.
+// minimal seam every non-list-backed Members path depends on; a host supplies
+// the real implementation (Aperture's own object provider registry satisfies it
+// directly). limit <= 0 means DefaultMaxMembers.
 type ObjectLister interface {
 	// List returns up to limit object identities of objectType that match
 	// pattern. The pattern bounds the enumeration to the grant's scope.
 	List(ctx context.Context, objectType string, pattern identity.Pattern, limit int) ([]identity.Identity, error)
 }
 
-// noLister is the default ObjectLister: enumeration is unavailable until E2-S2.
+// noLister is the default ObjectLister: it reports that enumeration has no
+// source rather than returning nothing, because an empty member list is a valid
+// answer and an unwired dependency must not be able to impersonate one.
 type noLister struct{}
 
 func (noLister) List(context.Context, string, identity.Pattern, int) ([]identity.Identity, error) {
 	return nil, aerr.New(aerr.APERTURE_SCOPE_LISTER_UNCONFIGURED,
-		"scope: object enumeration requires an ObjectLister (arrives in E2-S2)")
+		"scope: object enumeration requires an ObjectLister")
 }
 
 // RuleEvaluator decides rule-backed scope membership. It is the seam the
-// rule-driven inclusive/exclusive path consults; E2-S3 supplies the
-// expr-lang-backed implementation. Selected reports whether object is selected by rule for the
-// given principal/action context.
+// rule-driven inclusive/exclusive path consults; Aperture's rules engine
+// satisfies it directly. Selected reports whether object is selected by rule for
+// the given principal/action context.
 type RuleEvaluator interface {
 	Selected(ctx context.Context, rule string, object identity.Identity, principal, action string) (bool, error)
 }
 
-// noRules is the default RuleEvaluator: the rule path is unwired until E2-S3.
+// noRules is the default RuleEvaluator: a grant that declares a rule but is
+// evaluated with no evaluator wired is genuinely unconfigured, and says so
+// rather than deciding.
 type noRules struct{}
 
 func (noRules) Selected(context.Context, string, identity.Identity, string, string) (bool, error) {
 	return false, aerr.New(aerr.APERTURE_SCOPE_RULE_UNCONFIGURED,
-		"scope: rule-backed membership requires a RuleEvaluator (arrives in E2-S3)")
+		"scope: rule-backed membership requires a RuleEvaluator")
 }
 
 // Deps are the runtime dependencies a resolver may consult. The zero value is

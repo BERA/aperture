@@ -81,9 +81,12 @@ type ScopeResolver interface {
 - `Contains` answers the hot-path question "is this concrete object a member?"
   and must never enumerate.
 - `Members` performs a bounded enumeration (bounded by `scope.DefaultMaxMembers`)
-  for `Enumerate`-style callers. If it needs to list "all objects of a type", it
-  consults the injected `scope.ObjectLister`; when none is configured, return
-  `APERTURE_SCOPE_LISTER_UNCONFIGURED`.
+  for `Enumerate`-style callers, and must agree with `Contains` — anything
+  `Contains` accepts belongs in the member set, or the decision endpoints
+  contradict each other. If it needs to list "all objects of a type" (including
+  to filter a non-invertible predicate list-then-filter), it consults the
+  injected `scope.ObjectLister`; when none is configured, return
+  `APERTURE_SCOPE_LISTER_UNCONFIGURED` rather than an empty set.
 
 Provide a `scope.Factory` that validates the parsed `scope.Spec` for your
 strategy and captures the `GrantContext` + `Deps`:

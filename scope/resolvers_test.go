@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	aerr "github.com/frankbardon/aperture/errors"
@@ -166,6 +167,157 @@ func TestInclusiveRulePath(t *testing.T) {
 	}
 	if ok, _ := res.Contains(ctx, identity.MustParse("account:acme/document:6")); ok {
 		t.Errorf("non-selected object must not be covered")
+	}
+}
+
+// TestInclusiveMembers is the endpoint-agreement gate: whatever Contains answers
+// object-by-object, Members must return as a set. The rule half is
+// list-then-filter over the ObjectLister — a rule is an arbitrary expression over
+// metadata and is not invertible, so there is nothing to invert.
+func TestInclusiveMembers(t *testing.T) {
+	// One catalogue for every case, so the difference between rows is the grant's
+	// configuration and the wired deps — never the object population.
+	catalogue := fakeLister{objects: []identity.Identity{
+		identity.MustParse("account:acme/document:1"),
+		identity.MustParse("account:acme/document:2"),
+		identity.MustParse("account:acme/document:3"),
+		identity.MustParse("account:other/document:9"),
+	}}
+	// The rule selects documents 2 and 3, plus one object the lister never
+	// returns (proving the rule half is bounded by the listing, not by the rule).
+	selecting := fakeRules{selected: map[string]bool{
+		"account:acme/document:2":   true,
+		"account:acme/document:3":   true,
+		"account:acme/document:404": true,
+		"account:other/document:9":  true,
+	}}
+
+	cases := []struct {
+		name     string
+		ids      []string
+		rule     string
+		query    string
+		deps     Deps
+		want     []string
+		wantCode aerr.Code
+	}{{
+		name:  "list only needs no lister",
+		ids:   []string{"account:acme/document:1", "account:other/document:9"},
+		query: "**",
+		deps:  Deps{},
+		// document:9 is outside the grant pattern, so the pattern bounds the list.
+		want: []string{"account:acme/document:1"},
+	}, {
+		name:  "rule only enumerates through the lister",
+		rule:  "selective",
+		query: "**",
+		deps:  Deps{Lister: catalogue, Rules: selecting},
+		want:  []string{"account:acme/document:2", "account:acme/document:3"},
+	}, {
+		name:  "list and rule enumerate their union without duplicates",
+		ids:   []string{"account:acme/document:1", "account:acme/document:2"},
+		rule:  "selective",
+		query: "**",
+		deps:  Deps{Lister: catalogue, Rules: selecting},
+		// document:2 is in BOTH halves and appears once.
+		want: []string{"account:acme/document:1", "account:acme/document:2", "account:acme/document:3"},
+	}, {
+		name:  "the query pattern bounds both halves",
+		ids:   []string{"account:acme/document:1"},
+		rule:  "selective",
+		query: "account:acme/document:2",
+		deps:  Deps{Lister: catalogue, Rules: selecting},
+		want:  []string{"account:acme/document:2"},
+	}, {
+		name: "a rule that selects nothing enumerates an empty set, not an error",
+		rule: "selective",
+		// Nothing in the catalogue is under this account, so the listing is empty.
+		query: "account:empty/**",
+		deps:  Deps{Lister: catalogue, Rules: selecting},
+		want:  nil,
+	}, {
+		name:     "rule-backed with no lister reports the missing lister",
+		rule:     "selective",
+		query:    "**",
+		deps:     Deps{Rules: selecting},
+		wantCode: aerr.APERTURE_SCOPE_LISTER_UNCONFIGURED,
+	}, {
+		name:     "a list alongside a rule does not excuse the missing lister",
+		ids:      []string{"account:acme/document:1"},
+		rule:     "selective",
+		query:    "**",
+		deps:     Deps{Rules: selecting},
+		wantCode: aerr.APERTURE_SCOPE_LISTER_UNCONFIGURED,
+	}, {
+		name:     "rule-backed with no evaluator reports the missing evaluator",
+		rule:     "selective",
+		query:    "**",
+		deps:     Deps{Lister: catalogue},
+		wantCode: aerr.APERTURE_SCOPE_RULE_UNCONFIGURED,
+	}}
+
+	r := DefaultRegistry()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := mustResolve(t, r,
+				gc(StrategyInclusive, "account:acme/**", "document", tc.ids, tc.rule), tc.deps)
+			got, err := res.Members(context.Background(), identity.MustParsePattern(tc.query))
+			if tc.wantCode != "" {
+				if code := aerr.CodeOf(err); code != tc.wantCode {
+					t.Fatalf("code = %q, want %q (members %v, err %v)", code, tc.wantCode, got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Members: %v", err)
+			}
+			ids := make([]string, 0, len(got))
+			for _, o := range got {
+				ids = append(ids, o.String())
+			}
+			slices.Sort(ids)
+			want := slices.Clone(tc.want)
+			slices.Sort(want)
+			if !slices.Equal(ids, want) {
+				t.Fatalf("members = %v, want %v", ids, want)
+			}
+		})
+	}
+}
+
+// TestInclusiveMembersAgreesWithContains pins the property the table above only
+// samples: Members and Contains are two views of one membership predicate.
+func TestInclusiveMembersAgreesWithContains(t *testing.T) {
+	objects := []identity.Identity{
+		identity.MustParse("account:acme/document:1"),
+		identity.MustParse("account:acme/document:2"),
+		identity.MustParse("account:acme/document:3"),
+	}
+	res := mustResolve(t, DefaultRegistry(),
+		gc(StrategyInclusive, "account:acme/**", "document",
+			[]string{"account:acme/document:1"}, "selective"),
+		Deps{
+			Lister: fakeLister{objects: objects},
+			Rules:  fakeRules{selected: map[string]bool{"account:acme/document:3": true}},
+		})
+
+	ctx := context.Background()
+	members, err := res.Members(ctx, identity.MustParsePattern("**"))
+	if err != nil {
+		t.Fatalf("Members: %v", err)
+	}
+	inMembers := make(map[string]bool, len(members))
+	for _, m := range members {
+		inMembers[m.String()] = true
+	}
+	for _, o := range objects {
+		want, err := res.Contains(ctx, o)
+		if err != nil {
+			t.Fatalf("Contains(%s): %v", o, err)
+		}
+		if got := inMembers[o.String()]; got != want {
+			t.Errorf("%s: Members says %v, Contains says %v", o, got, want)
+		}
 	}
 }
 

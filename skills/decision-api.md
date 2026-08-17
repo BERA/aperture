@@ -61,9 +61,18 @@ enumerates unboundedly:
 
 - Candidates come from each ALLOW grant's covered objects — a scope resolver's
   bounded `Members` (implicit/exclusive enumerate "all of type" through the
-  provider `ObjectLister`; inclusive uses its id-list; literal yields a
-  concrete-identity grant or an explicit "{a,b,c}" id-set expanded to its
-  members, but never a wildcard), intersected with the query pattern.
+  provider `ObjectLister`; inclusive returns the union of its id-list and, when
+  it declares a rule, the same all-of-type listing filtered by `Contains`;
+  literal yields a concrete-identity grant or an explicit "{a,b,c}" id-set
+  expanded to its members, but never a wildcard), intersected with the query
+  pattern.
+- **`Enumerate` never disagrees with `Check` about a grant.** A rule-backed
+  inclusive grant enumerates list-then-filter — there is no reverse index, and no
+  attempt to invert a rule, which is an arbitrary expression over object
+  metadata. Its rule half needs the `ObjectLister`, so a rule-backed grant
+  enumerated without one reports `APERTURE_SCOPE_LISTER_UNCONFIGURED` instead of
+  quietly returning nothing; an empty member list is an answer, and a missing
+  dependency must not be able to impersonate one.
 - Each candidate is then run through the SAME deny-overrides/specificity
   decision as Check, so a candidate carved out by a more-specific or
   equal-specificity deny is dropped. A denied object is **never** returned.
