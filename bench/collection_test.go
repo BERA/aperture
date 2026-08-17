@@ -108,13 +108,13 @@ func BenchmarkCheckRule(b *testing.B) {
 	for _, v := range ruleVariants() {
 		b.Run(v.name, func(b *testing.B) {
 			q := ruleQuery(b, m, v.name)
-			warm(b, svc, q, true)
+			warm(b, svc, q, v.allow)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				res, err := svc.Check(ctx, q)
-				if err != nil || !res.Allow {
-					b.Fatalf("Check(%s): allow=%v err=%v", v.name, res.Allow, err)
+				if err != nil || res.Allow != v.allow {
+					b.Fatalf("Check(%s): allow=%v want %v err=%v", v.name, res.Allow, v.allow, err)
 				}
 			}
 			b.StopTimer()
@@ -133,7 +133,7 @@ func BenchmarkCheckRuleThroughput(b *testing.B) {
 	for _, v := range ruleVariants() {
 		b.Run(v.name, func(b *testing.B) {
 			q := ruleQuery(b, m, v.name)
-			warm(b, svc, q, true)
+			warm(b, svc, q, v.allow)
 			b.ReportAllocs()
 			b.ResetTimer()
 			start := time.Now()
@@ -141,8 +141,8 @@ func BenchmarkCheckRuleThroughput(b *testing.B) {
 				ctx := context.Background()
 				for pb.Next() {
 					res, err := svc.Check(ctx, q)
-					if err != nil || !res.Allow {
-						b.Fatalf("Check(%s): allow=%v err=%v", v.name, res.Allow, err)
+					if err != nil || res.Allow != v.allow {
+						b.Fatalf("Check(%s): allow=%v want %v err=%v", v.name, res.Allow, v.allow, err)
 					}
 				}
 			})
@@ -173,19 +173,18 @@ func BenchmarkRuleEval(b *testing.B) {
 			}
 			// Now is what an Engine supplies at every decision; a variant with a
 			// relative-date operand resolves to nothing without it and would
-			// measure the deny path rather than the arithmetic. The real clock is
-			// the same source the Check-path benchmarks run against, and the
-			// relative fixture is chosen to hold for any clock at or after its
-			// metadata's hire date.
+			// measure the deny path rather than the arithmetic. It is the SAME
+			// pinned instant the Check-path fixture's clock reports, so the two
+			// halves of the measurement decide the same comparisons.
 			in := rules.Input{
 				Object:    md,
 				Principal: map[string]any{"id": user(0)},
 				Action:    v.name,
-				Now:       time.Now().UTC(),
+				Now:       benchNow,
 			}
 			ok, err := compiled.Eval(ctx, in)
-			if err != nil || !ok {
-				b.Fatalf("%s: eval=%v err=%v (source: %s)", v.name, ok, err, compiled.Source())
+			if err != nil || ok != v.allow {
+				b.Fatalf("%s: eval=%v want %v err=%v (source: %s)", v.name, ok, v.allow, err, compiled.Source())
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -408,7 +407,7 @@ func TestCollectionCheckAllocations(t *testing.T) {
 	profiles := make(map[string]allocProfile, len(ruleVariants()))
 	for _, v := range ruleVariants() {
 		q := ruleQuery(t, m, v.name)
-		warm(t, svc, q, true)
+		warm(t, svc, q, v.allow)
 		p := measureAllocs(t, svc, q, iterations)
 		profiles[v.name] = p
 		t.Logf("%-18s %7.1f allocs/op %9.0f B/op   (%s)", v.name, p.allocsPerOp, p.bytesPerOp, renderOf(v.name))
@@ -510,7 +509,7 @@ func TestCheckNFRCollections(t *testing.T) {
 		svc, closeFn := newRuleService(t, m, withAudit)
 		for _, v := range ruleVariants() {
 			t.Run(name+"/"+v.name, func(t *testing.T) {
-				assertCheckNFR(t, svc, ruleQuery(t, m, v.name), name+"/"+v.name, variantSamples)
+				assertCheckNFR(t, svc, ruleQuery(t, m, v.name), name+"/"+v.name, v.allow, variantSamples)
 			})
 		}
 		closeFn()
