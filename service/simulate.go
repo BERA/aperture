@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/frankbardon/aperture/engine"
 	aerr "github.com/frankbardon/aperture/errors"
@@ -362,6 +363,30 @@ func (s *Service) ObjectMetadata(ctx context.Context, objectID string) (map[stri
 	return s.providers.Fetch(ctx, id)
 }
 
+// RulePreview is everything one what-if evaluation of an unsaved rule produced.
+// It is a struct rather than a widening return list because the three fields
+// beyond the verdict are what make the verdict READABLE, and they are added to
+// together: a bare false tells an author nothing about whether the rule is wrong
+// or the data is.
+type RulePreview struct {
+	// Result is the rule's boolean verdict for this object.
+	Result bool
+	// Object is the provider metadata snapshot the rule actually saw.
+	Object map[string]any
+	// Now is the reference instant the evaluation resolved relative dates
+	// against — always UTC. It is the value every entry in Bounds was computed
+	// from, so the two are read together.
+	Now time.Time
+	// Bounds describes every relative-date operand in the rule and the concrete
+	// date it currently means. Empty for a rule with no relative dates.
+	Bounds []rules.ResolvedRelativeDate
+	// Notes are the evaluation's deny-safe diagnostics — a wrong-shaped operand,
+	// a value that is not a canonical date, inverted between bounds. They never
+	// influence Result; they explain it. A false with no notes is a rule that
+	// evaluated cleanly and did not match.
+	Notes []rules.Note
+}
+
 // EvaluateRule compiles an UNSAVED rule AST and evaluates it against a single
 // object's provider metadata, returning the rule's boolean result plus the
 // metadata snapshot it saw. It is the rule-builder's what-if: no account,
@@ -371,18 +396,53 @@ func (s *Service) ObjectMetadata(ctx context.Context, objectID string) (map[stri
 // The AST is validated + compiled per call (this is not the hot path), so a
 // structurally invalid or non-boolean rule surfaces its APERTURE_RULE_* code.
 // Requires WithProviders for the metadata fetch.
+//
+// It is the narrow projection of EvaluateRulePreview, kept for callers that want
+// only the verdict.
 func (s *Service) EvaluateRule(ctx context.Context, ast *rules.Node, objectID string) (bool, map[string]any, error) {
+	p, err := s.EvaluateRulePreview(ctx, ast, objectID)
+	return p.Result, p.Object, err
+}
+
+// EvaluateRulePreview is EvaluateRule with the diagnostics the rule builder
+// renders: the reference instant, what each relative-date operand resolved to at
+// that instant, and the evaluation's deny-safe notes.
+//
+// THE REFERENCE INSTANT IS SUPPLIED HERE, and that is the whole reason this path
+// needs its own care. A compiled rule evaluated through rules.Input with a zero
+// Now has no reference instant, and every relative date correctly resolves to
+// nothing — so a preview that omitted it would answer false for every rule
+// containing one, at every offset, while the same rule allowed access in a real
+// decision. The decision engine opens rules.WithDecisionInstant at each Check /
+// Enumerate / Explain boundary; this path compiles the AST directly and so must
+// read the facade clock itself. It is UTC-normalised at the source, the same way
+// the engine's snapshot is.
+//
+// The metadata snapshot is returned even when evaluation FAILS, because the
+// snapshot is usually the explanation.
+func (s *Service) EvaluateRulePreview(ctx context.Context, ast *rules.Node, objectID string) (RulePreview, error) {
 	md, err := s.ObjectMetadata(ctx, objectID)
 	if err != nil {
-		return false, nil, err
+		return RulePreview{}, err
 	}
 	compiled, err := rules.NewCompiler().Compile(ast)
 	if err != nil {
-		return false, nil, err
+		return RulePreview{}, err
 	}
-	result, err := compiled.Eval(ctx, rules.Input{Object: md})
+	now := s.now().UTC()
+	p := RulePreview{
+		Object: md,
+		Now:    now,
+		Bounds: rules.ResolveRelativeDates(ast, now),
+	}
+	// EvalWithNotes rather than Eval: the preview is a diagnostic surface, so it
+	// always collects. Notes are what turn "false" into "object.hired_at is not
+	// a canonical date".
+	result, notes, err := compiled.EvalWithNotes(ctx, rules.Input{Object: md, Now: now})
+	p.Notes = notes
 	if err != nil {
-		return false, md, err
+		return p, err
 	}
-	return result, md, nil
+	p.Result = result
+	return p, nil
 }

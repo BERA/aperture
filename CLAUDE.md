@@ -91,6 +91,8 @@ non-skippable CI failure. The rule itself is documented in
 | The metadata value model (`provider/metadata.go`: legal shapes, depth cap, size cap) | `skills/metadata-values.md` and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/metadata_test.go` |
 | The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | `skills/metadata-values.md` ("Dates") and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/date_test.go` |
 | A loader's spelling of the value model (a CSV column suffix — `:int`, `:list<T>`, `:json`, `:date`, `:datetime` — or a seed key such as `objects:` / `field_types:`) | `skills/metadata-values.md` ("How each loader spells the model"), the loader's package doc, `docs/src/concepts/providers.md`, and `docs/src/concepts/seed.md` for a seed key | reviewed; no registry gate |
+| How the rule editor displays a date (anything in `internal/server/static/js/rules.js` or `rules-serializer.js` that renders a stored date, a resolved bound, or the reference instant) | "Reading a saved rule back" + "The date diagnostics" in `skills/ui-shell.md` | `TestRuleEditorNeverFormatsADateThroughADateObject` — scans the served JS and fails on `new Date` / `toLocale*String` / `Intl.DateTimeFormat` and friends |
+| The rule what-if preview's response fields (`EvaluateRuleResponse` in `service.proto`, `service.RulePreview`) | `skills/ui-shell.md` ("The date diagnostics"), `skills/api-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/library/service-facade.md` — **and `make proto`** | reviewed; no registry gate |
 
 The Go↔JS rows matter more than they look: **CI is node-free**, so
 `rules-serializer.test.js` never runs in the pipeline.
@@ -124,6 +126,10 @@ audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage gate in
   lockstep with `opSpecs` (`rules/ast.go`).
 - `TestDateOperatorTablesAgree` — `dateOps` (`rules/date.go`) stays in lockstep
   with `opSpecs` (`rules/ast.go`), membership and ternary arity alike.
+- `TestRuleEditorNeverFormatsADateThroughADateObject` — the rule editor's served
+  JS (`rules.js`, `rules-serializer.js`) constructs no JS `Date` and calls no
+  locale date formatter, so a stored UTC date is never restated in the viewer's
+  zone. Comments are stripped first, so documenting the hazard is still allowed.
 
 Gated, NOT in `make test` (a loaded runner would flake them):
 

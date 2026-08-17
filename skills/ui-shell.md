@@ -136,7 +136,46 @@ wrote.
 the editor renders stored date strings verbatim, `Z` included: `toLocaleString()`
 would show a viewer in UTC-5 a stored `2026-01-01T00:00:00Z` as
 `2025-12-31 19:00` — a different calendar year. That is a correctness rule, not a
-preference.
+preference. It is **enforced**, not merely written down: the Go test
+`TestRuleEditorNeverFormatsADateThroughADateObject`
+(`internal/server/static_test.go`) fetches `js/rules.js` and
+`js/rules-serializer.js` over the embedded file server, strips comments (both
+files DOCUMENT the hazard, and a guard that fired on its own warning would get
+the warning deleted), and fails on `new Date`, `Date.parse`, `Date.UTC`,
+`toLocale*String`, `toDateString`, `toTimeString`, `Intl.DateTimeFormat`, and the
+local-calendar readers `getFullYear` / `getMonth` / `getDate`. `js/audit.js` is
+deliberately **out of scope** — an audit trail is read in the operator's own zone
+and compares nothing.
+
+### Reading a saved rule back
+
+A rule authored through the controls, saved, reloaded and read back is the
+**same rule** — byte-identical JSON, key order included. Three things this means
+specifically for dates, each asserted in `js/rules-serializer.test.js`:
+
+- **Every date operator round-trips byte-identically**, driven from `DATE_OPS`
+  so the coverage cannot fall behind the operator table.
+- **A `between` authored as one node reads back as one node.** There is nothing
+  to re-sugar: the shape is a `compare` with a two-item `list` on the right, and
+  the round-trip asserts no `and` / `onOrBefore` pair appears in the result.
+- **`TODAY` reads back as `TODAY`**, never normalised into `NOW` +
+  `snap: startOfDay`, and a snap chosen on top of it survives alongside it.
+
+The **label layer** is part of the round-trip and is covered too. The controls
+display readable spellings (`start of quarter`, `is on or before`) while the AST
+stores tokens, so a loaded rule passes through `vocabLabel` on the way in and
+`vocabFromLabel` on the way out; if those were not exact inverses, save → reload
+→ save would silently produce a different rule. `rules.js` is a classic script
+and cannot be `require`d, so the test evaluates it in a `vm` context with a
+`window` shim and asserts the inverse over all three vocabularies and every
+operator spelling. An unrecognised token still passes through **verbatim**, so
+the validator names what the author typed.
+
+Node **positions** are not part of any of this: `astToGraph` lays leaves out
+left-to-right and `graphToAST` drops positions entirely. Leaf rows advance by the
+height of the leaf placed, not by a fixed pitch, because a `relativeDate` is four
+controls tall — with one pitch, a `between`'s two relative bounds loaded on top
+of each other until the author dragged them apart.
 
 **The unary operators carry no `right` key at all.** Neither direction may emit
 one — `graphToAST` omits it (never `right: null`), `astToGraph` wires no `right`
@@ -377,8 +416,44 @@ model, which is closed rather than arbitrary JSON:
   comparison has to tell the two apart.
 - A collapsed "Raw JSON" disclosure keeps the whole snapshot available verbatim.
 
-A change to what the preview renders, or to its read-only guarantee, updates this
-section in the same PR.
+### The date diagnostics
+
+`EvaluateRule` returns three more fields, and all three exist so a **`false` is
+readable**:
+
+| Field | Rendered as |
+|---|---|
+| `now` | the reference instant the evaluation resolved against, canonical UTC |
+| `bounds_json` | `[{path, anchor, n, unit, snap, resolved}]` — one entry per relative-date operand |
+| `notes_json` | `[{kind, op, path, expected, actual, message}]` — the deny-safe diagnostics |
+
+**The server resolves the bounds; the browser never does.** A relative date is a
+computation — snap first, then offset, clamping at month end, ISO Monday weeks,
+`endOf*` meaning the inclusive last second — and a JavaScript copy of those rules
+would be free to disagree with the one that actually decides access. `rules.js`
+(`boundRows` / `describeBound`) only *labels* what the response contains; nothing
+in the display path computes a date.
+
+`describeBound` spells the four controls back in the order the server applies
+them — anchor, then snap, then offset — because "the start of the year, five
+years back" and "five years back, then the start of the year" are different
+dates. A bound that resolves to nothing (no reference instant, an offset outside
+the representable year range) is labelled "does not resolve — the comparison
+denies" rather than left blank, which would read as "still loading".
+
+**Notes turn a bare `false` into an explanation.** A rule denying because a
+stored value is not a canonical date, or because a `between`'s bounds are
+inverted, looks exactly like a rule denying because the object does not match.
+The `message` is rendered **by the server** (`rules.Note.String`), so the editor
+and an `Explain` trace say the same thing about the same observation. A clean
+evaluation records nothing — notes accompany a false, they do not decorate every
+one. Notes carry **path, operator and shape only, never a value**.
+
+Every date in this panel is printed **verbatim, `Z` included** — see the guard
+above.
+
+A change to what the preview renders, to its read-only guarantee, or to the three
+date-diagnostic fields, updates this section in the same PR.
 
 ## compliance (load-bearing)
 
@@ -405,5 +480,9 @@ shapes, blocked calls, the date-operator set, the relative-date vocabularies and
 node shape, validation wording), the rule editor's operator palette and its
 spellings, its node controls (the relative-date quartet, the operand mode
 switches, the `between` bounds scaffold, and the `data-testid` labels they are
-styled through), or a rule above — updates this doc in the **same PR**. The gate
-in `skills/skills_test.go` fails the build if this doc loses its frontmatter.
+styled through), the what-if preview's response fields (`object_json`, `now`,
+`bounds_json`, `notes_json`) and how they are rendered, or a rule above — updates
+this doc in the **same PR**. The gate in `skills/skills_test.go` fails the build
+if this doc loses its frontmatter, and
+`TestRuleEditorNeverFormatsADateThroughADateObject` fails the build if the
+verbatim-rendering rule is broken in code.

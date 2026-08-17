@@ -12,6 +12,7 @@ import (
 	"github.com/frankbardon/aperture/filter"
 	"github.com/frankbardon/aperture/internal/wire/rpc"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/provider"
 	"github.com/frankbardon/aperture/rules"
 	"github.com/frankbardon/aperture/seed"
 	"github.com/frankbardon/aperture/service"
@@ -955,17 +956,73 @@ func (h *twirpHandler) EvaluateRule(ctx context.Context, req *rpc.EvaluateRuleRe
 	if err := json.Unmarshal(r.AST, &node); err != nil {
 		return nil, mapErr(aerr.Wrap(aerr.APERTURE_RULE_INVALID, "twirp: rule AST is not valid JSON", err))
 	}
-	result, md, err := h.svc.EvaluateRule(ctx, &node, req.GetObjectId())
+	p, err := h.svc.EvaluateRulePreview(ctx, &node, req.GetObjectId())
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	var objectJSON string
-	if md != nil {
-		if b, mErr := json.Marshal(md); mErr == nil {
+	if p.Object != nil {
+		if b, mErr := json.Marshal(p.Object); mErr == nil {
 			objectJSON = string(b)
 		}
 	}
-	return &rpc.EvaluateRuleResponse{Result: result, ObjectJson: objectJSON}, nil
+	resp := &rpc.EvaluateRuleResponse{
+		Result:     p.Result,
+		ObjectJson: objectJSON,
+		// The instant is written with the value model's canonical layout, NOT
+		// time.RFC3339: the canonical form's Z is a literal, so it can never
+		// carry an offset, and it is the same text the resolved bounds below are
+		// written in. The editor renders both verbatim.
+		Now: provider.DateTimeOf(p.Now).String(),
+	}
+	// Both diagnostic blobs are always a JSON ARRAY, never `null`: a rule with no
+	// relative date has no bounds, and the client should iterate an empty list
+	// rather than branch on a nil the wire shape does not otherwise produce.
+	bounds := p.Bounds
+	if bounds == nil {
+		bounds = []rules.ResolvedRelativeDate{}
+	}
+	if b, mErr := json.Marshal(bounds); mErr == nil {
+		resp.BoundsJson = string(b)
+	}
+	if b, mErr := json.Marshal(previewNotes(p.Notes)); mErr == nil {
+		resp.NotesJson = string(b)
+	}
+	return resp, nil
+}
+
+// previewNote is the wire projection of one evaluation note for the rule
+// builder, mirroring engine.EvaluationNote's role on the Explain surface: the
+// note's fields plus the one-line rendering, so the client prints a diagnostic
+// rather than reassembling one from parts it would have to keep in step with Go.
+//
+// SHAPE AND PATH ONLY — a note never carries a metadata value, and this
+// projection adds nothing that could.
+type previewNote struct {
+	Kind     string `json:"kind"`
+	Op       string `json:"op,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Expected string `json:"expected,omitempty"`
+	Actual   string `json:"actual,omitempty"`
+	Message  string `json:"message"`
+}
+
+// previewNotes projects a rule evaluation's notes onto the wire shape. An
+// evaluation that recorded nothing yields an empty slice rather than nil, so the
+// field is always a JSON array the client can iterate without a null check.
+func previewNotes(notes []rules.Note) []previewNote {
+	out := make([]previewNote, 0, len(notes))
+	for _, n := range notes {
+		out = append(out, previewNote{
+			Kind:     string(n.Kind),
+			Op:       n.Op,
+			Path:     n.Path,
+			Expected: n.Expected,
+			Actual:   n.Actual,
+			Message:  n.String(),
+		})
+	}
+	return out
 }
 
 // decodeSimulate builds the read-only Overlay and Query a Simulate call layers

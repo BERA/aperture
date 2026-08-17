@@ -290,3 +290,100 @@ func resolveRelativeDate(now time.Time, anchor string, n int, unit, snap string)
 	}
 	return provider.DateTimeOf(t), true
 }
+
+// ResolvedRelativeDate is one relative-date operand of an AST paired with the
+// concrete date it resolves to at a given reference instant.
+//
+// It exists for the rule builder's what-if preview. An author who writes
+// "three months back, snapped to the start of the month" has written a
+// COMPUTATION, not a date, and the only way to see whether they wrote the one
+// they meant is to see what it currently comes out as. Resolving it a second
+// time in the browser was the alternative and was rejected: the clamping,
+// snapping and ISO-week rules live in calendar.go, and a JavaScript copy of them
+// would be a second implementation free to disagree with the one that actually
+// decides access.
+//
+// Path is the operand's position in the AST, written as the dotted/indexed route
+// from the root ("$.right.items[0]"), so a `between` with two relative bounds
+// yields two distinguishable rows. It is a display label, not a selector: no
+// code parses it back.
+//
+// The four field values are echoed exactly as the node carries them — Offset is
+// the authored TOKEN, not a re-rendered number — so a node the validator would
+// reject still describes itself accurately. Resolved is the canonical date-time
+// the operand currently means, or "" when it resolves to nothing at all (no
+// reference instant, an offset that leaves the representable year range, or a
+// field outside its vocabulary). An empty Resolved is the same deny the engine
+// applies, made visible.
+// The JSON tags mirror the node's own persisted spelling (`n` for the offset),
+// so a surface that hands this to a client hands it something an author can line
+// up against the four controls without a translation table.
+type ResolvedRelativeDate struct {
+	Path     string `json:"path"`
+	Anchor   string `json:"anchor"`
+	Offset   string `json:"n"`
+	Unit     string `json:"unit"`
+	Snap     string `json:"snap"`
+	Resolved string `json:"resolved"`
+}
+
+// ResolveRelativeDates walks n and resolves every relative-date operand it
+// contains against now, in document order (left before right, children and list
+// items in index order). An AST with no relative date yields nil.
+//
+// It resolves through the SAME resolveRelativeDate the `$rel` dispatcher calls,
+// so the preview and the decision cannot disagree about what an operand means at
+// a given instant. It never fails: an operand that cannot be resolved comes back
+// with an empty Resolved, which is exactly the deny the evaluation would apply.
+//
+// A zero now means no reference instant is available, and every operand then
+// resolves to nothing — the same rule Input.Now carries everywhere else.
+func ResolveRelativeDates(n *Node, now time.Time) []ResolvedRelativeDate {
+	var out []ResolvedRelativeDate
+	walkRelativeDates(n, "$", &out, now)
+	return out
+}
+
+// walkRelativeDates is the recursive half of ResolveRelativeDates. It is a total
+// walk over the node shape rather than a type-directed one: a node carries only
+// the children its type populates, so visiting all four child slots reaches
+// every operand without a switch that a new node type could fall out of.
+func walkRelativeDates(n *Node, path string, out *[]ResolvedRelativeDate, now time.Time) {
+	if n == nil {
+		return
+	}
+	if n.Type == NodeRelativeDate {
+		*out = append(*out, resolvedAt(n, path, now))
+		return
+	}
+	walkRelativeDates(n.Left, path+".left", out, now)
+	walkRelativeDates(n.Right, path+".right", out, now)
+	for i, ch := range n.Children {
+		walkRelativeDates(ch, path+".children["+strconv.Itoa(i)+"]", out, now)
+	}
+	for i, it := range n.Items {
+		walkRelativeDates(it, path+".items["+strconv.Itoa(i)+"]", out, now)
+	}
+}
+
+// resolvedAt describes one relative-date node at now. An offset token that is
+// not a whole number is reported verbatim with an empty Resolved rather than
+// being coerced: the validator's job is to name it, and inventing a value here
+// would show the author a date their rule does not mean.
+func resolvedAt(n *Node, path string, now time.Time) ResolvedRelativeDate {
+	r := ResolvedRelativeDate{
+		Path:   path,
+		Anchor: n.Anchor,
+		Offset: string(n.Offset),
+		Unit:   n.Unit,
+		Snap:   n.Snap,
+	}
+	count, err := n.offsetCount()
+	if err != nil {
+		return r
+	}
+	if v, ok := resolveRelativeDate(now, n.Anchor, count, n.Unit, n.Snap); ok {
+		r.Resolved = v.String()
+	}
+	return r
+}

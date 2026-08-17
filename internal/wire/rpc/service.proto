@@ -230,6 +230,18 @@ message EvaluateRuleRequest {
 message EvaluateRuleResponse {
   bool result = 1;        // the rule's boolean verdict for the object
   string object_json = 2; // the object's metadata snapshot the rule saw (for display)
+  // The reference instant the evaluation resolved relative dates against, in the
+  // canonical UTC form (2006-01-02T15:04:05Z). Rendered VERBATIM by the editor —
+  // never through a JS Date, which would restate it in the viewer's zone.
+  string now = 3;
+  // The relative-date operands of the rule, each with the concrete date it means
+  // at `now`: [{path, anchor, n, unit, snap, resolved}]. Empty JSON array when
+  // the rule contains none. Resolved is "" for an operand that resolves to
+  // nothing (which is the deny the engine applies).
+  string bounds_json = 4;
+  // The evaluation's deny-safe diagnostics: [{kind, op, path, expected, actual}].
+  // They explain a false; they never cause one.
+  string notes_json = 5;
 }
 
 message EnumerateBatchRequest {

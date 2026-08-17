@@ -215,6 +215,17 @@ Two adjacent reads support the rule-builder's what-if and require
 - `EvaluateRule(ctx, ast *rules.Node, objectID) (bool, map[string]any, error)` —
   compiles an unsaved rule AST and evaluates it against one object's metadata,
   returning the boolean result and the metadata snapshot it saw.
+- `EvaluateRulePreview(ctx, ast *rules.Node, objectID) (RulePreview, error)` —
+  the same evaluation with the diagnostics a rule builder renders: `Result`,
+  `Object`, `Now` (the reference instant, from the facade clock), `Bounds` (each
+  relative-date operand and the concrete date it resolved to at `Now`), and
+  `Notes` (the evaluation's deny-safe observations). `EvaluateRule` is its
+  narrow projection.
+
+  Unlike `Check` / `Enumerate` / `Explain`, this path compiles the AST directly
+  instead of going through the decision engine, so it must supply the reference
+  instant itself — a `rules.Input` with a zero `Now` has none, and every relative
+  date correctly resolves to nothing.
 
 `ObjectIdentifiers(ctx, objectType, exclude...)` (also `WithProviders`) enumerates
 a type's complete instance set minus any excluded ids — the positive allow-list an

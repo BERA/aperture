@@ -231,6 +231,17 @@ because reflective method calls survive `expr.DisableAllBuiltins` — an unclamp
 calendar walk reachable from any rule. `allowedRoots` is unchanged, and `$rel` is
 unreachable from a rule for the same structural reason as `$op` and `$date`.
 
+**Showing an author what a relative date currently means** is
+`ResolveRelativeDates(ast, now) []ResolvedRelativeDate` — one entry per
+relative-date operand, in document order, each carrying its AST path, the four
+field values as authored, and `Resolved` (the canonical date, or `""` for an
+operand that resolves to nothing, which is the deny the evaluation applies). It
+goes through the **same** `resolveRelativeDate` the `$rel` dispatcher calls, so a
+preview and a decision cannot disagree about what an operand means at a given
+instant. It never fails and never raises. The rule builder's what-if
+(`service.EvaluateRulePreview`) is its caller; anything else that renders a
+relative date must use it rather than re-deriving the arithmetic.
+
 ### UTC, clamping, and the order of operations
 
 Resolution is three steps in a fixed order: **anchor → snap → offset**.

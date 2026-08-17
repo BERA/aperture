@@ -1453,6 +1453,101 @@ function countNote(n, noun) {
   return n + " " + noun + (n === 1 ? "" : "s");
 }
 
+/*
+ * ---- What-if preview: the resolved relative-date bounds --------------------
+ *
+ * A relative date is a COMPUTATION, not a date. "The start of the year, five
+ * years back" is a rule an author can read and still not be sure of — the snap
+ * is applied first, calendar units clamp at month end, and `endOf*` means the
+ * INCLUSIVE last second. The only way to know they wrote the one they meant is
+ * to see what it currently comes out as, which is what these rows show.
+ *
+ * THE SERVER RESOLVES IT, NOT THIS FILE. Every row below is read off the
+ * EvaluateRule response; nothing here computes a date. Re-resolving the operand
+ * in the browser would mean a second copy of the clamping, snapping and
+ * ISO-week rules, free to disagree with the one that actually decides access —
+ * and the whole point of showing the bound is that it is the bound the engine
+ * used.
+ *
+ * AND IT IS RENDERED VERBATIM. The resolved value and the reference instant
+ * both arrive in the canonical UTC form and are printed exactly as received,
+ * `Z` included. Passing either through a JS Date would restate it in the
+ * VIEWER'S zone: a viewer in UTC-5 would read a resolved 2026-01-01T00:00:00Z
+ * as the previous calendar YEAR, and would then quite reasonably conclude the
+ * rule was broken. A Go test (TestRuleEditorNeverFormatsADateThroughADateObject)
+ * scans this file for every spelling of that mistake.
+ */
+
+// boundRows turns the response's resolved-bound list into display rows. Each
+// row names the operand's position in the rule, spells the four control values
+// back as a sentence, and carries the resolved instant VERBATIM.
+//
+// A bound the server could not resolve at all — an offset that leaves the
+// representable year range, or a field outside its vocabulary — comes back with
+// an empty `resolved`. That is a real deny and is labelled as one rather than
+// left blank, because a blank reads as "still loading".
+function boundRows(bounds) {
+  if (!Array.isArray(bounds)) return [];
+  return bounds.map(function (b, i) {
+    const raw = b && typeof b === "object" ? b : {};
+    return {
+      key: String(raw.path || i),
+      path: String(raw.path || ""),
+      describe: describeBound(raw),
+      resolved: String(raw.resolved || ""),
+      unresolved: !raw.resolved,
+    };
+  });
+}
+
+// describeBound spells one relative-date operand as the sentence the four
+// controls read as, IN THE ORDER THE SERVER APPLIES THEM: the anchor, then the
+// snap, then the offset. Stating the order is the point — an author who reads
+// "five years back, then the start of the year" would expect a different date,
+// and the two orders really are different functions.
+//
+// The vocabulary tokens go through the same vocabLabel the controls use, so the
+// sentence matches what the node on the canvas is showing.
+function describeBound(b) {
+  const parts = [vocabLabel(b.anchor)];
+  if (b.snap && b.snap !== "none") parts.push("snapped to " + vocabLabel(b.snap));
+  const n = String(b.n === undefined || b.n === null ? "" : b.n).trim();
+  if (n !== "" && n !== "0") parts.push("offset " + n + " " + vocabLabel(b.unit));
+  return parts.join(", ");
+}
+
+// noteRows normalises the evaluation's deny-safe notes for display. The one-line
+// `message` is rendered by the server so the editor and an Explain trace say the
+// same thing about the same observation.
+//
+// These are why a `false` is trustworthy. A rule that denies because a stored
+// value is not a canonical date, or because a `between`'s bounds are inverted,
+// looks exactly like a rule that denies because the object does not match — and
+// a silent false is how an access-control bug hides.
+function noteRows(notes) {
+  if (!Array.isArray(notes)) return [];
+  return notes.map(function (n, i) {
+    const raw = n && typeof n === "object" ? n : {};
+    return {
+      key: String(raw.kind || "note") + ":" + String(raw.path || "") + ":" + i,
+      kind: String(raw.kind || ""),
+      message: String(raw.message || ""),
+    };
+  });
+}
+
+// parseJSONField decodes one of the response's JSON-blob fields, tolerating an
+// absent or malformed value: the preview's diagnostics must never be the reason
+// an evaluation appears to have failed.
+function parseJSONField(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
 // buildPalette assembles the node palette the shell renders (index.html walks
 // `palette` -> `grp.items` and calls add(item.kind)). The Logic / Operands /
 // Pulse groups are fixed — one entry per AST node type — but the Compare group
@@ -1542,6 +1637,14 @@ function rules() {
     // field. Derived on evaluate rather than on every render so the panel does
     // not re-walk the snapshot on unrelated Alpine updates.
     previewRows: [],
+    // The date diagnostics, all three read straight off the response and all
+    // three rendered VERBATIM. previewNow is the reference instant the
+    // evaluation resolved against, previewBounds is what each relative-date
+    // operand became at that instant, and previewNotes is why a false is a
+    // false. Nothing here is computed in the browser — see boundRows().
+    previewNow: "",
+    previewBounds: [],
+    previewNotes: [],
     // The node palette, grouped by category. Covers the whole AST: logical
     // combinators, comparisons over variables/literals, and the Pulse building
     // blocks (list/call) from E2-S3. The Compare group is generated from the
@@ -1627,6 +1730,9 @@ function rules() {
       this.previewResult = null;
       this.previewObject = null;
       this.previewRows = [];
+      this.previewNow = "";
+      this.previewBounds = [];
+      this.previewNotes = [];
       this.previewError = null;
       if (!this.preview.objectType) return;
       try {
@@ -1762,6 +1868,9 @@ function rules() {
       this.previewResult = null;
       this.previewObject = null;
       this.previewRows = [];
+      this.previewNow = "";
+      this.previewBounds = [];
+      this.previewNotes = [];
       if (!this.preview.objectId) {
         this.previewError = { code: "APERTURE_INVALID_INPUT", msg: "Select an object to evaluate the rule against." };
         return;
@@ -1776,6 +1885,12 @@ function rules() {
         this.previewResult = !!resp.result;
         this.previewObject = resp.object_json ? JSON.parse(resp.object_json) : null;
         this.previewRows = metadataRows(this.previewObject);
+        // The instant and the resolved bounds arrive canonical and are held as
+        // received — no reformatting, no Date. previewNow is what every bound
+        // below was computed from, so the two are shown together.
+        this.previewNow = resp.now || "";
+        this.previewBounds = boundRows(parseJSONField(resp.bounds_json));
+        this.previewNotes = noteRows(parseJSONField(resp.notes_json));
       } catch (e) {
         this.previewError = { code: e.code || "APERTURE_ERROR", msg: e.message };
       } finally {
@@ -1847,3 +1962,8 @@ window.createBlueprintEditor = createBlueprintEditor;
 // console against a real EvaluateRule payload; the panel itself reads
 // previewRows off the Alpine component.
 window.metadataRows = metadataRows;
+// The date diagnostics' row builders, exported for the same reason. Both are
+// pure projections of the response — neither computes a date, and neither
+// reformats one.
+window.boundRows = boundRows;
+window.noteRows = noteRows;

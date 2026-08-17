@@ -665,3 +665,172 @@ func TestRelativeDateResolvesOffsetsAndSnaps(t *testing.T) {
 		})
 	}
 }
+
+// --- describing a rule's relative dates for an author -----------------------
+
+// TestResolveRelativeDatesWalksEveryOperandPosition pins the AST walk that backs
+// the rule builder's "what did this become?" affordance. The order is document
+// order and the paths are stable, because the editor lines each row up against
+// an operand the author can see.
+func TestResolveRelativeDatesWalksEveryOperandPosition(t *testing.T) {
+	rel := func(anchor string, n int, unit, snap string) *Node {
+		return RelativeDate(anchor, n, unit, snap)
+	}
+	hired := Var("object.hired_at")
+
+	cases := []struct {
+		name  string
+		ast   *Node
+		paths []string
+	}{
+		{
+			name: "no relative date at all",
+			ast:  Compare(OpBefore, hired, Lit("2026-01-01")),
+		},
+		{
+			name:  "the right operand",
+			ast:   Compare(OpBefore, hired, rel(AnchorNow, -3, UnitMonths, SnapNone)),
+			paths: []string{"$.right"},
+		},
+		{
+			name:  "the left operand",
+			ast:   Compare(OpAfter, rel(AnchorToday, 0, UnitDays, SnapNone), hired),
+			paths: []string{"$.left"},
+		},
+		{
+			name: "both between bounds, in order",
+			ast: Between(hired,
+				rel(AnchorNow, -5, UnitYears, SnapStartOfYear),
+				rel(AnchorToday, 0, UnitDays, SnapEndOfDay)),
+			paths: []string{"$.right.items[0]", "$.right.items[1]"},
+		},
+		{
+			name: "one bound relative, one literal",
+			ast: Between(hired,
+				Lit("2026-01-01"),
+				rel(AnchorNow, -30, UnitMinutes, SnapNone)),
+			paths: []string{"$.right.items[1]"},
+		},
+		{
+			name: "nested under logical children",
+			ast: And(
+				Compare(OpEq, Var("object.classification"), Lit("public")),
+				Or(
+					Compare(OpAfter, hired, rel(AnchorNow, -90, UnitDays, SnapStartOfDay)),
+					Compare(OpBefore, hired, rel(AnchorNow, 1, UnitQuarters, SnapEndOfQuarter)),
+				),
+			),
+			paths: []string{"$.children[1].children[0].right", "$.children[1].children[1].right"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ResolveRelativeDates(tc.ast, pinnedInstant)
+			if len(got) != len(tc.paths) {
+				t.Fatalf("resolved %d operands, want %d: %+v", len(got), len(tc.paths), got)
+			}
+			for i, want := range tc.paths {
+				if got[i].Path != want {
+					t.Errorf("operand %d path = %q, want %q", i, got[i].Path, want)
+				}
+				if got[i].Resolved == "" {
+					t.Errorf("operand %d (%s) resolved to nothing", i, got[i].Path)
+				}
+			}
+		})
+	}
+	// A nil AST is not a failure; it simply carries nothing.
+	if got := ResolveRelativeDates(nil, pinnedInstant); got != nil {
+		t.Errorf("nil AST resolved %+v, want nil", got)
+	}
+}
+
+// TestResolveRelativeDatesAgreesWithEvaluation is the property that makes the
+// preview worth showing: the date an author is SHOWN is the date the rule
+// COMPARES AGAINST. Both come from resolveRelativeDate, so the assertion is that
+// nothing between them re-derives it — a comparison against the reported value
+// as a literal must decide identically to the relative node itself.
+func TestResolveRelativeDatesAgreesWithEvaluation(t *testing.T) {
+	cases := []struct {
+		anchor string
+		n      int
+		unit   string
+		snap   string
+		want   string
+	}{
+		{AnchorNow, 0, UnitDays, SnapNone, "2026-03-04T12:30:45Z"},
+		{AnchorToday, 0, UnitDays, SnapNone, "2026-03-04T00:00:00Z"},
+		{AnchorNow, -3, UnitMonths, SnapNone, "2025-12-04T12:30:45Z"},
+		{AnchorNow, -5, UnitYears, SnapStartOfYear, "2021-01-01T00:00:00Z"},
+		{AnchorNow, 0, UnitDays, SnapEndOfMonth, "2026-03-31T23:59:59Z"},
+		{AnchorToday, 1, UnitQuarters, SnapEndOfQuarter, "2026-06-30T23:59:59Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.snap+"/"+tc.unit, func(t *testing.T) {
+			node := RelativeDate(tc.anchor, tc.n, tc.unit, tc.snap)
+			got := ResolveRelativeDates(Compare(OpBefore, Var("object.hired_at"), node), pinnedInstant)
+			if len(got) != 1 {
+				t.Fatalf("resolved %d operands, want 1", len(got))
+			}
+			if got[0].Resolved != tc.want {
+				t.Fatalf("resolved = %q, want %q", got[0].Resolved, tc.want)
+			}
+			// The reported value, used as a literal bound, must decide the same
+			// way the relative node does — for a value on each side of it.
+			for _, hired := range []string{"2020-01-01", "2030-01-01"} {
+				md := map[string]any{"hired_at": hired}
+				relative := evalAgainst(t, Compare(OpBefore, Var("object.hired_at"), node), md, pinnedInstant)
+				literal := evalAgainst(t, Compare(OpBefore, Var("object.hired_at"), Lit(got[0].Resolved)), md, pinnedInstant)
+				if relative != literal {
+					t.Errorf("hired_at %s: relative decided %v but the reported bound %q decided %v",
+						hired, relative, got[0].Resolved, literal)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveRelativeDatesReportsWhatDoesNotResolve pins the deny side. An
+// operand that resolves to nothing denies at evaluation, and the preview has to
+// say so rather than showing a blank the author reads as "still loading". The
+// four field values are echoed whatever happens, so a node the validator would
+// reject still describes itself.
+func TestResolveRelativeDatesReportsWhatDoesNotResolve(t *testing.T) {
+	cases := []struct {
+		name string
+		node *Node
+		now  time.Time
+	}{
+		{
+			name: "no reference instant",
+			node: RelativeDate(AnchorNow, -3, UnitMonths, SnapNone),
+			now:  time.Time{},
+		},
+		{
+			name: "an offset that leaves the representable year range",
+			node: RelativeDate(AnchorNow, 1<<30, UnitYears, SnapNone),
+			now:  pinnedInstant,
+		},
+		{
+			name: "an offset that is not a whole number",
+			node: &Node{Type: NodeRelativeDate, Anchor: AnchorNow, Offset: "1.5", Unit: UnitDays, Snap: SnapNone},
+			now:  pinnedInstant,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ResolveRelativeDates(Compare(OpBefore, Var("object.hired_at"), tc.node), tc.now)
+			if len(got) != 1 {
+				t.Fatalf("resolved %d operands, want 1", len(got))
+			}
+			if got[0].Resolved != "" {
+				t.Errorf("resolved = %q, want empty (it must not resolve)", got[0].Resolved)
+			}
+			if got[0].Anchor != tc.node.Anchor || got[0].Unit != tc.node.Unit ||
+				got[0].Snap != tc.node.Snap || got[0].Offset != string(tc.node.Offset) {
+				t.Errorf("fields = %+v, want the node's own %s/%s/%s/%s",
+					got[0], tc.node.Anchor, tc.node.Offset, tc.node.Unit, tc.node.Snap)
+			}
+		})
+	}
+}

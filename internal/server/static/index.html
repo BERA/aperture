@@ -1872,6 +1872,59 @@
                           <strong x-text="previewResult ? 'true (selected)' : 'false (not selected)'"
                                   :style="previewResult ? 'color: var(--color-success, var(--neutral-700))' : 'color: var(--color-danger, var(--neutral-700))'"></strong>
                         </p>
+
+                        <!-- Deny-safe notes. A rule can evaluate to false
+                             because the object does not match, or because a
+                             stored value could not be read as a date at all —
+                             and those need different fixes. The engine records
+                             the second as a note; a bare false with no
+                             explanation is how an access-control bug hides. -->
+                        <template x-if="previewNotes.length">
+                          <div class="a-alert a-alert--info" style="margin-top: 8px; display: block">
+                            <p class="a-label" style="margin-bottom: 4px">Why this evaluated the way it did</p>
+                            <template x-for="n in previewNotes" :key="n.key">
+                              <p class="a-caption" style="margin: 2px 0">
+                                <span class="a-mono" x-text="n.kind"></span>
+                                <span x-text="' · ' + n.message"></span>
+                              </p>
+                            </template>
+                          </div>
+                        </template>
+
+                        <!-- Resolved relative-date bounds. A relative date is a
+                             computation, so the author is shown what it BECAME
+                             for this evaluation, next to the reference instant
+                             it was computed from.
+
+                             Every value here is printed VERBATIM, exactly as
+                             the server sent it, `Z` included. It is never put
+                             through a JS Date: a viewer in UTC-5 would then read
+                             a resolved 2026-01-01T00:00:00Z as 2025-12-31, a
+                             different calendar year from the one the rule
+                             compares against. -->
+                        <template x-if="previewBounds.length">
+                          <div style="margin-top: 8px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface-2); padding: 8px">
+                            <p class="a-label" style="margin-bottom: 2px">Relative dates, as resolved for this evaluation</p>
+                            <p class="a-caption" style="margin: 0 0 6px">
+                              Reference instant (UTC): <span class="a-mono" x-text="previewNow"></span>
+                            </p>
+                            <template x-for="b in previewBounds" :key="b.key">
+                              <div style="display: flex; align-items: baseline; gap: 8px; padding: 2px 0; flex-wrap: wrap">
+                                <span class="a-caption a-mono" style="flex: none" x-text="b.path"></span>
+                                <span class="a-caption" style="flex: none" x-text="b.describe"></span>
+                                <span class="a-caption" style="flex: none">=</span>
+                                <template x-if="!b.unresolved">
+                                  <span class="a-badge a-mono" x-text="b.resolved"></span>
+                                </template>
+                                <template x-if="b.unresolved">
+                                  <span class="a-caption" style="color: var(--color-danger, var(--neutral-700))">
+                                    does not resolve — the comparison denies
+                                  </span>
+                                </template>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
                         <!-- The metadata snapshot the rule actually saw, as a
                              field list. Array values expand to one chip per
                              element and object values to indented member rows

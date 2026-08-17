@@ -102,6 +102,12 @@ and saves rules (`ListRules`, `GetRule`, `PutRule`), lists object types
 or dry-runs an expression against the live model (`ValidateRule`,
 `EvaluateRule`, `Check`).
 
+The what-if preview shows more than the verdict: the reference instant the
+evaluation resolved against, what each relative-date operand became at that
+instant, and the deny-safe notes explaining a `false`. Dates are rendered
+**verbatim, `Z` included** — the editor never constructs a JavaScript `Date`,
+which would restate a stored UTC instant in the viewer's own zone.
+
 ### What-if — `#/whatif`
 
 A read-only decision simulator. Ask "would principal P be allowed action A on

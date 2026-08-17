@@ -739,6 +739,185 @@ ok(S.parseLiteral("plain words") === "plain words", "parseLiteral bare text -> s
 ok(S.formatLiteral(false) === "false", "formatLiteral false");
 ok(S.formatLiteral("hi") === "hi", "formatLiteral string unquoted");
 
+
+// --- Read-back: a date rule returns as the rule that was authored ------------
+//
+// The round-trip invariant above is deep-equality over a fixed case list. What
+// follows is the AUTHOR'S version of it, driven from the operator table so it
+// cannot fall behind: every date operator, byte-identical, key order included.
+//
+// Byte-identity (not deep-equality) is the assertion that matters here. The
+// relativeDate quartet is four adjacent optional keys, and a serializer that
+// emitted them in a different order — or emitted `n` as a string — would still
+// deep-equal on some comparisons while producing a rule that no longer matches
+// what Go marshals.
+
+// dateCaseFor builds one authored rule per operator: a relative-date operand on
+// the right, and for the ternary operator a mixed pair of bounds (a literal and
+// a relative date), which is the shape an author reaches for most often.
+function dateCaseFor(op) {
+  const left = { type: "var", name: "object.hired_at" };
+  const rel = { type: "relativeDate", anchor: "TODAY", n: -2, unit: "quarters", snap: "endOfMonth" };
+  if (S.RIGHT && (S.OP_SPECS[op] || {}).right === S.RIGHT.BOUNDS) {
+    return {
+      type: "compare",
+      op: op,
+      left: left,
+      right: { type: "list", items: [{ type: "literal", value: "2026-01-01" }, rel] },
+    };
+  }
+  return { type: "compare", op: op, left: left, right: rel };
+}
+
+ok(S.DATE_OPS.length === 8, "DATE_OPS carries the eight date operators (got " + S.DATE_OPS.length + ")");
+S.DATE_OPS.forEach(function (op) {
+  const ast = dateCaseFor(op);
+  const src = JSON.stringify(ast);
+  const back = JSON.stringify(S.graphToAST(S.astToGraph(ast)));
+  ok(back === src, "authored " + op + " reads back byte-identical");
+  ok(S.validateAST(ast).length === 0, "authored " + op + " validates clean");
+});
+
+// A `between` authored as ONE node reads back as ONE node. The AST story chose
+// the two-item-list shape over desugaring to and(onOrAfter, onOrBefore) exactly
+// so this holds without either side re-sugaring a two-child `and` heuristically:
+// there is nothing to re-sugar, so the proof is that the shape survives.
+const authoredBetween = dateCaseFor("between");
+const betweenBack = S.graphToAST(S.astToGraph(authoredBetween));
+ok(betweenBack.type === "compare" && betweenBack.op === "between", "between reads back as a single compare node");
+ok(
+  betweenBack.right.type === "list" && betweenBack.right.items.length === 2,
+  "between's bounds read back as one two-item list"
+);
+ok(
+  JSON.stringify(betweenBack).indexOf('"and"') < 0 && JSON.stringify(betweenBack).indexOf("onOrBefore") < 0,
+  "between is not desugared into and(onOrAfter, onOrBefore)"
+);
+
+// TODAY reads back as TODAY. It is a distinct persisted anchor, NOT sugar for
+// NOW + snap:startOfDay — an author who chose it must get it back, and a snap
+// they chose on top of it must survive alongside it rather than being folded in.
+const todayAst = {
+  type: "compare",
+  op: "after",
+  left: { type: "var", name: "object.hired_at" },
+  right: { type: "relativeDate", anchor: "TODAY", n: -1, unit: "weeks", snap: "startOfWeek" },
+};
+const todayBack = S.graphToAST(S.astToGraph(todayAst));
+ok(todayBack.right.anchor === "TODAY", "TODAY reads back as TODAY, not as NOW");
+ok(todayBack.right.snap === "startOfWeek", "a snap chosen on top of TODAY survives the round-trip");
+ok(JSON.stringify(todayBack) === JSON.stringify(todayAst), "the TODAY rule is byte-identical");
+
+// The graph an AST loads into carries the four relativeDate fields VERBATIM as
+// node properties — they are the four controls, so this is what "the same
+// controls come back" means at the serializer boundary.
+const loadedRel = S.astToGraph(todayAst).nodes.filter(function (n) {
+  return n.type === "relativeDate";
+})[0];
+ok(
+  loadedRel && loadedRel.anchor === "TODAY" && loadedRel.n === -1 &&
+    loadedRel.unit === "weeks" && loadedRel.snap === "startOfWeek",
+  "a loaded relative date carries its four control values verbatim"
+);
+
+// An unparseable offset survives the load so the validator can name it, rather
+// than the editor silently choosing a number the author did not write.
+const oddOffset = {
+  type: "compare",
+  op: "before",
+  left: { type: "var", name: "object.hired_at" },
+  right: { type: "relativeDate", anchor: "NOW", n: 1.5, unit: "days", snap: "none" },
+};
+ok(
+  S.astToGraph(oddOffset).nodes.filter(function (n) { return n.type === "relativeDate"; })[0].n === 1.5,
+  "a non-integer offset loads verbatim instead of being coerced"
+);
+ok(
+  S.validateAST(oddOffset).some(function (p) {
+    return /relative date offset must be a whole number/.test(p.message);
+  }),
+  "and is reported by the validator rather than by the control"
+);
+
+// --- Leaf layout: two relative bounds do not overlap on load ----------------
+// Layout is cosmetic (graphToAST drops positions), but a `between` with two
+// relative bounds is the common case and the two nodes are four controls tall,
+// so a single row pitch stacked them on top of each other until the author
+// dragged them apart. The assertion is DERIVED, not a pixel constant: a pair of
+// tall leaves must be spaced further apart than a pair of short ones.
+function boundGap(lo, hi) {
+  const g = S.astToGraph({
+    type: "compare",
+    op: "between",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "list", items: [lo, hi] },
+  });
+  const ys = g.nodes.filter(function (n) {
+    return n.type === lo.type;
+  }).map(function (n) {
+    return n.position.y;
+  });
+  return Math.abs(ys[1] - ys[0]);
+}
+const relBound = { type: "relativeDate", anchor: "NOW", n: -1, unit: "years", snap: "startOfYear" };
+const litBound = { type: "literal", value: "2026-01-01" };
+ok(boundGap(relBound, relBound) > boundGap(litBound, litBound), "two relative bounds load further apart than two literals");
+ok(boundGap(relBound, relBound) > 0, "two relative bounds do not load on top of each other");
+
+// --- The editor's label layer is an exact inverse ---------------------------
+//
+// rules.js is a CLASSIC script: it assigns window.rules at load and exports
+// nothing, so it cannot be require()d. It CAN be evaluated in a vm context with
+// a window shim, which makes its top-level declarations reachable — and that is
+// worth doing, because the label layer is the one part of the read-back the
+// serializer does not cover.
+//
+// What it guards: the controls display readable spellings ("start of quarter",
+// "is on or before") while the AST stores tokens, so a rule loaded from the
+// server passes through vocabLabel on the way in and vocabFromLabel on the way
+// out. If those two are not exact inverses over the closed vocabularies, a rule
+// that is saved, reloaded and saved again is a DIFFERENT rule — silently, and
+// only for the members where they disagree.
+(function editorLabelRoundTrip() {
+  let editor;
+  try {
+    const fs = require("fs");
+    const vm = require("vm");
+    const src = fs.readFileSync(__dirname + "/rules.js", "utf8");
+    editor = { window: { RuleSerializer: S }, console: console };
+    editor.globalThis = editor;
+    vm.runInNewContext(src, editor, { filename: "rules.js" });
+  } catch (e) {
+    ok(false, "rules.js evaluates in a vm context with a window shim: " + e.message);
+    return;
+  }
+  ok(typeof editor.vocabLabel === "function", "rules.js exposes its label helpers to the vm context");
+
+  [["ANCHORS", S.ANCHORS], ["UNITS", S.UNITS], ["SNAPS", S.SNAPS]].forEach(function (pair) {
+    pair[1].forEach(function (token) {
+      const shown = editor.vocabLabel(token);
+      ok(
+        editor.vocabFromLabel(pair[1], shown) === token,
+        pair[0] + ": " + token + ' displays as "' + shown + '" and reads back as itself'
+      );
+    });
+  });
+  Object.keys(S.OP_SPECS).forEach(function (op) {
+    ok(editor.opFromLabel(editor.opLabel(op)) === op, "operator " + op + " reads back through its spelling");
+  });
+  // A token the author typed that is in no vocabulary passes through VERBATIM,
+  // so the validator names what they wrote instead of the editor substituting
+  // something plausible.
+  ok(editor.vocabFromLabel(S.UNITS, "fortnights") === "fortnights", "an unknown unit passes through verbatim");
+  ok(editor.opFromLabel("is nearly before") === "is nearly before", "an unknown operator spelling passes through verbatim");
+  // The offset seed keeps a number as a number and a malformed token as itself;
+  // only a blank becomes 0.
+  ok(editor.offsetInitial(-3) === -3, "offsetInitial keeps a number");
+  ok(editor.offsetInitial("") === 0, "offsetInitial turns a blank into 0");
+  ok(editor.offsetInitial(undefined) === 0, "offsetInitial turns an absent offset into 0");
+  ok(editor.offsetInitial("1.5") === "1.5", "offsetInitial keeps a malformed token verbatim");
+})();
+
 if (failures > 0) {
   console.error("\n" + failures + " failure(s)");
   process.exit(1);

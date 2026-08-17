@@ -483,7 +483,24 @@
       return "n" + ++counter;
     };
     const COL = 260;
+    // Leaf rows advance by the HEIGHT of the leaf just placed, not by a fixed
+    // index, because the leaves are not all the same height: a var or a literal
+    // is one control tall, while a relativeDate carries four. With a single row
+    // pitch, two relative bounds loaded from an AST — which is exactly what a
+    // `between` with two of them is — overlapped until the author dragged them
+    // apart or hit "Fit to view".
+    //
+    // Layout is cosmetic and is NOT part of the AST: graphToAST drops positions
+    // entirely, so nothing here can change what a rule means or how it
+    // serializes. The numbers are approximate node heights plus a gap; the
+    // canvas is free-form and an author moves anything they like.
     const ROW = 96;
+    const TALL_ROW = 200;
+
+    // leafRow reports the vertical space one leaf needs.
+    function leafRow(type) {
+      return type === TYPES.RELATIVE_DATE ? TALL_ROW : ROW;
+    }
 
     function walk(node, depth) {
       const id = nextId();
@@ -562,12 +579,13 @@
       }
 
       // Position: a parent sits at the average y of its children; a leaf takes
-      // the next free row. Cosmetic only.
+      // the next free row and advances the cursor by its own height. Cosmetic
+      // only — positions are dropped by graphToAST.
       if (childYs.length > 0) {
         g.position.y = childYs.reduce(function (a, b) { return a + b; }, 0) / childYs.length;
       } else {
-        g.position.y = leafCursor * ROW;
-        leafCursor++;
+        g.position.y = leafCursor;
+        leafCursor += leafRow(node.type);
       }
       nodes.push(g);
       return id;
