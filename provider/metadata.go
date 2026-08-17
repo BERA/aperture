@@ -44,6 +44,14 @@ import (
 // Note on time values: time.Time is deliberately NOT a scalar. A rule literal
 // is a JSON scalar, so a time.Time in metadata could never be compared against
 // one; a loader formats timestamps as RFC 3339 strings instead.
+//
+// Those strings have exactly two canonical forms, defined in date.go:
+// "2006-01-02" for a calendar day and "2006-01-02T15:04:05Z" for a timestamp,
+// always UTC. A date therefore rides INSIDE this model as an ordinary string
+// scalar — it is not a fourth shape, and nothing here changes to accommodate it.
+// The model stays date-blind on purpose: it cannot know which strings a host
+// means as dates, so declaring a field to be one, and running its values through
+// provider.ParseDateValue, is a loader's job.
 
 const (
 	// DefaultMaxValueDepth is the default container depth a metadata field value

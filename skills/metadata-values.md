@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -43,7 +43,91 @@ Rejected everywhere:
   spelled in the two types the expression environment and JSON share so a loader
   normalises once;
 - **`time.Time`** — a rule literal is a JSON scalar and could never be compared
-  against one. Loaders format timestamps as RFC 3339 strings.
+  against one. Loaders format timestamps as RFC 3339 strings (see
+  [Dates](#dates) for the two canonical forms).
+
+## Dates
+
+A date is **not a fourth shape**. It is an ordinary **string scalar** that a
+loader has additionally been told is a date, and the value model is unchanged by
+it. What `provider/date.go` adds is the constraint that such a string must be one
+of exactly **two canonical forms**:
+
+| Form | Layout | Example |
+|---|---|---|
+| calendar day | `2006-01-02` (RFC 3339 full-date) | `2026-03-04` |
+| timestamp | `2006-01-02T15:04:05Z` (RFC 3339 date-time, always `Z`) | `2026-03-04T01:02:03Z` |
+
+**Granularity is carried by the string itself** — a value containing a `T` is a
+timestamp, one that does not is a calendar day — so no type tag travels beside
+the value, and a canonical date round-trips through YAML, JSON, CSV, and the
+expression environment as the string it already is.
+
+The model stays **date-blind**: `ValidateField` cannot know which strings a host
+means as dates, so it keeps accepting any string. Declaring a field to be a date
+— and so subjecting its values to `provider.ParseDateValue` — is a **loader's**
+job, through its typed column or field schema.
+
+### Accepted and rejected
+
+| Input | Result |
+|---|---|
+| `2026-03-04` | accepted, calendar day |
+| `2026-03-04T01:02:03Z` | accepted, timestamp |
+| `2026-03-04T01:02:03` | accepted — **no offset is read as UTC** |
+| `2026-03-04T01:02:03.456Z` | accepted, **truncated** to `…T01:02:03Z` |
+| `2026-03-04T01:02:03+05:00` | **rejected** — `DateReasonNonUTCOffset` |
+| `2026-02-30`, `2026-13-01`, `2023-02-29` | **rejected** — `DateReasonCalendar` |
+| `03/04/2026`, `2026-3-4`, `Mar 4 2026` | **rejected** — `DateReasonLayout` |
+| `""` | **rejected** — `DateReasonEmpty` (a loader that reads an empty cell as an *absent* field checks that before parsing) |
+
+Three properties are load-bearing, each because its absence is a silently wrong
+answer rather than a loud failure:
+
+- **An explicit offset is rejected, not converted.** Canonicalising is
+  instant-correct and calendar-surprising: a host writing
+  `2026-01-01T00:00:00+05:00` means January 1st, and the UTC instant is
+  `2025-12-31T19:00:00Z`, so every question about the day, month, or year would
+  answer 2025. Rejecting makes the host convert deliberately. An **offset-free**
+  value is accepted because it asserts no other zone; there is no timezone knob
+  anywhere in Aperture, and every instant is constructed and formatted in
+  `time.UTC`.
+- **Fractional seconds truncate; they never round.** Rounding can carry a value
+  across the very boundary a rule is testing.
+- **Parsing is mandatory — comparing the canonical strings is not a permissible
+  shortcut.** The two forms sort correctly *within* one granularity but not
+  across it: the date-only form is a strict prefix of the timestamp form, so
+  `"2026-03-04" < "2026-03-04T00:00:00Z"` as text while the two name the **same
+  instant**. A cutoff written against a date field and compared against a
+  timestamp would be wrong at exactly the boundary instant.
+
+### The entry points
+
+```go
+v, err := provider.ParseDateValue("2026-03-04T01:02:03.456Z") // load path
+v.Time()                       // 2026-03-04 01:02:03 +0000 UTC, never sub-second
+v.Granularity()                // provider.GranularityDateTime
+v.String()                     // "2026-03-04T01:02:03Z" — the form a loader stores
+v.Compare(other)               // -1 / 0 / +1 over the INSTANTS, never the text
+
+s, err := provider.CanonicalizeDate(raw)  // parse + render, idempotent
+v, ok := provider.DateValueOf(value)      // evaluation path: any value, no error built
+provider.DateOf(t) / provider.DateTimeOf(t)  // from a time.Time, converted to UTC
+```
+
+`DateValue`'s fields are unexported, so there is no way to express one in another
+zone, with sub-second precision, or with a granularity its instant cannot
+support. The zero `DateValue` is the only invalid one and `IsZero` identifies it.
+
+A rejection is **`APERTURE_CONFIG_INVALID`** — a loader-side failure, not a
+value-model violation — carrying `reason` (the `DateReason`) and `expected` (the
+two layouts) in its context. Read the cause back with `provider.DateReasonOf(err)`
+rather than matching message text. As everywhere in this model the error **never
+carries the value**, which for dates is sharper than usual: a date can be personal
+data, a birth date or a termination date. The `*time.ParseError` is classified and
+then **discarded**, never wrapped — its own `Error` string quotes the input
+verbatim. A loader adds its own locating context around the rejection: the
+**column, line, and field**, never the cell.
 
 ## Caps
 
@@ -323,6 +407,7 @@ Changing the value model means changing all of these in the same PR:
 | Change | Also update |
 |---|---|
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
+| The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | the "Dates" section above + `docs/src/concepts/providers.md` |
 | The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md` |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |

@@ -118,6 +118,33 @@ Two rules bound it:
 could never be compared against one, so a loader formats timestamps as RFC 3339
 strings.
 
+### Dates are string scalars, in two canonical forms
+
+A date is **not a fourth shape** — it is a string scalar a loader has been told is
+a date. Such a string must be one of exactly two forms, both UTC:
+
+| Form | Layout | Example |
+|---|---|---|
+| calendar day | `2006-01-02` | `2026-03-04` |
+| timestamp | `2006-01-02T15:04:05Z` | `2026-03-04T01:02:03Z` |
+
+Granularity is carried by the string itself, so no type tag travels beside the
+value. An offset-free timestamp is read as UTC and fractional seconds are
+**truncated**, never rounded. An **explicit offset is rejected** rather than
+converted: a host writing `2026-01-01T00:00:00+05:00` means January 1st, but the
+UTC instant is `2025-12-31T19:00:00Z`, so accepting it would silently move the
+calendar day and year.
+
+The value model itself stays date-blind — `ValidateField` cannot know which
+strings a host means as dates, so it keeps accepting any string. Declaring a
+field to be a date, and running its values through `provider.ParseDateValue`, is
+a loader's job. A rejection is `APERTURE_CONFIG_INVALID` carrying a machine-
+readable `reason` (`provider.DateReasonOf`) and never the value, because a date
+can be personal data. Comparison goes through `DateValue.Compare`, which compares
+**instants**: `"2026-03-04"` and `"2026-03-04T00:00:00Z"` are the same moment but
+sort differently as text, so comparing the stored strings would be wrong at
+exactly that boundary.
+
 ### Depth, counted below the field root
 
 `provider.ValueDepth(v)` reports a value's container depth: every array or object
