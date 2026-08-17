@@ -95,6 +95,8 @@ real tag list does not guarantee.
 | `BenchmarkRuleEval/<variant>` | the rule **in isolation** — compiled once, evaluated over the same metadata, so the fixture's ~60 µs of grant resolution cannot mask it |
 | `BenchmarkCollectionScaling/tags-N` | the guarded collection operator swept across array sizes, with the field's `ValueBytes` reported alongside |
 | `BenchmarkRuleCompileCached/<variant>` | the AST work a `Check` pays on **every** decision even when the compiled program is cached, with the AST's node count alongside |
+| `BenchmarkEnumerateRuleBacked/candidates-N` | a **rule-backed** `Enumerate` swept across candidate-set sizes, reporting a derived `ns/candidate` and the returned `ids` count |
+| `BenchmarkEnumerateRuleBackedRuleEval` | the same number of `rules.Engine.Selected` calls with no engine around them, so the rule half of the enumeration cost is separable from the decision half |
 
 `make bench` runs them all with `-benchmem`. The **audit toggle** is the
 benchmark axis: audit-off is the `s.audit == nil` path; audit-on wires a sampled
@@ -223,6 +225,63 @@ realistic 12-tag collection adds ~270 ns and ~500 B per `Check` — noise agains
 54 µs decision. Note the collection variants' B/op no longer grows with array
 length: `rule-tags-at-cap` allocates 11 286 B against `rule-tags-typical`'s
 11 285, over 600× the elements.
+
+### Rule-backed `Enumerate`
+
+`Enumerate` is a different shape from `Check`, and until now nothing measured it
+through a rule. A rule is not invertible, so an `inclusive;rule=…` grant's
+members are found by **listing the object type and filtering each candidate
+through the rule** — and the engine then runs its ordinary deny-overrides
+decision over every survivor, which consults the same grant again. One
+`Enumerate` is therefore up to **2 × candidates** rule evaluations.
+
+`bench/enumerate_test.go` builds its own store, registry and rules engine (so the
+cached-`Check` baseline above is untouched) with one account-wide
+`inclusive;rule=…` grant over N documents, all of which the rule selects — the
+worst case, since a rejected candidate skips the second evaluation.
+`BenchmarkEnumerateRuleBacked`, Apple M1 Max, `-benchtime=2s`, audit off:
+
+| candidates | ns/op | ns/candidate | allocs/op | B/op | ids returned |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 40 472 | 4 047 | 532 | 37 223 | 10 |
+| 100 | 391 125 | 3 911 | 5 075 | 367 144 | 100 |
+| 1 000 | 4 195 286 | 4 195 | 50 118 | 3 690 931 | 1 000 |
+| 2 000 | 4 434 250 | 4 434 | 50 123 | 3 725 176 | 1 000 |
+
+And the rule half in isolation (`BenchmarkEnumerateRuleBackedRuleEval`, 1 000
+`Selected` calls): **1 235 ns/eval, 14 allocs/eval, ~945 B/eval**.
+
+- **~4.2 µs and ~50 allocations per candidate**, flat across three orders of
+  magnitude — linear in the candidate count, with no super-linear term in the
+  resolver.
+- **The rule is ~60% of it.** Two evaluations at 1 235 ns is ~2.5 µs of the
+  ~4.2 µs and 28 of the ~50 allocations; the rest is the decision engine's own
+  per-candidate work. Inside the rule half the largest line item is the
+  per-decision AST re-walk (`BenchmarkRuleCompileCached`).
+- **The 1 000 and 2 000 rows are the same** to within run-to-run noise. Past
+  `scope.DefaultMaxMembers` the extra objects are never visited, so the worst
+  case is a constant a host can budget for rather than a function of the object
+  population. `TestEnumerateRuleBackedStaysBounded` pins that ungated.
+- **A bound-limit enumeration is ~4.2 ms**, roughly 1 000× a cached `Check`.
+  That is arithmetic (it *is* ~2 000 evaluations plus 1 000 decisions), but it
+  makes rule-backed `Enumerate` an interactive operation, not a hot-path one.
+- One asymmetry: a smaller `EnumerateRequest.Limit` shortens only the **second**
+  half. The member set is gathered first and bounded by
+  `scope.DefaultMaxMembers` regardless, so `Limit=10` over 1 000 candidates still
+  pays ~1 000 evaluations to build it, then ~10 decisions.
+
+These are **informational**. They are deliberately outside `TestCheckNFR`'s
+asserted gate, which is about the cached single-`Check` NFR; rule-backed
+enumeration has no agreed threshold. The numbers are published so a future change
+that regresses them has something to regress against.
+
+The counters in the compiled-rule cache are `sync/atomic` for this reason. The
+hit path used to take the cache's **write** lock purely to bump `hits`, which
+serialised concurrent evaluations on a number none of them read; at one rule
+evaluation per decision that was a rounding error, but rule-backed enumeration
+multiplies it by the candidate count. `TestCacheHitCountIsExactUnderConcurrency`
+(in `rules/`) asserts the counter stays exact — 32 goroutines × 100 evaluations
+must report exactly 3 200 hits — so the change is correct, not merely faster.
 
 ## Findings
 
@@ -374,6 +433,11 @@ the default build, but they are wired and runnable on demand and in a dedicated 
 job/cron where the runner is known to be unloaded.
 `TestMetadataIsSharedByReference` is the one guard that is **not** gated: it is
 structural rather than timed, so it runs in every `make test`.
+`TestEnumerateRuleBackedStaysBounded` is ungated for the same reason: it asserts
+that a rule-backed `Enumerate` over twice `scope.DefaultMaxMembers` candidates
+returns **exactly** the bound — not more (an unbounded member set) and not less
+(a second, tighter limit having crept in, which would be a wrong access-control
+answer rather than a performance tradeoff).
 
 **All gates now pass.** Three were failing by design as of E5-S2, left asserting
 the honest budget rather than relaxed to green — the numbers were the

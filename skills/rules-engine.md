@@ -265,6 +265,15 @@ render identically share one compiled program, and per-`Check` cost is bounded
 read from an injected `Clock` (`WithCacheTTL` / `WithClock`); `CacheStats`
 exposes hit/miss/eviction counters.
 
+A cache **hit** takes only the read lock: the counters are `sync/atomic`, so
+concurrent evaluations no longer serialise on a counter bump they never read.
+That matters most for rule-backed `Enumerate`, which evaluates the rule once per
+candidate to gather a grant's members and again per candidate in the decision
+walk — see [benchmarks](../docs/benchmarks.md), "Rule-backed `Enumerate`". The
+counters' meaning is unchanged, and `CacheStats` samples them atomically rather
+than under a lock, so the four fields are not one instant's snapshot; they are
+exact for a sequential caller.
+
 What the cache removes is the **expr-lang compile**, not the AST walk: `Selected`
 calls `Engine.Compile` per evaluation, and `Compile` re-validates, re-renders, and
 re-hashes the AST before it can probe the cache by hash. That walk is still on
