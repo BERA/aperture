@@ -58,12 +58,13 @@ const (
 // stable order (sorted by id/name) so a round-trip is byte-stable and
 // human-diffable.
 //
-// Two sections are runtime WIRING rather than model state, and are the seed
-// FILE's own source of truth: Providers and Objects. BuildRegistry turns them
-// into a live *provider.Registry; Apply writes neither to storage, and because
-// Export reads the model back OUT of storage, neither is ever reproduced by an
-// export. Live host domain-object metadata is deliberately not exportable state —
-// that is the provider cache, derived and disposable, never source of truth.
+// Three sections are runtime WIRING rather than model state, and are the seed
+// FILE's own source of truth: Providers, Objects, and FieldTypes. BuildRegistry
+// turns them into a live *provider.Registry; Apply writes none of them to
+// storage, and because Export reads the model back OUT of storage, none is ever
+// reproduced by an export. Live host domain-object metadata is deliberately not
+// exportable state — that is the provider cache, derived and disposable, never
+// source of truth.
 type Document struct {
 	Accounts    []Account    `yaml:"accounts" json:"accounts"`
 	Memberships []Membership `yaml:"memberships" json:"memberships"`
@@ -77,6 +78,7 @@ type Document struct {
 	Rules       []Rule       `yaml:"rules" json:"rules"`
 	Providers   []Provider   `yaml:"providers,omitempty" json:"providers,omitempty"`
 	Objects     []Object     `yaml:"objects,omitempty" json:"objects,omitempty"`
+	FieldTypes  []FieldType  `yaml:"field_types,omitempty" json:"field_types,omitempty"`
 }
 
 // Account mirrors model.Account in declarative form.

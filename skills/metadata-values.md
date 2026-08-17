@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the seed document's inline objects section and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the seed document's inline objects section, its optional field_types: date declarations, and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -316,6 +316,96 @@ Three properties, all of them the same ones the CSV loader owes:
   `APERTURE_IDENTITY_INVALID`. Ids are deduplicated across the **whole** section,
   not per type.
 
+#### The seed document's `field_types:` section
+
+A CSV header can say `hired_at:date`; a YAML mapping has nowhere to put that. The
+optional `field_types:` section is the missing declaration — and **only** that:
+
+```yaml
+field_types:
+  - object_type: brand
+    fields:
+      hired_at: date
+      last_seen: datetime
+
+objects:
+  - id: account:acme/brand:1
+    metadata:
+      hired_at: "2026-03-04"
+      last_seen: "2026-03-04T12:30:00Z"
+```
+
+| Spelling | Meaning |
+|---|---|
+| `date` | a **string scalar** in `2006-01-02`, canonicalised at load through `provider.ParseDateValue` |
+| `datetime` | a **string scalar** in `2006-01-02T15:04:05Z`, same parser |
+
+The vocabulary is **exactly those two words, lower-case and exact** — the CSV
+column suffix with the colon dropped, so one word means one thing in both
+loaders. `timestamp`, `Date`, `time`, and an empty type are all
+`APERTURE_CONFIG_INVALID`, never a silently ignored declaration. Each entry names
+an `object_type` (matched against the identity's terminal segment, as `providers:`
+is) and may appear at most once per type.
+
+It is a **third top-level wiring section**, beside `providers:` and `objects:`
+and shaped like `providers:` — a list of entries each naming its `object_type`,
+rather than a map keyed by type, so a duplicate declaration is a detectable error
+and not a last-one-wins merge. It is deliberately **not** a `fields:` key on an
+`object_types:` entry: `object_types:` is model state that `Apply` writes and
+`Export` rebuilds from storage, so a declaration hung there would be silently
+dropped by every export.
+
+**Quote date values in YAML.** YAML resolves an *unquoted* calendar day as a
+`!!timestamp`, and the seed loader's YAML path normalises through JSON, so
+`hired_at: 2026-03-04` arrives already widened to `2026-03-04T00:00:00Z` and a
+field declared `date` rejects it. The widening happens inside the YAML decoder,
+before `seed` sees the document, so it cannot be undone there — the rejection
+carries a `hint` naming the fix when the instant is exactly midnight. JSON has no
+date type and so no trap; the two formats agree on every quoted value.
+
+Six rules, five of them shared verbatim with the CSV loader:
+
+- **Validated and canonicalised at `BuildRegistry` time**, through
+  `provider.ParseDateValue` — never re-implemented here. The **canonical** text is
+  stored, so `2026-03-04T01:02:03.456Z` and `2026-03-04T01:02:03` both become
+  `2026-03-04T01:02:03Z`, and a `Filter.Fields` predicate over the field is
+  canonical-string equality.
+- **The declared type fixes the granularity** — a `date` field rejects a timestamp
+  and a `datetime` field rejects a bare day, rather than quietly widening it to
+  midnight.
+- **An empty value omits the field**, exactly as an empty CSV cell does.
+- **A declared field is not a required field.** The section declares a *type*; an
+  object that omits the field is valid. Declaring a type for an object type with
+  **no** `objects:` entries is likewise legal (the entries may be arriving, or the
+  type may be served by a `providers:` entry) and registers nothing on its own —
+  but the declaration is still validated, so a typo fails the build immediately.
+- **It applies to `objects:` only.** A `providers:` entry carries its own typing
+  (the CSV suffix), so a declaration is never imposed on provider-loaded rows; one
+  type declaration in two places could disagree with itself. Inline entries are
+  still fully validated against the declaration when a `providers:` entry wins
+  their type — validation never depends on precedence — and the canonicalised
+  values are discarded with the rest of those entries.
+- **A non-string value is its own error**, unlike a CSV cell which is always
+  text: a number, array, or object in a declared date field is
+  `APERTURE_CONFIG_INVALID` naming the declared `type` and the `kind` found, not a
+  confusing parse failure.
+
+A rejection is `APERTURE_CONFIG_INVALID` naming the **object id and the field**,
+in both the message and the context, and carries the `reason`
+(`provider.DateReasonOf`) for a parse failure. A granularity mismatch is **not** a
+parse failure, so it carries no `reason` and `DateReasonOf` correctly reports
+none — the same shape the CSV loader's granularity rejection has. Neither ever
+carries the value: a date is frequently personal data. The value model's own
+error is classified and dropped rather than wrapped, because `DateReasonOf` reads
+the **outermost** coded error and wrapping would hide the reason.
+
+**This is a date-type declaration, not a general metadata schema.** No
+`required:`, `default:`, `enum:`, `pattern:`, `int`/`float`/`bool`, or nested
+field paths. The value model already governs shape, depth, and size; the one
+thing it cannot govern is which strings a host means as dates. Like `providers:`
+and `objects:`, the section is runtime **wiring**: no storage row, no `Apply`
+write, no export.
+
 #### When `providers:` and `objects:` claim the same type
 
 **Precedence is type-level and total: the file-backed `providers:` entry wins,
@@ -440,6 +530,7 @@ Changing the value model means changing all of these in the same PR:
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
+| The seed `field_types:` section (its spelling, its vocabulary, what it applies to) | "The seed document's `field_types:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and its two type words must stay identical to the CSV `:date`/`:datetime` suffixes, which is the whole reason it exists |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
 | The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |
 

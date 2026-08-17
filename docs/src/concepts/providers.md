@@ -139,7 +139,8 @@ The value model itself stays date-blind — `ValidateField` cannot know which
 strings a host means as dates, so it keeps accepting any string. Declaring a
 field to be a date, and running its values through `provider.ParseDateValue`, is
 a loader's job — in `csvprovider` that is the
-[`:date` / `:datetime` column suffix](#date-columns). A rejection is
+[`:date` / `:datetime` column suffix](#date-columns), and in a seed document the
+[`field_types:` section](seed.md#declared-field-types). A rejection is
 `APERTURE_CONFIG_INVALID` carrying a machine-
 readable `reason` (`provider.DateReasonOf`) and never the value, because a date
 can be personal data. Comparison goes through `DateValue.Compare`, which compares
