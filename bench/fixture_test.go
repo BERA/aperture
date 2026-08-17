@@ -96,6 +96,25 @@ const (
 	ruleTagsTypical = "rule-tags-typical"
 	// ruleTagsAtCap is the same guarded render over the cap-maximal array.
 	ruleTagsAtCap = "rule-tags-at-cap"
+	// ruleDateCompare is a binary DATE comparison, which puts PARSING on the
+	// comparison hot path: both operands are canonical date strings and both are
+	// parsed to instants on every evaluation, because comparing the strings is
+	// wrong across granularities. Read as a delta from rule-scalar, this is the
+	// per-comparison cost of a date operator.
+	ruleDateCompare = "rule-date-compare"
+	// ruleDateBetween is the ternary form, which parses THREE operands per
+	// evaluation rather than two. The pair makes the per-operand parse cost
+	// readable by difference rather than as one absolute number.
+	ruleDateBetween = "rule-date-between"
+)
+
+// The date fixture's field values. They are the two canonical granularities, so
+// the mixed-granularity path (a date-only field compared against a timestamp
+// bound, which parses through a different branch) is exercised rather than only
+// the same-shape case.
+const (
+	benchHiredAt    = "2026-03-04"
+	benchReviewedAt = "2026-03-04T09:30:00Z"
 )
 
 // benchObject is the object every rule variant is checked against. Using ONE
@@ -157,6 +176,21 @@ func ruleVariants() []ruleVariant {
 				rules.List(rules.Lit(benchTag(tagsAtCapLen-1)))),
 			render: `guarded dispatcher: $op("hasAny", __notes, "object.tagsAtCap", object?.tagsAtCap, ...)`,
 		},
+		// The date cases compare a date-only FIELD against a TIMESTAMP bound on
+		// purpose: granularity never affects ordering, so the mixed case is the
+		// one a real rule hits and the one a string comparison would get wrong.
+		{
+			name: ruleDateCompare,
+			ast: rules.Compare(rules.OpBefore, rules.Var("object.hired_at"),
+				rules.Lit("2026-12-31T23:59:59Z")),
+			render: `guarded dispatcher: $date("before", __notes, "object.hired_at", object?.hired_at, ...) — 2 parses`,
+		},
+		{
+			name: ruleDateBetween,
+			ast: rules.Between(rules.Var("object.reviewed_at"),
+				rules.Lit("2026-01-01"), rules.Lit("2026-12-31T23:59:59Z")),
+			render: `guarded dispatcher: $date("between", __notes, "object.reviewed_at", object?.reviewed_at, ...) — 3 parses`,
+		},
 	}
 }
 
@@ -185,6 +219,11 @@ func benchMetadata() provider.Metadata {
 		},
 		"tags":      benchTags(tagsTypicalLen),
 		"tagsAtCap": benchTags(tagsAtCapLen),
+		// Dates ride inside the value model as ordinary string scalars, so they
+		// cost the metadata bag nothing structurally — the cost the date variants
+		// measure is the PARSE, which happens per evaluation and not per fetch.
+		"hired_at":    benchHiredAt,
+		"reviewed_at": benchReviewedAt,
 	}
 }
 

@@ -86,16 +86,25 @@ Date operators. `left` is the date-valued field; `right` is another date operand
 | `sameYear` | `object.hired_at same year as "2026-03-04"` | one element |
 
 A date operand is one of the two canonical strings the value model defines —
-`2006-01-02` or `2006-01-02T15:04:05Z` (see the `metadata-values` skill). Two
+`2006-01-02` or `2006-01-02T15:04:05Z` (see the `metadata-values` skill). Four
 properties are worth stating outright:
 
 - **`between` is INCLUSIVE AT BOTH ENDS.** `between [lo, hi]` is exactly
   `onOrAfter lo && onOrBefore hi`. Bounds are never reordered: a `lo` above the
-  `hi` is a range that matches nothing, which is what the author wrote.
+  `hi` is a range that matches nothing, which is what the author wrote — and it
+  is **noted**, because "matched nothing" is otherwise indistinguishable from a
+  window nothing happens to fall in.
 - **Granularity never affects ordering.** `"2026-03-04"` and
   `"2026-03-04T00:00:00Z"` name the same instant and compare **equal**. Ordering
   is over instants, never over text — which is also why no date operator renders
   to a native `<`.
+- **`sameDay` / `sameMonth` / `sameYear` are calendar-bucket EQUALITY, in UTC.**
+  Not distance: `2026-03-31` and `2026-04-01` are a day apart and are **not** in
+  the same month, and `2026-03-04` and `2025-03-04` share a month number but are
+  **not** in the same month. There is no timezone conversion anywhere and no
+  timezone knob — every instant in the model is already UTC.
+- **A date operand that will not parse denies, and never raises** — see
+  "Malformed dates" below.
 
 `between` needs two right-hand operands and `compare` carries one `right`, so
 `right` is a `list` of exactly two items. **No new node type, no new field, and
@@ -248,6 +257,40 @@ Which shapes each operator accepts:
 | `isEmpty` `isNotEmpty` | array, object, or string | `array, object, or string` |
 | `exists` | anything — a nil test cannot mismatch | — |
 
+## Malformed dates: deny-safe, and noted
+
+Date operators follow the same policy, for the same reason: metadata reaches the
+evaluator from host-implemented `ObjectProvider`s and from the principal
+attribute bag, neither of which any loader validates, so one malformed date must
+not break every `Check` that touches the field.
+
+**Any operand that will not parse makes the comparison `false`.** Never an
+`APERTURE_RULE_EVAL` error. Both operands are parsed to instants on every
+evaluation — comparing the canonical strings is not a permissible shortcut,
+because the date-only form is a strict prefix of the timestamp form.
+
+| operand | result | note |
+|---|---|---|
+| absent (`nil`) | **`false`** | `shape_mismatch`, `expected date, got absent` |
+| a number, bool, array, or object | **`false`** | `shape_mismatch`, `expected date, got number` |
+| a string that is not one of the two canonical forms | **`false`** | `date_invalid` |
+| `between` whose lower bound is after its upper bound | **`false`** | `date_bounds_inverted` |
+
+**Note the asymmetry with the collection operators, and that it is deliberate.**
+A collection operator gives an absent field a meaning — it reads as an *empty
+collection*, and the operator's own polarity decides from there, which is why
+`hasNone` grants on missing data. A date operator has no such reading: there is
+no empty date, and all eight date operators are **positive**, so none of them can
+match on an absence. Absent is therefore uniformly `false`, exactly as a
+wrong-shaped operand is, and no date operator ever records `absent_field`. (A
+negative date operator, were one ever added, would need it.)
+
+An unparseable string is kept **separate** from a shape mismatch because the fix
+differs: the shape was right and the content was not, so the answer is to
+canonicalise the data — or to declare the field as a date in the loader (a CSV
+`:date` / `:datetime` column, or the seed document's `field_types:`) so it is
+validated at load instead of denying silently at decision time.
+
 ### Evaluation notes
 
 A silent `false` is how an access-control bug hides, so every mismatch is
@@ -256,16 +299,25 @@ Twirp `trace_json`, MCP):
 
 ```
 object.tags: expected collection, got string
+object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z
+object.hired_at: between bounds are inverted; the lower bound is after the upper bound, so nothing can match
 ```
 
 Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
-`Actual` — carrying **shape and path only, never a metadata value**. Two kinds
-are recorded today:
+`Actual` — carrying **shape and path only, never a metadata value**. That last
+point is not a nicety for dates: a date is often personal data (a birth date, a
+termination date), and the same trace crosses the Twirp and MCP surfaces. Four
+kinds are recorded today:
 
-- `shape_mismatch` — a collection operator met a non-collection.
+- `shape_mismatch` — a collection operator met a non-collection, **or** a date
+  operator met a value that is not a string (including an absent field).
 - `absent_field` — an operator **matched because the field is missing** (the
   `nin` / `hasNone` / `subsetOf` / `isEmpty` grant above), which is otherwise
-  invisible in the verdict.
+  invisible in the verdict. No date operator records this.
+- `date_invalid` — a date operator met a **string** that is not one of the two
+  canonical forms. `Expected` names the forms; the offending value never appears.
+- `date_bounds_inverted` — a `between` was written with its lower bound after its
+  upper bound, so it matches nothing. `Path` names the compared field.
 
 The channel is opt-in and costs the decision path nothing: `Check` and
 `Enumerate` install no collector, so nothing is recorded and nothing is
@@ -296,7 +348,8 @@ evaluation, surfacing coded errors:
   or a call to an unregistered function (caught by the expression type-checker).
 - `APERTURE_RULE_EVAL` — a runtime failure (e.g. an ordered comparison against a
   metadata field the object lacks) or a non-boolean result. A wrong-shaped
-  collection operand is **not** one of these: it denies with a note.
+  collection operand is **not** one of these, and neither is an absent,
+  wrong-shaped, or unparseable **date** operand: both deny with a note.
 - `APERTURE_RULE_NOT_FOUND` — a scope rule reference the `RuleSource` cannot
   resolve.
 

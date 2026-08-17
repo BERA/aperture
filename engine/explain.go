@@ -109,7 +109,8 @@ type EvaluationNote struct {
 	GrantID string
 	// Rule is the rule reference that was evaluated.
 	Rule string
-	// Kind classifies the observation ("shape_mismatch", "absent_field").
+	// Kind classifies the observation ("shape_mismatch", "absent_field",
+	// "date_invalid", "date_bounds_inverted").
 	Kind string
 	// Op is the comparison operator that made the observation ("hasAll", ...).
 	Op string

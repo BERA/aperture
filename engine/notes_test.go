@@ -192,3 +192,175 @@ func TestTraceNoteNeverCarriesTheValue(t *testing.T) {
 		t.Fatalf("the rendered trace leaked a metadata value:\n%s", tr.String())
 	}
 }
+
+// dateFixtureMetadata is the date half of the same story: a well-formed date, a
+// string a host wrote in some other format (which no loader validated, because a
+// host-implemented ObjectProvider bypasses them all), a value of the wrong shape
+// entirely, and an object missing the field.
+func dateFixtureMetadata() map[string]provider.Metadata {
+	return map[string]provider.Metadata{
+		"account:acme/document:good":     {"hired_at": "2026-03-04"},
+		"account:acme/document:mistyped": {"hired_at": "04/03/2026"},
+		"account:acme/document:shape":    {"hired_at": 20260304},
+		"account:acme/document:absent":   {"title": "no hire date here"},
+	}
+}
+
+// TestDateOperandIsDeniedNotErrored is the decision-surface half of the date
+// policy: a rule reading a malformed date DENIES rather than failing the whole
+// request, on Check and on Enumerate alike, and the well-formed object is
+// unaffected.
+func TestDateOperandIsDeniedNotErrored(t *testing.T) {
+	eng, ctx := dateFixture(t)
+
+	good, err := eng.Check(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read", Object: "account:acme/document:good"})
+	if err != nil {
+		t.Fatalf("Check(good): %v", err)
+	}
+	if !good.Allow {
+		t.Fatalf("the well-formed date should be allowed: %+v", good)
+	}
+
+	for _, id := range []string{"mistyped", "shape", "absent"} {
+		object := "account:acme/document:" + id
+		res, err := eng.Check(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read", Object: object})
+		if err != nil {
+			t.Fatalf("a malformed date must not fail Check(%s): %v (code %s)", id, err, aerr.CodeOf(err))
+		}
+		if res.Allow {
+			t.Fatalf("a malformed date must deny (%s): %+v", id, res)
+		}
+	}
+
+	members, err := eng.Enumerate(ctx, EnumerateRequest{
+		Account: acctAcme, Principal: "alice", Action: "read", Pattern: "account:acme/**"})
+	if err != nil {
+		t.Fatalf("a malformed date must not fail Enumerate: %v (code %s)", err, aerr.CodeOf(err))
+	}
+	if len(members) != 1 || members[0] != "account:acme/document:good" {
+		t.Fatalf("members = %v, want only the well-formed document", members)
+	}
+}
+
+// TestExplainSurfacesDateNotes is the diagnostic half: each date failure reaches
+// the trace with its own kind, naming the path and the reason and nothing else.
+func TestExplainSurfacesDateNotes(t *testing.T) {
+	eng, ctx := dateFixture(t)
+
+	cases := []struct {
+		object string
+		want   EvaluationNote
+	}{
+		{"mistyped", EvaluationNote{
+			GrantID: "g-shape", Rule: "tagged", Kind: "date_invalid", Op: rules.OpBefore,
+			Path: "object.hired_at", Expected: "2006-01-02 or 2006-01-02T15:04:05Z",
+			Message: "object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z",
+		}},
+		{"shape", EvaluationNote{
+			GrantID: "g-shape", Rule: "tagged", Kind: "shape_mismatch", Op: rules.OpBefore,
+			Path: "object.hired_at", Expected: "date", Actual: "number",
+			Message: "object.hired_at: expected date, got number",
+		}},
+		{"absent", EvaluationNote{
+			GrantID: "g-shape", Rule: "tagged", Kind: "shape_mismatch", Op: rules.OpBefore,
+			Path: "object.hired_at", Expected: "date", Actual: "absent",
+			Message: "object.hired_at: expected date, got absent",
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.object, func(t *testing.T) {
+			tr, err := eng.Explain(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read",
+				Object: "account:acme/document:" + tc.object})
+			if err != nil {
+				t.Fatalf("Explain: %v", err)
+			}
+			if tr.Decision.Allow {
+				t.Fatalf("a malformed date must deny\n%s", tr.String())
+			}
+			if len(tr.Notes) != 1 {
+				t.Fatalf("trace notes = %+v, want exactly one", tr.Notes)
+			}
+			if tr.Notes[0] != tc.want {
+				t.Fatalf("note = %+v, want %+v", tr.Notes[0], tc.want)
+			}
+			if report := tr.String(); !strings.Contains(report, tc.want.Message) {
+				t.Fatalf("the rendered trace must print the note:\n%s", report)
+			}
+		})
+	}
+
+	// The well-formed object records nothing at all.
+	clean, err := eng.Explain(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read",
+		Object: "account:acme/document:good"})
+	if err != nil {
+		t.Fatalf("Explain(good): %v", err)
+	}
+	if len(clean.Notes) != 0 {
+		t.Fatalf("a well-formed date should record no notes, got %+v", clean.Notes)
+	}
+}
+
+// TestExplainSurfacesInvertedBoundsNote covers the authoring-error diagnostic:
+// `between` written backwards denies every object, and without the note that is
+// indistinguishable from a window nothing falls in.
+func TestExplainSurfacesInvertedBoundsNote(t *testing.T) {
+	eng, ctx := shapeFixture(t,
+		rules.Between(rules.Var("object.hired_at"), rules.Lit("2026-12-31"), rules.Lit("2026-01-01")),
+		dateFixtureMetadata())
+
+	tr, err := eng.Explain(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read",
+		Object: "account:acme/document:good"})
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if tr.Decision.Allow {
+		t.Fatalf("an inverted range matches nothing\n%s", tr.String())
+	}
+	if len(tr.Notes) != 1 || tr.Notes[0].Kind != "date_bounds_inverted" {
+		t.Fatalf("trace notes = %+v, want one date_bounds_inverted note", tr.Notes)
+	}
+	if got, want := tr.Notes[0].Path, "object.hired_at"; got != want {
+		t.Fatalf("note path = %q, want %q", got, want)
+	}
+	if report := tr.String(); !strings.Contains(report, tr.Notes[0].Message) {
+		t.Fatalf("the rendered trace must print the note:\n%s", report)
+	}
+}
+
+// TestTraceDateNoteNeverCarriesTheValue is the leak guard for dates specifically.
+// A date is often personal data — a birth date, a termination date — so it is
+// exactly the kind of value a trace crossing account boundaries must not carry.
+func TestTraceDateNoteNeverCarriesTheValue(t *testing.T) {
+	const marker = "1974-11-02-CROSS-ACCOUNT"
+	eng, ctx := shapeFixture(t,
+		rules.Compare(rules.OpBefore, rules.Var("object.hired_at"), rules.Lit("2026-01-01")),
+		map[string]provider.Metadata{"account:acme/document:1": {"hired_at": marker}})
+
+	tr, err := eng.Explain(ctx, Request{Account: acctAcme, Principal: "alice", Action: "read", Object: "account:acme/document:1"})
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(tr.Notes) == 0 {
+		t.Fatal("fixture recorded no notes; the assertion would be vacuous")
+	}
+	for _, n := range tr.Notes {
+		for _, field := range []string{n.GrantID, n.Rule, n.Kind, n.Op, n.Path, n.Expected, n.Actual, n.Message} {
+			if strings.Contains(field, marker) {
+				t.Fatalf("trace note leaked a date value: %q in %+v", field, n)
+			}
+		}
+	}
+	if strings.Contains(tr.String(), marker) {
+		t.Fatalf("the rendered trace leaked a date value:\n%s", tr.String())
+	}
+}
+
+// dateFixture builds the shared date engine: one rule comparing object.hired_at
+// against a fixed cutoff, over dateFixtureMetadata.
+func dateFixture(t *testing.T) (*Engine, context.Context) {
+	t.Helper()
+	return shapeFixture(t,
+		rules.Compare(rules.OpBefore, rules.Var("object.hired_at"), rules.Lit("2026-12-31")),
+		dateFixtureMetadata())
+}
