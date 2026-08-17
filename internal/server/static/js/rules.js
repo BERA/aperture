@@ -67,6 +67,14 @@ const OP_LABELS = {
   isEmpty: "is empty",
   isNotEmpty: "is not empty",
   exists: "exists",
+  before: "before",
+  after: "after",
+  onOrBefore: "on or before",
+  onOrAfter: "on or after",
+  between: "between",
+  sameDay: "same day",
+  sameMonth: "same month",
+  sameYear: "same year",
 };
 
 // opSpecs returns the serializer's operator registry, or an empty table when the

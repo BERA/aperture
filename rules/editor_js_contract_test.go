@@ -148,6 +148,28 @@ func TestEditorOperatorTablesAgree(t *testing.T) {
 		t.Errorf("%s: `OPS` must stay derived as `Object.keys(OP_SPECS)`; "+
 			"a hand-written list can drift from the registry", serializerPath)
 	}
+
+	// DATE_OPS is the one operator property the JS carries OUTSIDE OP_SPECS: an
+	// OP_SPECS entry has to stay in the literal `{ right: RIGHT.X }` form for
+	// jsOpSpecs to read it, so date-ness lives in its own list. Date-ness is a
+	// POSITIONAL permission — a relativeDate operand is legal only under one of
+	// these operators — so a list that falls behind opSpecs means the editor
+	// refuses a rule the server accepts, or saves one it rejects.
+	var goDateOps []string
+	for op, spec := range opSpecs {
+		if spec.kind == renderDate {
+			goDateOps = append(goDateOps, op)
+		}
+	}
+	diffSets(t, "date operator", goDateOps, jsStringArray(t, jsConstBody(t, js, "DATE_OPS")),
+		"Go opSpecs entries with kind renderDate (rules/ast.go)", "JS DATE_OPS ("+serializerPath+")")
+
+	// ...and the JS validator must decide from that list rather than from a
+	// scattered set of per-operator conditionals, for the same reason isUnaryOp
+	// must decide from OP_SPECS.
+	if !strings.Contains(js, "DATE_OPS.indexOf(op) >= 0") {
+		t.Errorf("%s: isDateOp must decide from DATE_OPS, not from a separate list", serializerPath)
+	}
 }
 
 // TestEditorUnaryOperatorsAgree pins the unary set specifically. It is the one

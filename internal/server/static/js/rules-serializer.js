@@ -12,9 +12,10 @@
  *   graphToAST(astToGraph(ast))  deep-equals  ast.
  * There is NO second rule format — the AST here is byte-for-byte the same shape
  * `rules/ast.go` marshals (fields: type, op, name, value, left, right,
- * children, items; all others omitted, including `right` on the three UNARY
- * comparison operators). The Rete UI (rules.js) is only an editing surface that
- * produces/consumes this plain graph model.
+ * children, items, and the relativeDate quartet anchor, n, unit, snap; all
+ * others omitted, including `right` on the three UNARY comparison operators).
+ * The Rete UI (rules.js) is only an editing surface that produces/consumes this
+ * plain graph model.
  *
  * Because it is pure it is unit-testable under `node` with no browser — see
  * rules-serializer.test.js (run: `node internal/server/static/js/rules-serializer.test.js`).
@@ -46,6 +47,12 @@
     LITERAL: "literal",
     LIST: "list",
     CALL: "call",
+    // A date expressed RELATIVE to the decision's reference instant: an anchor,
+    // a whole-number offset in one of seven units, and a snap. It is an OPERAND,
+    // never a predicate — legal only on either side of a date operator (either
+    // `between` bound included), and rejected anywhere else. See ANCHORS/UNITS/
+    // SNAPS and validateRelativeDate below.
+    RELATIVE_DATE: "relativeDate",
   };
 
   // RIGHT is the shape a comparison's right operand must take — the JS mirror of
@@ -59,7 +66,19 @@
   //               is hasAll/hasAny/hasNone, not has (has, hasKey)
   //   NONE        no right operand at all: the unary operators, whose compare
   //               node carries NO `right` key
-  const RIGHT = { ANY: "any", COLLECTION: "collection", ELEMENT: "element", NONE: "none" };
+  //   BOUNDS      a `list` holding EXACTLY TWO operand nodes — the ternary
+  //               shape, used only by `between`. It is deliberately NOT a new
+  //               field or a new node type: `right` stays one node, so every
+  //               rule persisted before dates existed is byte-identical, and the
+  //               author's one `between` node reads back as one node rather than
+  //               as a re-sugared pair of comparisons
+  const RIGHT = {
+    ANY: "any",
+    COLLECTION: "collection",
+    ELEMENT: "element",
+    NONE: "none",
+    BOUNDS: "bounds",
+  };
 
   // OP_SPECS is the closed comparison-operator registry, mirroring `opSpecs` in
   // rules/ast.go one entry for one entry. Go keeps the operand shape and the
@@ -75,6 +94,12 @@
   // introducing a new node type, so the editor gains nine operators and no new
   // palette primitive. OMITTING the key — never emitting `right: null` — is what
   // keeps the AST byte-identical across a round-trip through the editor.
+  //
+  // The last eight are the DATE operators. Seven of them reuse RIGHT.ELEMENT —
+  // the shape rule constrains AST STRUCTURE (one value, never a set), and
+  // date-ness is a runtime question the server answers deny-safely — so a
+  // relativeDate operand needed no shape of its own. `between` is the exception
+  // and takes RIGHT.BOUNDS.
   const OP_SPECS = {
     eq: { right: RIGHT.ANY }, // ==
     ne: { right: RIGHT.ANY }, // !=
@@ -94,7 +119,44 @@
     isEmpty: { right: RIGHT.NONE }, // object.tags is empty         — unary
     isNotEmpty: { right: RIGHT.NONE }, // object.tags is not empty     — unary
     exists: { right: RIGHT.NONE }, // object.owner.dept exists     — unary
+
+    before: { right: RIGHT.ELEMENT }, // object.hired_at before "2026-01-01"       — strict
+    after: { right: RIGHT.ELEMENT }, // object.hired_at after "2026-01-01"        — strict
+    onOrBefore: { right: RIGHT.ELEMENT }, // on or before                              — inclusive
+    onOrAfter: { right: RIGHT.ELEMENT }, // on or after                               — inclusive
+    between: { right: RIGHT.BOUNDS }, // between ["2026-01-01", "2026-12-31"]      — inclusive both ends
+    sameDay: { right: RIGHT.ELEMENT }, // same UTC calendar day
+    sameMonth: { right: RIGHT.ELEMENT }, // same UTC calendar month
+    sameYear: { right: RIGHT.ELEMENT }, // same UTC calendar year
   };
+
+  // DATE_OPS is the subset of OP_SPECS that compares DATES — the operators whose
+  // Go opSpec carries the renderDate strategy. It is a separate list rather than
+  // a flag on the OP_SPECS entries because those entries are machine-read by the
+  // Go contract test in the literal `{ right: RIGHT.X }` form; a second key there
+  // would break the scanner. The gate compares this list against the Go table
+  // instead, so the two cannot drift either.
+  //
+  // It exists because date-ness is a POSITIONAL permission, not a shape: a
+  // relativeDate operand is legal only under one of these operators, so
+  // validateAST has to ask "is this a date operator?" and the palette has to know
+  // which operators offer date controls.
+  const DATE_OPS = [
+    "before",
+    "after",
+    "onOrBefore",
+    "onOrAfter",
+    "between",
+    "sameDay",
+    "sameMonth",
+    "sameYear",
+  ];
+
+  // isDateOp reports whether `op` compares dates — i.e. whether a relativeDate is
+  // legal as one of its operands.
+  function isDateOp(op) {
+    return DATE_OPS.indexOf(op) >= 0;
+  }
 
   // Comparison operators carried in a compare node's `op`, derived from the one
   // registry above so the list can never fall behind it. Key insertion order is
@@ -151,6 +213,64 @@
   // Go-style identifier, which keeps the rendered expression injection-free.
   const VAR_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
+  // ---- The relativeDate vocabularies (rules/relative.go) --------------------
+  //
+  // Three closed sets, one per field of a relativeDate node. Each drives one
+  // editor control AND one branch of validateRelativeDate, so a member the
+  // editor does not offer is a rule an author cannot write, and a member the
+  // editor offers but the server does not know is a rule that fails on save.
+  // Both directions are drift, so the Go contract test compares both.
+  //
+  // The Go side holds each as a MAP (membership is the only question it asks),
+  // and compares these AS A SET — so the order below is purely PRESENTATION, and
+  // it is chosen here, once, for the editor's controls to read in.
+  //
+  // NEVER build a JS Date out of any of this. The engine is UTC end to end and
+  // the editor renders stored date strings verbatim, `Z` included: a viewer in
+  // UTC-5 shown `toLocaleString()` would read a stored 2026-01-01T00:00:00Z as
+  // "2025-12-31 19:00" — a different calendar YEAR. That is a correctness rule,
+  // not a preference.
+
+  // ANCHORS — the point a relative date is measured from. TODAY is NOW snapped to
+  // the start of its UTC day; it is a DISTINCT persisted anchor, never rewritten
+  // into NOW + snap: startOfDay, and it still takes a snap on top.
+  const ANCHORS = ["NOW", "TODAY"];
+
+  // UNITS — the seven offset units, coarsest first, which is how an author scans
+  // for one. The first three are CALENDAR units and clamp at month end on the
+  // server; the last four are fixed-length.
+  const UNITS = ["years", "quarters", "months", "weeks", "days", "hours", "minutes"];
+
+  // SNAPS — the calendar boundary the anchor is rounded to BEFORE the offset is
+  // applied. `none` leads because it is the identity and the control's usual
+  // value; the rest are widest-to-narrowest, start before end within each period,
+  // so the pairs read together. An `end*` boundary is the LAST representable
+  // instant of its period (23:59:59), not the start of the next one.
+  const SNAPS = [
+    "none",
+    "startOfYear",
+    "endOfYear",
+    "startOfQuarter",
+    "endOfQuarter",
+    "startOfMonth",
+    "endOfMonth",
+    "startOfWeek",
+    "endOfWeek",
+    "startOfDay",
+    "endOfDay",
+  ];
+
+  // OFFSET_LIMIT is the magnitude bound on a relativeDate's `n`. The Go validator
+  // reads the field with a 32-bit signed parse, so anything outside this range is
+  // "not a whole number" there and must be here too.
+  const OFFSET_MIN = -2147483648;
+  const OFFSET_MAX = 2147483647;
+
+  // JSON_NUMBER matches the JSON number grammar exactly — the token form the Go
+  // side stores the offset in (a json.Number, not an int, precisely so the
+  // VALIDATOR and not the JSON decoder owns rejecting `1.5`).
+  const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
   // ---- Node specs: the single source of truth for pins the UI + serializer
   // share. `inputs` names the arity shape; the serializer derives connection
   // target keys from it, and the Rete UI builds the matching input sockets.
@@ -169,6 +289,11 @@
     literal: { title: "Literal", category: "operand", out: SOCKET.VALUE, inputs: "none", accepts: [] },
     list: { title: "List", category: "pulse", out: SOCKET.LIST, inputs: "variadic", accepts: [SOCKET.VALUE] },
     call: { title: "Call", category: "pulse", out: SOCKET.VALUE, inputs: "variadic", accepts: [SOCKET.VALUE, SOCKET.LIST] },
+    // A relative date is a LEAF operand: it produces a value and takes no wires.
+    // Its four fields are controls (anchor, n, unit, snap), not input pins —
+    // every one of them is a closed-set token or a whole number, so there is
+    // nothing another node could legally feed it.
+    relativeDate: { title: "Relative date", category: "operand", out: SOCKET.VALUE, inputs: "none", accepts: [] },
   };
 
   // inputKeys returns the ordered input-socket keys a node of `type` exposes
@@ -282,6 +407,22 @@
           return { type: TYPES.LIST, items: orderedSources(inc).map(build) };
         case TYPES.CALL:
           return { type: TYPES.CALL, name: n.name || "", items: orderedSources(inc).map(build) };
+        case TYPES.RELATIVE_DATE:
+          // Key order matters, exactly as it does for a compare: the emitted
+          // object is compared against the Go marshalling, whose struct order is
+          // type, anchor, n, unit, snap.
+          //
+          // ALL FOUR KEYS ARE ALWAYS EMITTED. "No offset" is n: 0 and "no snap"
+          // is the vocabulary member "none" — absence never means anything, so
+          // an empty control is a validation problem rather than a silently
+          // different rule.
+          return {
+            type: TYPES.RELATIVE_DATE,
+            anchor: n.anchor === undefined || n.anchor === null ? "" : String(n.anchor),
+            n: normalizeOffset(n.n),
+            unit: n.unit === undefined || n.unit === null ? "" : String(n.unit),
+            snap: n.snap === undefined || n.snap === null ? "" : String(n.snap),
+          };
         default:
           throw serErr("APERTURE_RULE_INVALID", "unknown node type: " + String(type));
       }
@@ -301,6 +442,21 @@
       .map(function (k) {
         return inc[k];
       });
+  }
+
+  // normalizeOffset turns whatever a relativeDate's `n` control holds into the
+  // JSON NUMBER the AST stores. A number passes through untouched, so a loaded
+  // rule round-trips byte-for-byte; an empty control is 0 ("no offset"); and a
+  // token that is not a JSON number is returned VERBATIM rather than coerced, so
+  // validateRelativeDate can report the Go validator's own wording instead of the
+  // editor silently inventing a cutoff the author did not write.
+  function normalizeOffset(value) {
+    if (typeof value === "number") return value;
+    if (value === null || value === undefined) return 0;
+    const s = String(value).trim();
+    if (s === "") return 0;
+    if (!JSON_NUMBER.test(s)) return s;
+    return Number(s);
   }
 
   function requireSource(inc, key, id) {
@@ -393,6 +549,14 @@
             wire(it, "in-" + i);
           });
           break;
+        case TYPES.RELATIVE_DATE:
+          // A leaf: the four fields become the node's four controls, carried
+          // verbatim so graphToAST can hand them straight back.
+          g.anchor = node.anchor;
+          g.n = node.n;
+          g.unit = node.unit;
+          g.snap = node.snap;
+          break;
         default:
           throw serErr("APERTURE_RULE_INVALID", "unknown node type: " + String(node.type));
       }
@@ -432,7 +596,13 @@
     function report(code, message, path) {
       problems.push({ code: code, message: message, path: path });
     }
-    function walk(n, path) {
+    // `dateOperand` is the POSITIONAL permission a relativeDate needs: true only
+    // when this node sits directly under a date operator (either side, or either
+    // `between` bound). It is deliberately NOT inherited — validateCompare hands
+    // it to its own operands, and every recursion below passes false — so a
+    // relativeDate buried inside a call argument or a list under a date operator
+    // is refused exactly as the Go walk refuses it.
+    function walk(n, path, dateOperand) {
       if (n === null || n === undefined) {
         report("APERTURE_RULE_INVALID", "nil node", path);
         return;
@@ -482,11 +652,26 @@
             walk(it, path + ".items[" + i + "]");
           });
           break;
+        case TYPES.RELATIVE_DATE:
+          if (!dateOperand) {
+            // It resolves to a date the author never sees, so anywhere it is not
+            // being compared AS a date it would either be string-compared against
+            // a value that changes every second, or silently deny. Refusing it
+            // here makes the mistake visible when the rule is SAVED.
+            report(
+              "APERTURE_RULE_INVALID",
+              "a relative date is only valid as an operand of a date operator: " + String(n.anchor),
+              path
+            );
+            return;
+          }
+          validateRelativeDate(n, path, report);
+          break;
         default:
           report("APERTURE_RULE_INVALID", "unknown node type: " + String(n.type), path);
       }
     }
-    walk(ast, "$");
+    walk(ast, "$", false);
     return problems;
   }
 
@@ -506,6 +691,11 @@
   // reports what the server would have reported. Where the Go error carries an
   // `op` context field, this appends it after a colon, matching the convention
   // the rest of validateAST already uses.
+  //
+  // A DATE operator additionally grants its own operands — and, for `between`,
+  // each of its two bounds independently — permission to be a relativeDate. The
+  // flag rides along rather than being re-derived per operand, so the two sides
+  // of one comparison cannot disagree about it.
   function validateCompare(n, path, report, walk) {
     let spec = OP_SPECS[n.op];
     if (!spec) {
@@ -515,6 +705,7 @@
       // server rejects the node either way.
       spec = { right: RIGHT.ANY };
     }
+    const dateOp = isDateOp(n.op);
     const left = n.left;
     const right = n.right;
     if (left === undefined || left === null) {
@@ -525,13 +716,42 @@
       if (right !== undefined && right !== null) {
         report("APERTURE_RULE_INVALID", "unary operator takes no right operand: " + String(n.op), path + ".right");
       }
-      if (left !== undefined && left !== null) walk(left, path + ".left");
+      // No unary operator is a date operator, so the left operand of one is not a
+      // date-operand position; `dateOp` is false here by construction.
+      if (left !== undefined && left !== null) walk(left, path + ".left", dateOp);
       return;
     }
 
     if (right === undefined || right === null) {
       report("APERTURE_RULE_INVALID", "comparison requires a left and a right operand", path);
-      if (left !== undefined && left !== null) walk(left, path + ".left");
+      if (left !== undefined && left !== null) walk(left, path + ".left", dateOp);
+      return;
+    }
+
+    if (spec.right === RIGHT.BOUNDS) {
+      // The ternary shape: exactly two bounds, in a list. Both failure modes
+      // share one message — an author who supplied the wrong container and one
+      // who supplied the wrong number of bounds need the same correction.
+      //
+      // The bounds are walked as OPERANDS in their own right, NOT through the
+      // list node, because that is what carries the date-operand permission down
+      // to them: each bound may independently be a literal, a variable, or a
+      // relativeDate.
+      if (right.type !== TYPES.LIST || !Array.isArray(right.items) || right.items.length !== 2) {
+        report(
+          "APERTURE_RULE_INVALID",
+          "operator requires a list of exactly two bounds on the right: " + String(n.op),
+          path + ".right"
+        );
+      }
+      if (left !== undefined && left !== null) walk(left, path + ".left", dateOp);
+      if (right.type === TYPES.LIST) {
+        (right.items || []).forEach(function (bound, i) {
+          walk(bound, path + ".right.items[" + i + "]", dateOp);
+        });
+      } else {
+        walk(right, path + ".right", dateOp);
+      }
       return;
     }
 
@@ -549,8 +769,47 @@
         path + ".right"
       );
     }
-    if (left !== undefined && left !== null) walk(left, path + ".left");
-    walk(right, path + ".right");
+    if (left !== undefined && left !== null) walk(left, path + ".left", dateOp);
+    walk(right, path + ".right", dateOp);
+  }
+
+  // validateRelativeDate mirrors `validateRelativeDate` in rules/relative.go: the
+  // node's four fields are each checked against their closed set.
+  //
+  // Each field reports its OWN problem rather than short-circuiting on the first,
+  // because each names a different mistake with a different fix — an anchor the
+  // author invented, an offset that is not a whole number, a unit that does not
+  // exist, a snap that does not exist — and the editor renders each message
+  // beside the control it belongs to.
+  function validateRelativeDate(n, path, report) {
+    if (ANCHORS.indexOf(n.anchor) < 0) {
+      report("APERTURE_RULE_INVALID", "relative date has an unknown anchor: " + String(n.anchor), path);
+    }
+    if (!isWholeOffset(n.n)) {
+      report("APERTURE_RULE_INVALID", "relative date offset must be a whole number: " + String(n.n), path);
+    }
+    if (UNITS.indexOf(n.unit) < 0) {
+      report("APERTURE_RULE_INVALID", "relative date has an unknown offset unit: " + String(n.unit), path);
+    }
+    if (SNAPS.indexOf(n.snap) < 0) {
+      report("APERTURE_RULE_INVALID", "relative date has an unknown snap: " + String(n.snap), path);
+    }
+  }
+
+  // isWholeOffset mirrors the Go side's 32-bit base-10 integer parse of the `n`
+  // field: a fraction, an out-of-range magnitude, a non-numeric token, and an
+  // absent field are all the same correction — write a whole number — and so are
+  // all one problem with one wording.
+  //
+  // A number that arrived through JSON.parse has already lost its original token
+  // (`1e3` parses to 1000), which is the one place this can be laxer than Go; the
+  // editor's own control never produces that form.
+  function isWholeOffset(value) {
+    if (typeof value === "string") {
+      return /^-?\d+$/.test(value.trim()) && isWholeOffset(Number(value.trim()));
+    }
+    if (typeof value !== "number") return false;
+    return Number.isInteger(value) && value >= OFFSET_MIN && value <= OFFSET_MAX;
   }
 
   function validateVar(name, path, report) {
@@ -614,13 +873,18 @@
     OPS: OPS,
     OP_SPECS: OP_SPECS,
     RIGHT: RIGHT,
+    DATE_OPS: DATE_OPS,
     ROOTS: ROOTS,
     FUNCTIONS: FUNCTIONS,
     BLOCKED_CALLS: BLOCKED_CALLS,
+    ANCHORS: ANCHORS,
+    UNITS: UNITS,
+    SNAPS: SNAPS,
     SOCKET: SOCKET,
     NODE_SPECS: NODE_SPECS,
     VAR_PATH: VAR_PATH,
     isUnaryOp: isUnaryOp,
+    isDateOp: isDateOp,
     inputKeys: inputKeys,
     graphToAST: graphToAST,
     astToGraph: astToGraph,

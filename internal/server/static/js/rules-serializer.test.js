@@ -154,6 +154,138 @@ const cases = {
       },
     ],
   },
+  // The eight date operators. Seven take a single element on the right; between
+  // takes a list of EXACTLY TWO bounds and no new JSON key.
+  "before literal date": {
+    type: "compare",
+    op: "before",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "literal", value: "2026-01-01" },
+  },
+  "after literal datetime": {
+    type: "compare",
+    op: "after",
+    left: { type: "var", name: "object.touched_at" },
+    right: { type: "literal", value: "2026-01-01T00:00:00Z" },
+  },
+  "onOrBefore var": {
+    type: "compare",
+    op: "onOrBefore",
+    left: { type: "var", name: "object.due_at" },
+    right: { type: "var", name: "principal.deadline" },
+  },
+  "sameDay literal": {
+    type: "compare",
+    op: "sameDay",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "literal", value: "2026-03-04" },
+  },
+  "sameMonth literal": {
+    type: "compare",
+    op: "sameMonth",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "literal", value: "2026-03-04" },
+  },
+  "sameYear literal": {
+    type: "compare",
+    op: "sameYear",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "literal", value: "2026-03-04" },
+  },
+  "between literal bounds": {
+    type: "compare",
+    op: "between",
+    left: { type: "var", name: "object.hired_at" },
+    right: {
+      type: "list",
+      items: [
+        { type: "literal", value: "2026-01-01" },
+        { type: "literal", value: "2026-12-31" },
+      ],
+    },
+  },
+
+  // The relativeDate operand. Every one of these mirrors a case in
+  // rules/editor_contract_test.go one-for-one, and all four fields are always
+  // present in the struct's key order: type, anchor, n, unit, snap.
+  "relative date months ago": {
+    type: "compare",
+    op: "onOrAfter",
+    left: { type: "var", name: "object.touched_at" },
+    right: { type: "relativeDate", anchor: "NOW", n: -3, unit: "months", snap: "none" },
+  },
+  "relative date today start of year": {
+    type: "compare",
+    op: "onOrAfter",
+    left: { type: "var", name: "object.touched_at" },
+    right: { type: "relativeDate", anchor: "TODAY", n: 0, unit: "days", snap: "startOfYear" },
+  },
+  "relative date forward hours": {
+    type: "compare",
+    op: "before",
+    left: { type: "var", name: "object.expires_at" },
+    right: { type: "relativeDate", anchor: "NOW", n: 12, unit: "hours", snap: "none" },
+  },
+  "relative date end of quarter": {
+    type: "compare",
+    op: "onOrBefore",
+    left: { type: "var", name: "object.due_at" },
+    right: { type: "relativeDate", anchor: "TODAY", n: 1, unit: "quarters", snap: "endOfQuarter" },
+  },
+  "relative date same year": {
+    type: "compare",
+    op: "sameYear",
+    left: { type: "var", name: "object.hired_at" },
+    right: { type: "relativeDate", anchor: "NOW", n: -1, unit: "years", snap: "startOfWeek" },
+  },
+  "between relative bounds": {
+    type: "compare",
+    op: "between",
+    left: { type: "var", name: "object.hired_at" },
+    right: {
+      type: "list",
+      items: [
+        { type: "relativeDate", anchor: "NOW", n: -5, unit: "years", snap: "startOfYear" },
+        { type: "relativeDate", anchor: "TODAY", n: 0, unit: "days", snap: "endOfDay" },
+      ],
+    },
+  },
+  "between literal and relative": {
+    type: "compare",
+    op: "between",
+    left: { type: "var", name: "object.hired_at" },
+    right: {
+      type: "list",
+      items: [
+        { type: "literal", value: "2026-01-01" },
+        { type: "relativeDate", anchor: "NOW", n: -30, unit: "minutes", snap: "none" },
+      ],
+    },
+  },
+  "relative date nested under and": {
+    type: "and",
+    children: [
+      {
+        type: "compare",
+        op: "eq",
+        left: { type: "var", name: "object.classification" },
+        right: { type: "literal", value: "public" },
+      },
+      {
+        type: "compare",
+        op: "after",
+        left: { type: "var", name: "object.touched_at" },
+        right: { type: "relativeDate", anchor: "NOW", n: -90, unit: "days", snap: "startOfDay" },
+      },
+    ],
+  },
+  "relative date on the LEFT of a date operator": {
+    type: "compare",
+    op: "before",
+    left: { type: "relativeDate", anchor: "TODAY", n: 0, unit: "days", snap: "startOfDay" },
+    right: { type: "var", name: "object.hired_at" },
+  },
+
   "falsy scalars survive — false": {
     type: "compare",
     op: "eq",
@@ -206,11 +338,25 @@ const EXPECTED_OPS = [
   "eq", "ne", "lt", "le", "gt", "ge", "in", "nin",
   "has", "hasAll", "hasAny", "hasNone", "subsetOf", "hasKey",
   "isEmpty", "isNotEmpty", "exists",
+  "before", "after", "onOrBefore", "onOrAfter", "between", "sameDay", "sameMonth", "sameYear",
 ];
-ok(eq(S.OPS, EXPECTED_OPS), "OPS carries all 17 operators in ast.go order");
+ok(eq(S.OPS, EXPECTED_OPS), "OPS carries all 25 operators in ast.go order");
 ok(
   eq(S.OPS.filter(S.isUnaryOp), ["isEmpty", "isNotEmpty", "exists"]),
   "exactly isEmpty/isNotEmpty/exists are unary"
+);
+ok(
+  eq(S.OPS.filter(S.isDateOp), [
+    "before", "after", "onOrBefore", "onOrAfter", "between", "sameDay", "sameMonth", "sameYear",
+  ]),
+  "exactly the eight date operators are date operators"
+);
+ok(S.OP_SPECS.between.right === S.RIGHT.BOUNDS, "between is the one operator taking RIGHT.BOUNDS");
+ok(
+  S.OPS.filter(function (op) {
+    return S.OP_SPECS[op].right === S.RIGHT.BOUNDS;
+  }).length === 1,
+  "no operator but between takes RIGHT.BOUNDS"
 );
 ["hasAll", "hasAny", "hasNone", "subsetOf", "isEmpty", "isNotEmpty"].forEach(function (fn) {
   ok(S.FUNCTIONS.indexOf(fn) >= 0, "FUNCTIONS advertises the collection backing " + fn);
@@ -378,6 +524,196 @@ S.BLOCKED_CALLS.forEach(function (name) {
 ok(
   S.validateAST({ type: "call", name: "len", items: [{ type: "var", name: "object.tags" }] }).length === 0,
   "a curated function is still callable"
+);
+
+// --- Byte-for-byte against the Go contract test's own fixtures --------------
+// These strings are COPIED VERBATIM from rules/editor_contract_test.go, which
+// asserts each is byte-stable through rules.Node. Parsing them here, round-
+// tripping through the graph, and re-serializing proves the two sides agree on
+// key ORDER as well as on content — the half a deep-equal comparison misses, and
+// exactly where the relativeDate quartet (type, anchor, n, unit, snap) could
+// silently drift.
+[
+  '{"type":"compare","op":"onOrAfter","left":{"type":"var","name":"object.touched_at"},"right":{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}}',
+  '{"type":"compare","op":"onOrAfter","left":{"type":"var","name":"object.touched_at"},"right":{"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"startOfYear"}}',
+  '{"type":"compare","op":"before","left":{"type":"var","name":"object.expires_at"},"right":{"type":"relativeDate","anchor":"NOW","n":12,"unit":"hours","snap":"none"}}',
+  '{"type":"compare","op":"onOrBefore","left":{"type":"var","name":"object.due_at"},"right":{"type":"relativeDate","anchor":"TODAY","n":1,"unit":"quarters","snap":"endOfQuarter"}}',
+  '{"type":"compare","op":"sameYear","left":{"type":"var","name":"object.hired_at"},"right":{"type":"relativeDate","anchor":"NOW","n":-1,"unit":"years","snap":"startOfWeek"}}',
+  '{"type":"compare","op":"between","left":{"type":"var","name":"object.hired_at"},"right":{"type":"list","items":[{"type":"relativeDate","anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"},{"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}]}}',
+  '{"type":"compare","op":"between","left":{"type":"var","name":"object.hired_at"},"right":{"type":"list","items":[{"type":"literal","value":"2026-01-01"},{"type":"relativeDate","anchor":"NOW","n":-30,"unit":"minutes","snap":"none"}]}}',
+  '{"type":"and","children":[{"type":"compare","op":"eq","left":{"type":"var","name":"object.classification"},"right":{"type":"literal","value":"public"}},{"type":"compare","op":"after","left":{"type":"var","name":"object.touched_at"},"right":{"type":"relativeDate","anchor":"NOW","n":-90,"unit":"days","snap":"startOfDay"}}]}',
+].forEach(function (src) {
+  const ast = JSON.parse(src);
+  ok(JSON.stringify(S.graphToAST(S.astToGraph(ast))) === src, "byte-identical round-trip: " + src.slice(0, 64) + "…");
+  ok(S.validateAST(ast).length === 0, "Go fixture validates clean: " + src.slice(0, 64) + "…");
+});
+
+// --- The three relativeDate vocabularies (rules/relative.go) ----------------
+// Membership is what the Go contract test compares (as a SET); the order below
+// is this file's presentation choice and is asserted so it cannot be reshuffled
+// silently under the editor's controls.
+ok(eq(S.ANCHORS, ["NOW", "TODAY"]), "ANCHORS carries both anchors");
+ok(
+  eq(S.UNITS, ["years", "quarters", "months", "weeks", "days", "hours", "minutes"]),
+  "UNITS carries all seven offset units, coarsest first"
+);
+ok(
+  eq(S.SNAPS, [
+    "none",
+    "startOfYear", "endOfYear",
+    "startOfQuarter", "endOfQuarter",
+    "startOfMonth", "endOfMonth",
+    "startOfWeek", "endOfWeek",
+    "startOfDay", "endOfDay",
+  ]),
+  "SNAPS carries all eleven snaps, identity first then widest to narrowest"
+);
+ok(S.TYPES.RELATIVE_DATE === "relativeDate", "TYPES carries the relativeDate node type");
+ok(!!S.NODE_SPECS.relativeDate, "NODE_SPECS carries a relativeDate entry");
+ok(eq(S.inputKeys("relativeDate", 0), []), "a relative date is a leaf: no input pins");
+
+// --- between: the ternary shape --------------------------------------------
+const twoBounds = {
+  type: "list",
+  items: [{ type: "literal", value: "2026-01-01" }, { type: "literal", value: "2026-12-31" }],
+};
+ok(
+  S.validateAST({ type: "compare", op: "between", left: leftVar, right: twoBounds }).length === 0,
+  "between accepts exactly two bounds"
+);
+[
+  ["one bound", { type: "list", items: [{ type: "literal", value: "2026-01-01" }] }],
+  ["three bounds", { type: "list", items: [litRight, litRight, litRight] }],
+  ["no bounds", { type: "list", items: [] }],
+  ["a bare literal", litRight],
+  ["a var", varRight],
+].forEach(function (pair) {
+  ok(
+    S.validateAST({ type: "compare", op: "between", left: leftVar, right: pair[1] }).some(function (p) {
+      return p.code === "APERTURE_RULE_INVALID" && /exactly two bounds on the right/.test(p.message);
+    }),
+    "between rejects " + pair[0]
+  );
+});
+// An operand subtree under between is still walked, through either bound.
+ok(
+  S.validateAST({
+    type: "compare",
+    op: "between",
+    left: leftVar,
+    right: { type: "list", items: [{ type: "var", name: "bogus.lo" }, { type: "literal", value: "2026-12-31" }] },
+  }).some(function (p) {
+    return p.code === "APERTURE_RULE_UNKNOWN_VARIABLE";
+  }),
+  "an unknown variable in a between bound is still flagged"
+);
+
+// --- relativeDate: positional legality --------------------------------------
+const relNow = { type: "relativeDate", anchor: "NOW", n: -3, unit: "months", snap: "none" };
+
+// LEGAL: either operand of any date operator, and either between bound.
+S.DATE_OPS.forEach(function (op) {
+  const right = op === "between" ? { type: "list", items: [relNow, relNow] } : relNow;
+  ok(
+    S.validateAST({ type: "compare", op: op, left: leftVar, right: right }).length === 0,
+    op + " accepts a relative date on the right"
+  );
+  const bin = op === "between" ? twoBounds : litRight;
+  ok(
+    S.validateAST({ type: "compare", op: op, left: relNow, right: bin }).length === 0,
+    op + " accepts a relative date on the left"
+  );
+});
+
+// ILLEGAL everywhere else. Each of these is a position the Go walk refuses.
+[
+  ["as the right of eq", { type: "compare", op: "eq", left: leftVar, right: relNow }],
+  ["as the left of gt", { type: "compare", op: "gt", left: relNow, right: litRight }],
+  ["inside an in list", { type: "compare", op: "in", left: leftVar, right: { type: "list", items: [relNow] } }],
+  ["as a call argument", { type: "call", name: "lower", items: [relNow] }],
+  ["as a logical child", { type: "and", children: [relNow, { type: "compare", op: "exists", left: leftVar }] }],
+  ["as the whole rule", relNow],
+  // `has` takes a single element on the right, so the SHAPE is fine — it is
+  // date-ness, not shape, that refuses this one.
+  ["as the element operand of has", { type: "compare", op: "has", left: leftVar, right: relNow }],
+].forEach(function (pair) {
+  ok(
+    S.validateAST(pair[1]).some(function (p) {
+      return p.code === "APERTURE_RULE_INVALID" && /only valid as an operand of a date operator/.test(p.message);
+    }),
+    "a relative date is rejected " + pair[0]
+  );
+});
+// The permission is NOT inherited: a relative date buried under a call that is
+// itself a date operand is still refused.
+ok(
+  S.validateAST({
+    type: "compare",
+    op: "before",
+    left: leftVar,
+    right: { type: "call", name: "lower", items: [relNow] },
+  }).some(function (p) {
+    return /only valid as an operand of a date operator/.test(p.message);
+  }),
+  "the date-operand permission does not reach a nested call argument"
+);
+
+// --- relativeDate: field validation, one message per field ------------------
+function relWith(patch) {
+  const n = { type: "relativeDate", anchor: "NOW", n: -3, unit: "months", snap: "none" };
+  Object.keys(patch).forEach(function (k) {
+    n[k] = patch[k];
+  });
+  return { type: "compare", op: "before", left: leftVar, right: n };
+}
+[
+  ["unknown anchor", { anchor: "YESTERDAY" }, /unknown anchor/],
+  ["missing anchor", { anchor: undefined }, /unknown anchor/],
+  ["lower-case anchor", { anchor: "now" }, /unknown anchor/],
+  ["unknown unit", { unit: "fortnights" }, /unknown offset unit/],
+  ["missing unit", { unit: undefined }, /unknown offset unit/],
+  ["unknown snap", { snap: "startOfFiscalYear" }, /unknown snap/],
+  ["missing snap (absence is not `none`)", { snap: undefined }, /unknown snap/],
+  ["fractional offset", { n: 1.5 }, /whole number/],
+  ["non-numeric offset", { n: "soon" }, /whole number/],
+  ["missing offset", { n: undefined }, /whole number/],
+  ["out-of-range offset", { n: 4000000000 }, /whole number/],
+].forEach(function (tc) {
+  ok(
+    S.validateAST(relWith(tc[1])).some(function (p) {
+      return p.code === "APERTURE_RULE_INVALID" && tc[2].test(p.message);
+    }),
+    "relative date rejects " + tc[0]
+  );
+});
+// n: 0 and snap: "none" are the real spellings of "no offset" / "no snap".
+ok(S.validateAST(relWith({ n: 0 })).length === 0, "n: 0 is a valid offset");
+ok(S.validateAST(relWith({ n: "-3" })).length === 0, "a numeric-string offset is accepted");
+// Each field fails INDEPENDENTLY, so all four controls can be flagged at once.
+ok(
+  S.validateAST(relWith({ anchor: "X", n: 1.5, unit: "Y", snap: "Z" })).length === 4,
+  "all four relative-date fields report independently"
+);
+
+// --- normalizeOffset: the `n` control becomes a JSON number ------------------
+function offsetOf(value) {
+  return S.graphToAST({
+    nodes: [{ id: "r", type: "relativeDate", anchor: "NOW", n: value, unit: "days", snap: "none" }],
+    connections: [],
+  }).n;
+}
+ok(offsetOf(-3) === -3, "a number offset passes through untouched");
+ok(offsetOf("-3") === -3, "a text control's digits become a number");
+ok(offsetOf("") === 0, "an empty offset control means no offset");
+ok(offsetOf(undefined) === 0, "an unset offset control means no offset");
+ok(offsetOf("soon") === "soon", "an unparseable offset survives verbatim for the validator");
+ok(typeof offsetOf(" 12 ") === "number", "a padded numeric offset still normalizes");
+// All four keys are emitted even when the controls are empty, so absence never
+// silently means something.
+const bareRel = S.graphToAST({ nodes: [{ id: "r", type: "relativeDate" }], connections: [] });
+ok(
+  eq(Object.keys(bareRel), ["type", "anchor", "n", "unit", "snap"]),
+  "a relative date always emits all four keys, in the Go struct's order"
 );
 
 // --- graphToAST rejects a multi-root graph ----------------------------------

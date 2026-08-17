@@ -66,9 +66,13 @@ together:
 | `TYPES` | `NodeType` consts (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
 | `OP_SPECS` / `OPS` (derived) | `opSpecs` / `Op*` consts (`rules/ast.go`) | `TestEditorOperatorTablesAgree` |
 | `RIGHT` | `rightShape` (`rules/ast.go`) | `TestEditorOperatorTablesAgree` |
+| `DATE_OPS` | `opSpecs` entries with kind `renderDate` (`rules/ast.go`) | `TestEditorOperatorTablesAgree` |
 | `ROOTS` | `allowedRoots` (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
 | `BLOCKED_CALLS` | `blockedCallNames` (`rules/ast.go`) | `TestEditorVocabularyTablesAgree` |
 | `FUNCTIONS` | `defaultFunctions` (`rules/compiler.go`) | `TestEditorVocabularyTablesAgree` |
+| `ANCHORS` | `relativeAnchors` (`rules/relative.go`) | `TestEditorVocabularyTablesAgree` |
+| `UNITS` | `relativeUnits` (`rules/relative.go`) | `TestEditorVocabularyTablesAgree` |
+| `SNAPS` | `relativeSnaps` (`rules/relative.go`) | `TestEditorVocabularyTablesAgree` |
 | `VAR_PATH` | `varPath` (`rules/ast.go`) | — (identical literal, by eye) |
 | `validateAST` | `(*Node).Validate` (`rules/ast.go`) | `TestEditorValidationMessagesAgree` |
 
@@ -76,10 +80,63 @@ together:
 new operator is one entry, never a scattered conditional. It records each
 operator's **right-operand shape** — `any` (the scalar comparisons), `collection`
 (a `list` or a `var`: `in` `nin` `hasAll` `hasAny` `hasNone` `subsetOf`),
-`element` (anything but a `list`: `has` `hasKey`), or `none` (the unary
-`isEmpty` `isNotEmpty` `exists`). `validateAST` enforces exactly those rules and
-reports the Go validator's own codes and message wording, so a rule the canvas
-refuses is refused for the same stated reason server-side.
+`element` (anything but a `list`: `has` `hasKey`, and seven of the eight date
+operators), `none` (the unary `isEmpty` `isNotEmpty` `exists`), or `bounds` (a
+`list` of **exactly two** items: `between` alone). `validateAST` enforces exactly
+those rules and reports the Go validator's own codes and message wording, so a
+rule the canvas refuses is refused for the same stated reason server-side.
+
+### Dates in the serializer
+
+The eight date operators (`before` `after` `onOrBefore` `onOrAfter` `between`
+`sameDay` `sameMonth` `sameYear`) are ordinary `compare` nodes. `between`'s
+`right` is a two-item `list` — **no new field and no new JSON key**, so every
+rule persisted before dates existed round-trips byte-identically, and the
+author's one `between` node reads back as one node rather than as a re-sugared
+pair of comparisons.
+
+Date-ness lives in **`DATE_OPS`**, not in the `OP_SPECS` entries, because those
+entries have to stay in the literal `{ right: RIGHT.X }` form the Go scanner
+reads; the gate compares `DATE_OPS` against the Go table instead. It is needed
+because date-ness is a **positional permission**:
+
+**`relativeDate`** is the one node type that is an operand and nothing else. It
+is legal only directly under a date operator — either side, or either `between`
+bound — and `APERTURE_RULE_INVALID` everywhere else (as an `eq` operand, an `in`
+list item, a call argument, a logical child, or the whole rule). **The permission
+is not inherited**: a relative date nested inside a call that is itself a date
+operand is still refused, exactly as the Go walk refuses it.
+
+It carries four fields and **all four are always present** — `anchor`, `n`,
+`unit`, `snap`, emitted in that key order after `type`. "No offset" is `n: 0` and
+"no snap" is the vocabulary member `"none"`; absence never means anything, so an
+empty control is a validation problem rather than a silently different rule.
+`n` is a JSON **number**, and **negative goes into the past** — there is no
+direction field anywhere.
+
+```json
+{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}
+```
+
+`ANCHORS` / `UNITS` / `SNAPS` are the three closed vocabularies, one per field.
+The Go side holds each as a map and the gate compares them **as sets**, so their
+order in the serializer is purely presentational and is chosen there, once, for
+the editor's controls: anchors as declared, units coarsest-first, snaps with the
+identity `none` leading and the rest widest-to-narrowest, start before end.
+`validateRelativeDate` checks each field against its set and reports each
+**independently**, so all four controls can be flagged at once.
+
+`normalizeOffset` turns whatever the `n` control holds into that JSON number: a
+number passes through untouched (so a loaded rule round-trips byte-for-byte), an
+empty control is `0`, and a token that is not a JSON number is kept **verbatim**
+for the validator to name rather than coerced into a cutoff the author never
+wrote.
+
+**Never build a JS `Date` out of any of this.** The engine is UTC end to end and
+the editor renders stored date strings verbatim, `Z` included: `toLocaleString()`
+would show a viewer in UTC-5 a stored `2026-01-01T00:00:00Z` as
+`2025-12-31 19:00` — a different calendar year. That is a correctness rule, not a
+preference.
 
 **The unary operators carry no `right` key at all.** Neither direction may emit
 one — `graphToAST` omits it (never `right: null`), `astToGraph` wires no `right`
@@ -237,6 +294,7 @@ The shell obeys `.planning/access-control/research/design-system.md`:
 A change to the embedded shell's public surface — the static routes it exposes
 (`/`, `/css/*`, `/js/*`, `/vendor/*`), the `apiFetch` bearer convention, the nav
 skeleton, the `rules-serializer.js` mirror of `rules/ast.go` (operators, operand
-shapes, blocked calls, validation wording), the rule editor's operator palette
-and its spellings, or a rule above — updates this doc in the **same PR**. The gate in
+shapes, blocked calls, the date-operator set, the relative-date vocabularies and
+node shape, validation wording), the rule editor's operator palette and its
+spellings, or a rule above — updates this doc in the **same PR**. The gate in
 `skills/skills_test.go` fails the build if this doc loses its frontmatter.
