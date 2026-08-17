@@ -163,41 +163,78 @@ func TestCLIAndServerAgreeOnRuleBackedDecisions(t *testing.T) {
 }
 
 // TestEnumerateAgreesWithTheServer covers the other decision verb. Enumeration
-// over an IMPLICIT scope has to walk the object lister to answer at all, so this
-// is the case that proves the provider registry reaches the scope resolver and
-// not only the rules fetcher: unwired, `aperture enumerate` could only report
+// over an IMPLICIT scope has to walk the object lister to answer at all, so it is
+// the case that proves the provider registry reaches the scope resolver and not
+// only the rules fetcher: unwired, `aperture enumerate` could only report
 // APERTURE_SCOPE_LISTER_UNCONFIGURED.
+//
+// The rule-backed row covers the seam the implicit one cannot. It could not be
+// asserted at all until the inclusive resolver learned to enumerate its rule half
+// — enumerating a rule-backed inclusive grant used to report
+// APERTURE_SCOPE_RULE_UNCONFIGURED no matter how completely the stack was wired,
+// so the surface-equivalence test could only reach the object lister through a
+// permission that needed no rule. Both verbs now go through both seams.
 func TestEnumerateAgreesWithTheServer(t *testing.T) {
 	ctx := context.Background()
 	seedPath := writeRuleBackedSeed(t)
 
-	var out bytes.Buffer
-	app := NewApp("test")
-	app.Writer = &out
-	if err := app.Run(ctx, []string{
-		"aperture", "enumerate", "--seed", seedPath, "--account", "acme",
-		"alice", "list", "account:acme/**",
-	}); err != nil {
-		t.Fatalf("enumerate: %v", err)
+	cases := []struct {
+		name   string
+		action string
+		// want pins the content as well as the agreement, so an unwired build
+		// cannot pass by returning nothing on both sides.
+		want []string
+	}{
+		{
+			name:   "implicit scope walks the object lister",
+			action: "list",
+			want: []string{
+				"account:acme/document:42",
+				"account:acme/document:7",
+				"account:acme/document:99",
+			},
+		},
+		{
+			// Only document:42 carries a proper ["public"] tag list. document:99 is
+			// tagged internal, and document:7's tags are a STRING, which the
+			// collection operator treats as a deny-safe false rather than an error.
+			name:   "rule-backed inclusive scope filters the listed objects",
+			action: "read",
+			want:   []string{"account:acme/document:42"},
+		},
 	}
-	got := nonEmptyLines(out.String())
 
-	want, err := serverService(t, ctx, seedPath).Enumerate(ctx, service.EnumerateQuery{
-		Account: "acme", Principal: "alice", Action: "list", Pattern: "account:acme/**",
-	})
-	if err != nil {
-		t.Fatalf("server Enumerate: %v", err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			app := NewApp("test")
+			app.Writer = &out
+			if err := app.Run(ctx, []string{
+				"aperture", "enumerate", "--seed", seedPath, "--account", "acme",
+				"alice", tc.action, "account:acme/**",
+			}); err != nil {
+				t.Fatalf("enumerate: %v", err)
+			}
+			got := nonEmptyLines(out.String())
 
-	slices.Sort(got)
-	slices.Sort(want)
-	if !slices.Equal(got, want) {
-		t.Fatalf("the CLI and the server disagree on enumeration:\n cli:    %v\n server: %v", got, want)
-	}
-	// Pin the content too, so an unwired build cannot pass by returning nothing on
-	// both sides.
-	if len(got) != 3 {
-		t.Fatalf("want the three seeded documents, got %v", got)
+			server, err := serverService(t, ctx, seedPath).Enumerate(ctx, service.EnumerateQuery{
+				Account: "acme", Principal: "alice", Action: tc.action, Pattern: "account:acme/**",
+			})
+			if err != nil {
+				t.Fatalf("server Enumerate: %v", err)
+			}
+
+			slices.Sort(got)
+			slices.Sort(server)
+			if !slices.Equal(got, server) {
+				t.Fatalf("the CLI and the server disagree on enumeration:\n cli:    %v\n server: %v", got, server)
+			}
+			want := slices.Clone(tc.want)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("enumeration = %v, want %v", got, want)
+			}
+		})
 	}
 }
 
