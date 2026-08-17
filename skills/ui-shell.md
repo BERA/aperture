@@ -200,12 +200,15 @@ drops a `compare` node already set to that operator.
   token → spelling — `has member`, `has all`, `has any`, `has none`, `subset of`,
   `has key`, `is empty`, `is not empty`, `exists`, plus `equals`, `not equals`,
   `less than`, `less or equal`, `greater than`, `greater or equal`, `in`,
-  `not in`. It is a spelling table only: **membership and order come from
-  `OP_SPECS`**, and an operator with no spelling shows its bare token rather than
-  vanishing. The spelling is presentation — `opFromLabel` resolves it back to the
-  AST token in `reteToGraph`, so nothing downstream ever sees it, an unrecognised
-  spelling passes through verbatim for the validator to name, and a raw token
-  typed into the control is still accepted.
+  `not in`, and the eight date operators as sentences: `is before`, `is after`,
+  `is on or before`, `is on or after`, `is between`, `is on the same day as`,
+  `is in the same month as`, `is in the same year as`. It is a spelling table
+  only: **membership and order come from `OP_SPECS`**, and an operator with no
+  spelling shows its bare token rather than vanishing. The spelling is
+  presentation — `opFromLabel` resolves it back to the AST token in
+  `reteToGraph`, so nothing downstream ever sees it, an unrecognised spelling
+  passes through verbatim for the validator to name, and a raw token typed into
+  the control is still accepted.
 - **The palette entry's `kind` is compound** (`"compare:hasAll"`) because the
   shell template keys the palette by `kind`; `rules().add()` splits it into the
   node kind plus the seed operator, keeping the operator out of the template.
@@ -224,7 +227,111 @@ drops a `compare` node already set to that operator.
   renderer is a committed vendored blob this repo never rebuilds, so a custom
   control would mean a node build. The list is attached by delegation on
   pointerdown/focusin (the input belongs to the renderer and is re-created by it),
-  which is idempotent and survives re-renders.
+  which is idempotent and survives re-renders. Every dropdown below works the
+  same way, and every one of them resolves its text back through the closed set
+  before the graph is read — **a `<datalist>` suggests, it does not constrain.**
+
+## Authoring dates (relative-date node, operand modes, `between` bounds)
+
+A date rule is built entirely by clicking. `js/rules.js` adds three things on top
+of the operator palette:
+
+### The relative-date node and its four controls
+
+A **Relative date** palette entry sits with Variable and Literal in Operands (it
+is a leaf operand: it produces a value and takes no wires). The node carries the
+AST's four fields as four flat controls, in the order the node reads as a
+sentence — *"the start of the year, five years back"*:
+
+| Control | Type | Source | Notes |
+|---|---|---|---|
+| `anchor` | text + `<datalist>` | `ANCHORS` | `now` / `today` |
+| `n` | text (`inputmode="numeric"`) | — | whole number; **negative goes into the past** |
+| `unit` | text + `<datalist>` | `UNITS` | coarsest first |
+| `snap` | text + `<datalist>` | `SNAPS` | identity `none` first |
+
+- **The lists are never hand-typed in the editor.** They are read from the
+  serializer's three tables (which the Go contract test compares against
+  `rules/relative.go`), in the presentation order chosen there, so a unit added
+  on the Go side appears in the dropdown with no edit to `rules.js`.
+- **Spellings are derived, not tabled.** `vocabLabel` lowercases an ALL-CAPS
+  token (`NOW` → `now`) and splits a camelCase one (`startOfYear` → `start of
+  year`); `vocabFromLabel` is the inverse against the same closed list and
+  returns unrecognised text **verbatim**, so a typed `fortnights` is reported as
+  `relative date has an unknown offset unit: fortnights` — the Go validator's own
+  wording — rather than being silently substituted. A third hand-maintained copy
+  of a set already written down twice is exactly how the copies drift.
+- **The offset is a TEXT control, not a number one**, and that is load bearing.
+  The classic number control coerces with `+value` on every keystroke, and a
+  number input holding just `-` reports an EMPTY value — so `+""` is `0`, the
+  control re-renders as `0`, and the minus is wiped before a digit can follow
+  (typing `-3` yields `03`). A control that cannot express "into the past" cannot
+  express this node.
+- **The offset is handed to the serializer raw.** `normalizeOffset` turns a blank
+  control into `0` and keeps an unparseable token verbatim; the control does not
+  clamp or coerce, so it never invents a cutoff the author did not write. A
+  fraction saves as a fraction and is reported as
+  `relative date offset must be a whole number: 1.5` — a number control could not
+  even produce that token, so the fraction would be silently coerced rather than
+  named.
+- **There is no ago/from-now toggle.** The sign is the direction; a second field
+  meaning the same thing would be a second way to write one rule.
+- `validateRelativeDate` reports the four fields **independently**, and the
+  validation panel lists every problem, so all four controls can be flagged at
+  once.
+
+### The operand mode switch
+
+A date comparison carries a **mode control** per operand slot — one (`right
+operand`) for the seven single-operand date operators, two (`lower bound` /
+`upper bound`) for `between`. Choosing `literal`, `relative`, or `variable`
+builds that operand node and wires it in, so an author never has to find a
+palette entry and drag a wire to get the four controls.
+
+**The mode is DERIVED from the graph, never stored.** Nothing about it is in the
+AST: it is read back off whatever is wired, so a rule loaded from the server and
+a rule built by hand show the same modes for the same shape, and an operand
+rewired by hand updates the control rather than being overwritten by it. An
+operand no mode names (a call, a list, another comparison) reads back as a blank
+control, never a wrong one.
+
+### `between`'s bounds, and what survives an operator change
+
+`between`'s ternary shape — a two-item `list` on the right — is a detail of how
+the AST stores bounds, not something an author should have to know, so **the
+editor builds it**: dropping `is between` scaffolds the list with two empty
+literal bounds, both immediately editable and each with its own mode. All four
+literal/relative combinations are authorable because neither mode control
+consults the other.
+
+Operator changes follow four rules, all in `reshapeDateOperands`:
+
+- **Compatible operands survive.** `is before` → `is after` touches nothing.
+- **Entering `between` WRAPS** the current right operand as the lower bound;
+  **leaving it UNWRAPS** the lower bound back onto `right`. A configured operand
+  survives the round trip in the position that still means the same thing.
+- **An incompatible operand is cleared.** A relative date is legal only under a
+  date operator, so `is before` → `has all` removes it rather than leaving a node
+  that saves as an error the canvas does not explain.
+- **Only LEAVES are ever deleted** (a var, a literal, a relative date — one field
+  the author can retype). A displaced subtree is disconnected and left on the
+  canvas: the editor does not throw away structure someone built.
+
+None of this runs for an **unknown** operator. The control fires on every
+keystroke, so an author retyping `is before` over `is between` passes through a
+run of half-words, and reacting to those would tear down the bounds and delete a
+configured relative date on the way to an operator they are still spelling.
+
+### Labelling the controls
+
+The classic renderer draws every control as a bare `<input>` with no label. It
+does tag each control's wrapper `data-testid="control-<key>"`, so `css/styles.css`
+hangs the field name on a `::before` scoped to `.rete-canvas` (a CSS pseudo
+element belongs to CSS, not to the element tree React reconciles — nothing is
+injected into the renderer's DOM), and `rules.js` sets `placeholder` / `title` /
+`step` through the same delegation that attaches the datalists. **Never build a
+JS `Date` to display any of it** — stored date strings render verbatim, `Z`
+included.
 
 ## Auth wiring (external credentials, never issued here)
 
@@ -296,5 +403,7 @@ A change to the embedded shell's public surface — the static routes it exposes
 skeleton, the `rules-serializer.js` mirror of `rules/ast.go` (operators, operand
 shapes, blocked calls, the date-operator set, the relative-date vocabularies and
 node shape, validation wording), the rule editor's operator palette and its
-spellings, or a rule above — updates this doc in the **same PR**. The gate in
-`skills/skills_test.go` fails the build if this doc loses its frontmatter.
+spellings, its node controls (the relative-date quartet, the operand mode
+switches, the `between` bounds scaffold, and the `data-testid` labels they are
+styled through), or a rule above — updates this doc in the **same PR**. The gate
+in `skills/skills_test.go` fails the build if this doc loses its frontmatter.
