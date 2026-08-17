@@ -268,6 +268,15 @@ const (
 	// that could be correct. The '$' is load-bearing for the same reason as
 	// fnCollectionOp's.
 	fnDateOp = "$date"
+
+	// fnRelativeDate is the dispatcher a relative-date OPERAND renders to
+	// (renderRelativeDate). Unlike the other two it returns a value rather than a
+	// bool: it resolves the decision's reference instant plus a literal
+	// anchor/offset/snap into a canonical date string, which the enclosing date
+	// operator then compares like any other operand. Its '$' is load-bearing in
+	// the same way, and it is the ONLY dispatcher that reads the instant — $date
+	// never sees it.
+	fnRelativeDate = "$rel"
 )
 
 // defaultFunctions is the curated pure function set every Compiler exposes. They
@@ -373,6 +382,37 @@ func defaultFunctions() []expr.Option {
 			return evalDateOp(op, sink,
 				leftPath, args[3], rightPath, args[5], right2Path, args[7]), nil
 		}, new(func(string, any, string, any, string, any, string, any) bool)),
+
+		// $rel resolves a relative-date OPERAND (renderRelativeDate). Its
+		// arguments are the decision's reference instant — the only place __now
+		// is ever read — followed by the node's four literal fields: anchor,
+		// offset count, offset unit, snap.
+		//
+		// It returns a canonical date STRING, which is byte-for-byte what a date
+		// literal in the same position would be, so `$date` parses both operands
+		// through one path and a relative date is interchangeable with a fixed
+		// one. When the date cannot be resolved — no reference instant, or
+		// arithmetic the seam does not implement yet — it returns nil, and the
+		// enclosing operator applies its ordinary deny-safe policy (false, with a
+		// shape note). It never raises: a rule must not fail to evaluate because
+		// of the date it is measured against.
+		expr.Function(fnRelativeDate, func(args ...any) (any, error) {
+			if len(args) != 5 {
+				return nil, aerr.WithContext(aerr.APERTURE_RULE_EVAL,
+					"rule: relative date takes exactly five operands",
+					map[string]any{"args": len(args)})
+			}
+			now, _ := args[0].(time.Time)
+			anchor, _ := args[1].(string)
+			count, _ := args[2].(int)
+			unit, _ := args[3].(string)
+			snap, _ := args[4].(string)
+			v, ok := resolveRelativeDate(now, anchor, count, unit, snap)
+			if !ok {
+				return nil, nil
+			}
+			return v.String(), nil
+		}, new(func(time.Time, string, int, string, string) any)),
 	}
 }
 

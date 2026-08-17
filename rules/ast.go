@@ -59,6 +59,12 @@ const (
 	NodeList NodeType = "list"
 	// NodeCall is a call to a registered pure function.
 	NodeCall NodeType = "call"
+	// NodeRelativeDate is a date expressed RELATIVE to the decision's reference
+	// instant — an anchor, a whole-number offset in one of seven units, and a
+	// snap. It is an operand, never a predicate: it is legal only on either side
+	// of a date operator (including as one bound of a between), and it is the
+	// only node type whose value is not written into the rule. See relative.go.
+	NodeRelativeDate NodeType = "relativeDate"
 )
 
 // Comparison operators carried in a NodeCompare's Op field.
@@ -322,6 +328,12 @@ var varPath = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-
 //	literal  Value (scalar JSON: string, number, bool, or null)
 //	list     Items
 //	call     Name (function), Items (arguments)
+//	relativeDate
+//	         Anchor, Offset, Unit, Snap — ALL FOUR, always. Unlike every other
+//	         node type, none of its fields is ever omitted: "no offset" is n = 0
+//	         and "no snap" is the vocabulary member "none", so absence never
+//	         means anything and the four editor controls are never empty. See
+//	         relative.go.
 type Node struct {
 	Type     NodeType        `json:"type"`
 	Op       string          `json:"op,omitempty"`
@@ -331,6 +343,15 @@ type Node struct {
 	Right    *Node           `json:"right,omitempty"`
 	Children []*Node         `json:"children,omitempty"`
 	Items    []*Node         `json:"items,omitempty"`
+
+	// The relativeDate fields. Offset is a JSON number TOKEN rather than an int
+	// so that Validate — not encoding/json — owns the rejection of a
+	// non-integer offset, and so the token a rule was authored with survives the
+	// round-trip verbatim. See Node.offsetCount.
+	Anchor string      `json:"anchor,omitempty"`
+	Offset json.Number `json:"n,omitempty"`
+	Unit   string      `json:"unit,omitempty"`
+	Snap   string      `json:"snap,omitempty"`
 }
 
 // And returns a logical-and over children.
@@ -427,10 +448,40 @@ func (n *Node) Validate() error {
 		return validateAll(n.Items)
 	case NodeCall:
 		return n.validateCall()
+	case NodeRelativeDate:
+		// A relative date is an OPERAND OF A DATE OPERATOR and nothing else, so
+		// reaching it through the general walk — as a logical child, a call
+		// argument, an item of an `in` list, or the right side of `eq` — is an
+		// error. validateCompare reaches the legal positions through
+		// validateDateOperand instead, which is the only caller that accepts one.
+		//
+		// The restriction is not decoration. The node resolves to a date the
+		// author never sees, so anywhere it is not being compared AS a date it
+		// would either be compared as an opaque string (`eq "2026-03-04T…Z"`,
+		// which is string equality against a value that changes every second) or
+		// silently deny. Refusing it at validation makes the mistake visible when
+		// the rule is saved.
+		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
+			"rule: a relative date is only valid as an operand of a date operator",
+			map[string]any{"anchor": n.Anchor})
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: unknown node type", map[string]any{"type": string(n.Type)})
 	}
+}
+
+// validateDateOperand validates one operand of a comparison, accepting a
+// relative-date node only when the operator is a date operator.
+//
+// It is the single seam through which NodeRelativeDate becomes legal: everywhere
+// else in the AST it is validated by Node.Validate, which rejects it outright. A
+// bounds list's items are operands in their own right, so between's two bounds
+// may each independently be a literal, a variable, or a relative date.
+func validateDateOperand(n *Node, dateOp bool) error {
+	if dateOp && n != nil && n.Type == NodeRelativeDate {
+		return n.validateRelativeDate()
+	}
+	return n.Validate()
 }
 
 // validateCompare checks a NodeCompare against its operator's opSpec: the
@@ -453,6 +504,11 @@ func (n *Node) validateCompare() error {
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: comparison requires a left operand", map[string]any{"op": n.Op})
 	}
+	// A date operator's operands are the only place a relative-date node is
+	// legal; every other operand is validated by the general walk, which rejects
+	// one. The flag rides along rather than being re-derived per operand so the
+	// two sides of a comparison cannot disagree about it.
+	dateOp := spec.kind == renderDate
 	if spec.shape == rightNone {
 		if n.Right != nil {
 			return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
@@ -465,7 +521,7 @@ func (n *Node) validateCompare() error {
 		return aerr.New(aerr.APERTURE_RULE_INVALID,
 			"rule: comparison requires a left and a right operand")
 	}
-	if err := n.Left.Validate(); err != nil {
+	if err := validateDateOperand(n.Left, dateOp); err != nil {
 		return err
 	}
 	switch spec.shape {
@@ -496,8 +552,18 @@ func (n *Node) validateCompare() error {
 				"rule: operator requires a list of exactly two bounds on the right",
 				map[string]any{"op": n.Op, "bounds": len(n.Right.Items)})
 		}
+		// Each bound is its own date operand, so the two may independently be a
+		// literal, a variable, or a relative date. (Validating the items here
+		// rather than through the list node is what carries that permission down;
+		// NodeList.Validate is the same walk minus the permission.)
+		for _, bound := range n.Right.Items {
+			if err := validateDateOperand(bound, dateOp); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return n.Right.Validate()
+	return validateDateOperand(n.Right, dateOp)
 }
 
 // validateCall checks a NodeCall's function name. Beyond the identifier shape it
@@ -634,6 +700,8 @@ func (n *Node) render(b *bytes.Buffer) error {
 		}
 		b.WriteByte(')')
 		return nil
+	case NodeRelativeDate:
+		return n.renderRelativeDate(b)
 	default:
 		return aerr.WithContext(aerr.APERTURE_RULE_INVALID,
 			"rule: cannot render unknown node type", map[string]any{"type": string(n.Type)})
@@ -850,6 +918,57 @@ func dateOperands(n *Node) (*Node, *Node) {
 		return nil, nil
 	}
 	return n.Right.Items[0], n.Right.Items[1]
+}
+
+// renderRelativeDate writes a relative-date operand as a call to the relative
+// dispatcher:
+//
+//	$rel(__now, "NOW", -3, "months", "none")
+//	$rel(__now, "TODAY", 0, "days", "startOfYear")
+//
+// The arguments are, in order: the decision's reference instant, then the node's
+// four fields exactly as they are persisted — anchor, offset count, offset unit,
+// snap. Every one of them is a LITERAL: the instant is the only thing that is not
+// baked into the source, so the rendered text is stable across decisions and the
+// compiled-program cache keys on a rule rather than on a moment.
+//
+// THE ARGUMENTS ARE LITERALS BECAUSE THE ALTERNATIVE IS A CALENDAR WALK. The
+// instant arrives as `__now`, an environment entry whose identifier is not one of
+// allowedRoots, so no NodeVar can name it — exactly the arrangement `$date` uses
+// for `__notes`. Were `NOW` a variable root instead, `NOW.AddDate(0, -3, 0)`
+// would be a well-formed var path, because reflective method calls survive
+// expr.DisableAllBuiltins. The vocabularies are quoted strings that a closed-set
+// check has already passed, so nothing an author writes reaches the expression as
+// syntax.
+//
+// `$rel` is unreachable from a rule for the same structural reason as `$op` and
+// `$date`: '$' is outside the identifier grammar varPath enforces, so no NodeCall
+// can name it and no blockedCallNames entry is needed.
+//
+// The dispatcher returns a date VALUE (a canonical date string, or nil when it
+// cannot be resolved), not a bool — this node is an operand, and it is
+// interchangeable with a date literal everywhere one is accepted.
+func (n *Node) renderRelativeDate(b *bytes.Buffer) error {
+	// Rendering an UNVALIDATED node must not emit garbage: Expr is exported, and
+	// an unparseable offset written into the source would surface as an opaque
+	// expr-lang compile failure instead of the validator's own message.
+	count, err := n.offsetCount()
+	if err != nil {
+		return err
+	}
+	b.WriteString(fnRelativeDate)
+	b.WriteByte('(')
+	b.WriteString(nowVar)
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Anchor))
+	b.WriteString(", ")
+	b.WriteString(strconv.Itoa(count))
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Unit))
+	b.WriteString(", ")
+	b.WriteString(strconv.Quote(n.Snap))
+	b.WriteByte(')')
+	return nil
 }
 
 // varPathOf returns the dotted path a note should name an operand by: the

@@ -34,6 +34,7 @@ file (E5-S2) persists the same shape. There is no second rule format.
 | `literal` | `value` (scalar JSON) | string / number / bool / null constant |
 | `list` | `items` | list literal (right side of a collection op) |
 | `call` | `name`, `items` (args) | call to a registered pure function |
+| `relativeDate` | `anchor`, `n`, `unit`, `snap` (**all four, always**) | a date relative to the decision's reference instant; an **operand**, legal only inside a date operator |
 
 The JSON form is stable and round-trips (marshal -> unmarshal -> marshal is
 byte-identical), including falsy literals (`false`, `0`, `""`, `null`) and the
@@ -72,7 +73,8 @@ Collection operators. `left` is the collection (or, for `exists`, any path);
 | `exists` | `object.owner.dept exists` | any path | **omitted** |
 
 Date operators. `left` is the date-valued field; `right` is another date operand
-— a literal or a variable — except for `between`, which takes **two bounds**:
+— a literal, a variable, or a `relativeDate` — except for `between`, which takes
+**two bounds**:
 
 | `op` | Reads as | `right` |
 |---|---|---|
@@ -131,10 +133,121 @@ Operand rules are enforced by `Validate` and return `APERTURE_RULE_INVALID`:
   the right; a `list` there is an error.
 - `between` needs a `list` of **exactly two** bounds on the right — one bound,
   three bounds, an empty list, or a bare operand are all rejected.
+- A `relativeDate` operand is legal only inside a date operator (either side, or
+  either `between` bound); see "Relative dates".
 
 Build a unary node with `rules.Unary(op, left)`, a `between` node with
 `rules.Between(left, low, high)`, and everything else with
 `rules.Compare(op, left, right)`.
+
+## Relative dates
+
+A rule that says "touched in the last 90 days" must keep meaning that tomorrow,
+so the cutoff cannot be a literal. The `relativeDate` node expresses a date
+**relative to the decision's reference instant** (`NOW` — see "The clock, and one
+`NOW` per decision") as structured fields, not as an expression an author has to
+learn to write:
+
+```json
+{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}
+```
+
+| field | vocabulary |
+|---|---|
+| `anchor` | `NOW` \| `TODAY` |
+| `n` | any whole number; **negative goes into the past** |
+| `unit` | `years` \| `quarters` \| `months` \| `weeks` \| `days` \| `hours` \| `minutes` |
+| `snap` | `none` \| `startOfYear` \| `endOfYear` \| `startOfQuarter` \| `endOfQuarter` \| `startOfMonth` \| `endOfMonth` \| `startOfWeek` \| `endOfWeek` \| `startOfDay` \| `endOfDay` |
+
+The two worked examples:
+
+| Intent | Node |
+|---|---|
+| three months prior to today | `{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}` |
+| year to date plus five years of history | a `between` whose lower bound is `{"anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"}` and whose upper bound is `{"anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}` |
+
+```json
+{"type":"compare","op":"between",
+ "left":{"type":"var","name":"object.hired_at"},
+ "right":{"type":"list","items":[
+   {"type":"relativeDate","anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"},
+   {"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}]}}
+```
+
+Build one with `rules.RelativeDate(anchor, n, unit, snap)`; the vocabularies have
+exported constants (`rules.AnchorNow`, `rules.UnitMonths`, `rules.SnapStartOfYear`,
+…).
+
+Six rules, each of which is API rather than convention:
+
+- **A negative `n` goes into the past.** "Three months ago" is `n: -3`. There is
+  no separate direction field anywhere that could disagree with the sign — a sign
+  error in a date rule is silent and grants access backwards in time, so the
+  convention is stated once and used by every surface.
+- **All four fields are always present.** "No offset" is `n: 0` (with whatever
+  unit — zero of anything is the anchor itself) and "no snap" is the vocabulary
+  member `"none"`, never an absent key. Absence never means anything, so the
+  editor's four controls are never empty and both validators run the same four
+  uniform checks.
+- **`TODAY` is a distinct persisted anchor**, defined as `NOW` snapped to the
+  start of its UTC day. It is never rewritten into `NOW` + `snap: startOfDay`: an
+  author who chose `TODAY` reads back `TODAY`.
+- **A snap composes on top of the anchor.** `anchor: TODAY, snap: startOfYear` is
+  legal and means the start of the year — the wider snap simply subsumes the
+  anchor's start-of-day. The snap is applied **after** the offset, so
+  `NOW, n: -5, unit: years, snap: startOfYear` is "the start of the year five
+  years ago", not "five years before the start of this year".
+- **The node is an operand, and only a date operator's operand.** It is legal on
+  either side of `before` / `after` / `onOrBefore` / `onOrAfter` / `sameDay` /
+  `sameMonth` / `sameYear`, and as either bound of a `between` — the two bounds
+  vary independently, so any mix of literal and relative is fine. Anywhere else —
+  the right of `eq`, an item of an `in` list, a `call` argument, a child of
+  `and` — is `APERTURE_RULE_INVALID`. It resolves to a date the author never
+  sees, so being compared as anything but a date is a silent wrong answer.
+- **Anchors, units, and snaps are closed sets checked in the AST**, not free
+  strings resolved at runtime, so a typo fails when the rule is **saved** rather
+  than denying quietly on every decision after. Each field has its own message:
+  `relative date has an unknown anchor` / `… an unknown offset unit` / `… an
+  unknown snap` / `relative date offset must be a whole number`.
+
+**How it compiles.** The node renders to the internal dispatcher
+`$rel(__now, anchor, n, unit, snap)` — the reference instant, then the four fields
+as **literals**:
+
+```
+$date("before", __notes, "object.hired_at", object?.hired_at, "",
+      $rel(__now, "NOW", -3, "months", "none"), "", nil)
+```
+
+`$rel` returns a canonical date **string** — byte-for-byte what a literal in the
+same position would be — so `$date` parses both operands through one path and a
+relative date is interchangeable with a fixed one. `$rel` is the **only**
+dispatcher that reads `__now`; `$date` never sees it and its arity is unchanged.
+
+The literal arguments are the whole point. Exposing the instant as a `NOW`
+variable root instead would make `NOW.AddDate(0, -3, 0)` a well-formed var path,
+because reflective method calls survive `expr.DisableAllBuiltins` — an unclamped
+calendar walk reachable from any rule. `allowedRoots` is unchanged, and `$rel` is
+unreachable from a rule for the same structural reason as `$op` and `$date`.
+
+**UTC, and clamping.** Every boundary is computed in UTC; there is no timezone
+knob. Week boundaries are ISO 8601 (**Monday** start). Offsetting by the three
+calendar units (`years`, `quarters`, `months`) **clamps at month end** rather than
+normalising the way `time.AddDate` does — `2026-03-31` minus one month is
+`2026-02-28`, not `2026-03-03`. `weeks` / `days` / `hours` / `minutes` are
+fixed-length and unaffected.
+
+> **Not implemented yet.** `rules.resolveRelativeDate` resolves the anchor (and so
+> `n: 0` with `snap: none`); the offset arithmetic and the ten non-identity snaps
+> are still to be written. Until they land, a node with a non-zero offset or a
+> snap other than `none` **resolves to nothing and its comparison denies**, with
+> the ordinary `shape_mismatch` note. Denying is the only safe placeholder: an
+> approximation would grant or withhold access against a date nobody chose.
+
+**No reference instant, no date.** `rules.Input.Now`'s zero value means "no
+reference instant is available" — a hand-built `Input`; an `Engine` always
+supplies one. A relative date then resolves to nothing and **denies** rather than
+resolving against the year 1, and it never raises.
 
 ### How each operator compiles
 
@@ -239,10 +352,11 @@ compiled program as `__now`, which is absent from the four roots above — exact
 as the notes sink `__notes` is. That is a security boundary, not a style choice:
 reflective **method calls survive `expr.DisableAllBuiltins`**, so an exposed root
 would make `NOW.AddDate(0, -3, 0)` and `NOW.Unix()` well-formed var paths — an
-unclamped calendar walk reachable from any rule. A relative-date node renders
-literal arguments to a `$`-prefixed dispatcher and reads `__now` as one of them,
-the way `$date` already reads `__notes`. `TestNowIsNotReachableFromARule` fails if
-the identifier is ever added to `allowedRoots`.
+unclamped calendar walk reachable from any rule. The `relativeDate` node renders
+literal arguments to the `$rel` dispatcher and reads `__now` as one of them, the
+way `$date` already reads `__notes` — see "Relative dates".
+`TestNowIsNotReachableFromARule` fails if the identifier is ever added to
+`allowedRoots`.
 
 **The cache never carries an instant.** The rendered source names the identifier,
 never a resolved timestamp, so a cached program cannot answer against a stale
@@ -347,6 +461,7 @@ because the date-only form is a strict prefix of the timestamp form.
 | a number, bool, array, or object | **`false`** | `shape_mismatch`, `expected date, got number` |
 | a string that is not one of the two canonical forms | **`false`** | `date_invalid` |
 | `between` whose lower bound is after its upper bound | **`false`** | `date_bounds_inverted` |
+| a `relativeDate` that cannot be resolved (no reference instant, or arithmetic the seam does not implement yet) | **`false`** | `shape_mismatch`, `expected date, got absent`, path `(expression)` |
 
 **Note the asymmetry with the collection operators, and that it is deliberate.**
 A collection operator gives an absent field a meaning — it reads as an *empty
@@ -413,7 +528,8 @@ evaluation, surfacing coded errors:
 - `APERTURE_RULE_INVALID` — malformed AST (bad arity, missing operand, a right
   operand on a unary op, the wrong operand shape for a collection op, non-scalar
   literal, non-identifier variable path, a `call` naming a denied predicate
-  builtin).
+  builtin, a `relativeDate` outside a date operator or carrying an anchor / unit
+  / snap outside its closed set or a non-integer offset).
 - `APERTURE_RULE_UNKNOWN_VARIABLE` — a variable root outside `object` /
   `principal` / `account` / `action`.
 - `APERTURE_RULE_TYPE_ERROR` — type-incompatible comparison, non-boolean result,

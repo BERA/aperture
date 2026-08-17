@@ -77,6 +77,7 @@ var goBackingFuncConsts = map[string]string{
 	"fnIsNotEmpty":   fnIsNotEmpty,
 	"fnCollectionOp": fnCollectionOp,
 	"fnDateOp":       fnDateOp,
+	"fnRelativeDate": fnRelativeDate,
 }
 
 // TestEditorOperatorTablesAgree is the drift gate proper: every operator in Go's
@@ -222,6 +223,25 @@ func TestEditorVocabularyTablesAgree(t *testing.T) {
 		diffSets(t, "pure function", goDefaultFunctionNames(t), jsStringArray(t, jsConstBody(t, js, "FUNCTIONS")),
 			"Go defaultFunctions (rules/compiler.go)", "JS FUNCTIONS ("+serializerPath+")")
 	})
+
+	// The relative-date node's three closed vocabularies. Each drives one editor
+	// control, so a member the editor does not offer is a rule an author cannot
+	// write, and a member the editor offers but Go does not know is a rule the
+	// server rejects on save. Both directions are drift, so both are compared.
+	t.Run("ANCHORS vs relativeAnchors", func(t *testing.T) {
+		diffSets(t, "relative-date anchor", keysOf(relativeAnchors), jsStringArray(t, jsConstBody(t, js, "ANCHORS")),
+			"Go relativeAnchors (rules/relative.go)", "JS ANCHORS ("+serializerPath+")")
+	})
+
+	t.Run("UNITS vs relativeUnits", func(t *testing.T) {
+		diffSets(t, "relative-date offset unit", keysOf(relativeUnits), jsStringArray(t, jsConstBody(t, js, "UNITS")),
+			"Go relativeUnits (rules/relative.go)", "JS UNITS ("+serializerPath+")")
+	})
+
+	t.Run("SNAPS vs relativeSnaps", func(t *testing.T) {
+		diffSets(t, "relative-date snap", keysOf(relativeSnaps), jsStringArray(t, jsConstBody(t, js, "SNAPS")),
+			"Go relativeSnaps (rules/relative.go)", "JS SNAPS ("+serializerPath+")")
+	})
 }
 
 // TestEditorValidationMessagesAgree asserts the JS validator reports the Go
@@ -254,6 +274,26 @@ func TestEditorValidationMessagesAgree(t *testing.T) {
 		{"blocked call", Call("filter", Var("object.tags")), aerr.APERTURE_RULE_INVALID},
 		{"literal has no value", &Node{Type: NodeLiteral}, aerr.APERTURE_RULE_INVALID},
 		{"composite literal", &Node{Type: NodeLiteral, Value: []byte(`["a"]`)}, aerr.APERTURE_RULE_INVALID},
+
+		// The relative-date node. Its four fields fail independently, because
+		// each names a different correction, and the editor renders whichever
+		// message it is handed beside the offending control.
+		{"relative date outside a date operator",
+			Compare(OpEq, Var("object.hired_at"), RelativeDate(AnchorNow, -3, UnitMonths, SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown anchor",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate("YESTERDAY", 0, UnitDays, SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown unit",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate(AnchorNow, -3, "fortnights", SnapNone)),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date unknown snap",
+			Compare(OpBefore, Var("object.hired_at"), RelativeDate(AnchorNow, -3, UnitMonths, "startOfFiscalYear")),
+			aerr.APERTURE_RULE_INVALID},
+		{"relative date offset is not a whole number",
+			Compare(OpBefore, Var("object.hired_at"),
+				&Node{Type: NodeRelativeDate, Anchor: AnchorNow, Offset: "1.5", Unit: UnitMonths, Snap: SnapNone}),
+			aerr.APERTURE_RULE_INVALID},
 	}
 
 	for _, tc := range cases {

@@ -62,6 +62,42 @@ func TestEditorASTContract(t *testing.T) {
 			`{"type":"compare","op":"hasAny","left":{"type":"var","name":"object.tags"},"right":{"type":"list","items":[{"type":"literal","value":"gold"}]}},` +
 			`{"type":"not","children":[{"type":"compare","op":"isEmpty","left":{"type":"var","name":"object.owner"}}]}]}]}`,
 
+		// The relative-date operand. All four of its fields are always present —
+		// "no offset" is n:0 and "no snap" is "none" — and the key order below is
+		// the struct's, so a drift in either would break byte-stability here.
+		// Both anchors, several units, and several snaps are covered.
+		"relative date months ago": `{"type":"compare","op":"onOrAfter","left":{"type":"var","name":"object.touched_at"},` +
+			`"right":{"type":"relativeDate","anchor":"NOW","n":-3,"unit":"months","snap":"none"}}`,
+
+		"relative date today start of year": `{"type":"compare","op":"onOrAfter","left":{"type":"var","name":"object.touched_at"},` +
+			`"right":{"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"startOfYear"}}`,
+
+		"relative date forward hours": `{"type":"compare","op":"before","left":{"type":"var","name":"object.expires_at"},` +
+			`"right":{"type":"relativeDate","anchor":"NOW","n":12,"unit":"hours","snap":"none"}}`,
+
+		"relative date end of quarter": `{"type":"compare","op":"onOrBefore","left":{"type":"var","name":"object.due_at"},` +
+			`"right":{"type":"relativeDate","anchor":"TODAY","n":1,"unit":"quarters","snap":"endOfQuarter"}}`,
+
+		"relative date same year": `{"type":"compare","op":"sameYear","left":{"type":"var","name":"object.hired_at"},` +
+			`"right":{"type":"relativeDate","anchor":"NOW","n":-1,"unit":"years","snap":"startOfWeek"}}`,
+
+		// Year to date plus five years of history: one between whose lower bound
+		// is relative and whose upper bound is the anchor itself.
+		"between relative bounds": `{"type":"compare","op":"between","left":{"type":"var","name":"object.hired_at"},` +
+			`"right":{"type":"list","items":[` +
+			`{"type":"relativeDate","anchor":"NOW","n":-5,"unit":"years","snap":"startOfYear"},` +
+			`{"type":"relativeDate","anchor":"TODAY","n":0,"unit":"days","snap":"endOfDay"}]}}`,
+
+		"between literal and relative": `{"type":"compare","op":"between","left":{"type":"var","name":"object.hired_at"},` +
+			`"right":{"type":"list","items":[` +
+			`{"type":"literal","value":"2026-01-01"},` +
+			`{"type":"relativeDate","anchor":"NOW","n":-30,"unit":"minutes","snap":"none"}]}}`,
+
+		"relative date nested under and": `{"type":"and","children":[` +
+			`{"type":"compare","op":"eq","left":{"type":"var","name":"object.classification"},"right":{"type":"literal","value":"public"}},` +
+			`{"type":"compare","op":"after","left":{"type":"var","name":"object.touched_at"},` +
+			`"right":{"type":"relativeDate","anchor":"NOW","n":-90,"unit":"days","snap":"startOfDay"}}]}`,
+
 		"falsy false": `{"type":"compare","op":"eq","left":{"type":"var","name":"object.archived"},"right":{"type":"literal","value":false}}`,
 		"falsy zero":  `{"type":"compare","op":"eq","left":{"type":"var","name":"object.count"},"right":{"type":"literal","value":0}}`,
 		"falsy empty": `{"type":"compare","op":"ne","left":{"type":"var","name":"object.note"},"right":{"type":"literal","value":""}}`,
