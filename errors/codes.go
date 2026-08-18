@@ -84,6 +84,25 @@ const (
 	// already carry an APERTURE_* code (e.g. APERTURE_NOT_FOUND for an
 	// absent object) pass through unwrapped instead.
 	APERTURE_PROVIDER_FETCH Code = "APERTURE_PROVIDER_FETCH"
+	// APERTURE_SQL_PROVIDER_QUERY — a SQL-backed ObjectProvider's statement did
+	// not run: a connection, permission, syntax, placeholder-arity, or timeout
+	// failure reported by the host's database. The driver's error is wrapped
+	// verbatim. This is an OPERATIONAL failure, deliberately distinct from
+	// APERTURE_NOT_FOUND (the object is absent) — the Registry must be able to
+	// tell "there is no such object" from "the database is unreachable", because
+	// the two mean opposite things for a decision.
+	APERTURE_SQL_PROVIDER_QUERY Code = "APERTURE_SQL_PROVIDER_QUERY"
+	// APERTURE_SQL_PROVIDER_AMBIGUOUS — a SQL-backed ObjectProvider's "get one"
+	// statement returned more than one row for a single object identity. The
+	// first row is never silently taken: which row won would depend on an
+	// unspecified order, so an object's metadata — and therefore the decision
+	// made from it — would vary between two otherwise identical Checks.
+	APERTURE_SQL_PROVIDER_AMBIGUOUS Code = "APERTURE_SQL_PROVIDER_AMBIGUOUS"
+	// APERTURE_SQL_PROVIDER_SCAN — a row the host's database returned could not
+	// be turned into object metadata: an unnamed or duplicated result column, a
+	// scan failure, or a driver value of a Go type this provider does not map.
+	// The statement ran; its shape or its values are the problem.
+	APERTURE_SQL_PROVIDER_SCAN Code = "APERTURE_SQL_PROVIDER_SCAN"
 	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
 	// metadata value model: a value that is neither a scalar, a []any of
 	// scalars, nor a map[string]any one level deeper; an array holding an object
@@ -293,6 +312,29 @@ var Registry = map[Code]Metadata{
 			"Return APERTURE_NOT_FOUND from the provider for an object that does not exist.",
 		},
 	},
+	APERTURE_SQL_PROVIDER_QUERY: {
+		Message: "SQL object provider could not run its statement",
+		Fixups: []string{
+			"Inspect the wrapped driver error for the underlying database failure.",
+			"Check the statement's placeholder count: a fetch statement binds exactly one parameter, the identity's terminal segment value.",
+			"Use the placeholder syntax your engine speaks — Aperture passes placeholders through untouched and never rewrites $1 to ?.",
+			"Confirm the database is reachable and the connection's role can read the table; raise Config.Timeout if the statement is legitimately slow.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_AMBIGUOUS: {
+		Message: "SQL object provider's fetch statement returned more than one row for one identity",
+		Fixups: []string{
+			"Filter the fetch statement on a unique or primary key so one identity selects at most one row.",
+			"A join that fans out is the usual cause; aggregate or de-duplicate the fanned-out side instead of adding LIMIT 1, which would make the metadata depend on an unspecified row order.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_SCAN: {
+		Message: "SQL object provider could not read a row into object metadata",
+		Fixups: []string{
+			"Give every selected expression a name, and alias duplicates: each result column becomes a metadata field keyed by its column name.",
+			"Cast or serialise a column whose Go type the provider does not map (the driver value's type is named in the error).",
+		},
+	},
 	APERTURE_METADATA_INVALID: {
 		Message: "object metadata violates the metadata value model",
 		Fixups: []string{
@@ -424,6 +466,9 @@ var AllCodes = []Code{
 	APERTURE_PROVIDER_INVALID,
 	APERTURE_PROVIDER_UNREGISTERED,
 	APERTURE_PROVIDER_FETCH,
+	APERTURE_SQL_PROVIDER_QUERY,
+	APERTURE_SQL_PROVIDER_AMBIGUOUS,
+	APERTURE_SQL_PROVIDER_SCAN,
 	APERTURE_METADATA_INVALID,
 	APERTURE_RULE_INVALID,
 	APERTURE_RULE_UNKNOWN_VARIABLE,
