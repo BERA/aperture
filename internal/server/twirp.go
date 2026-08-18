@@ -120,19 +120,50 @@ func (h *twirpHandler) CheckBatch(ctx context.Context, req *rpc.CheckBatchReques
 // interpretation the surface performs: Value -> the Go shapes the value model
 // admits, with no coercion between them (see rpc.FieldsFromWire). An omitted
 // map arrives as a nil map, which is exactly an unfiltered enumeration.
+//
+// Reference edges need no decode at all — three strings map straight across
+// (referenceEdges) — and get no validation here either, for the reason stated
+// there.
 func enumerateQuery(q *rpc.EnumerateRequest) (service.EnumerateQuery, error) {
 	fields, err := rpc.FieldsFromWire(q.GetFields())
 	if err != nil {
 		return service.EnumerateQuery{}, err
 	}
 	return service.EnumerateQuery{
-		Account:   q.Account,
-		Principal: q.Principal,
-		Action:    q.Action,
-		Pattern:   q.Pattern,
-		Fields:    fields,
-		Limit:     int(q.Limit),
+		Account:    q.Account,
+		Principal:  q.Principal,
+		Action:     q.Action,
+		Pattern:    q.Pattern,
+		Fields:     fields,
+		References: referenceEdges(q.GetReferences()),
+		Limit:      int(q.Limit),
 	}, nil
+}
+
+// referenceEdges carries the wire's reference edges onto the facade's, three
+// strings at a time. Nothing here validates them: whether the holder identity
+// parses, whether a declared holder type agrees with it, and whether the field
+// is a declared reference are all decisions with a DISCLOSURE consequence
+// (engine/reference.go draws the empty-vs-NOT_FOUND boundary), and a surface
+// that answered any of them separately would be a second place for the answer
+// to differ.
+//
+// An omitted repeated field arrives as an empty slice and leaves as a nil one,
+// so "no edges on the wire" is indistinguishable from "no edges in Go" — an
+// unrestricted enumeration, exactly as before this field existed.
+func referenceEdges(in []*rpc.ReferenceEdge) []service.ReferenceEdge {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]service.ReferenceEdge, 0, len(in))
+	for _, e := range in {
+		out = append(out, service.ReferenceEdge{
+			HolderType: e.GetHolderType(),
+			HolderID:   e.GetHolderId(),
+			Field:      e.GetField(),
+		})
+	}
+	return out
 }
 
 func (h *twirpHandler) Enumerate(ctx context.Context, req *rpc.EnumerateRequest) (*rpc.EnumerateResponse, error) {

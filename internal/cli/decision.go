@@ -147,10 +147,18 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	ruleSource := service.NewStorageRuleSource(store)
 	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher)
 
-	opts := make([]engine.Option, 0, len(engOpts)+2)
+	opts := make([]engine.Option, 0, len(engOpts)+3)
 	opts = append(opts, engine.WithScopeResolution(nil, scopeDeps))
 	if metaSource != nil {
 		opts = append(opts, engine.WithMetadata(metaSource))
+		// The SAME registry is the declared-reference source, so one object
+		// source backs the lister, the Fields predicate and the dereference, and
+		// an enumeration through `--via` reads the holder from the cache the
+		// decision already warmed. Gated on the same condition for the same
+		// reason: with no object source at all, an enumeration through a
+		// reference must report APERTURE_PROVIDER_UNREGISTERED rather than an
+		// empty result that reads as "no access".
+		opts = append(opts, engine.WithReferences(reg))
 	}
 	opts = append(opts, engOpts...)
 
