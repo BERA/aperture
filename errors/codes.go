@@ -72,8 +72,12 @@ const (
 	// registration time, before any object metadata can be fetched.
 	APERTURE_PROVIDER_INVALID Code = "APERTURE_PROVIDER_INVALID"
 	// APERTURE_PROVIDER_UNREGISTERED — metadata for an object-type was requested
-	// (fetch, enumerate, or invalidate) but no ObjectProvider is registered for
-	// that type. The object-type is the identity's terminal segment type.
+	// (fetch, enumerate, invalidate, or an Enumerate metadata-field predicate)
+	// but no ObjectProvider is registered for that type — or, for the predicate,
+	// the engine was built with no metadata source at all (engine.WithMetadata).
+	// The object-type is the identity's terminal segment type. A filtered
+	// enumeration reports this rather than returning an empty list, because an
+	// empty list reads as "no access" and would hide the misconfiguration.
 	APERTURE_PROVIDER_UNREGISTERED Code = "APERTURE_PROVIDER_UNREGISTERED"
 	// APERTURE_PROVIDER_FETCH — a host ObjectProvider's Fetch/List/Query returned
 	// a plain (uncoded) error. The cause is wrapped verbatim; provider errors that
@@ -279,6 +283,7 @@ var Registry = map[Code]Metadata{
 		Fixups: []string{
 			"Register an ObjectProvider for the object type before fetching its metadata.",
 			"Confirm the object identity's terminal segment type matches a registered provider key.",
+			"Filtering an enumeration by metadata fields? Build the engine with engine.WithMetadata(registry) — the same provider registry the scope lister uses — or drop the field predicates.",
 		},
 	},
 	APERTURE_PROVIDER_FETCH: {

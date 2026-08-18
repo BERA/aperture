@@ -130,12 +130,12 @@ func writeCommand(b *bytes.Buffer, c *ucli.Command, parents []string, level int)
 	b.WriteString("`\n\n")
 
 	if c.Usage != "" {
-		b.WriteString(c.Usage)
+		b.WriteString(escapeHTML(c.Usage))
 		b.WriteString("\n\n")
 	}
 	if c.Description != "" {
-		b.WriteString(c.Description)
-		b.WriteString("\n\n")
+		b.WriteString(mdDescription(c.Description))
+		b.WriteString("\n")
 	}
 
 	// Synopsis.
@@ -274,12 +274,61 @@ func anchor(name string) string {
 // instead of being parsed as HTML tags, pipes are escaped, and newlines become
 // <br> so multi-line content stays on one row.
 func mdCell(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = escapeHTML(s)
 	s = strings.ReplaceAll(s, "|", "\\|")
 	s = strings.ReplaceAll(s, "\n", "<br>")
 	return s
+}
+
+// escapeHTML makes a help string safe to drop into Markdown prose. The only
+// hazard there is the angle bracket: a placeholder like <pattern> is parsed as
+// an HTML tag and silently disappears from the rendered page.
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// mdDescription renders a command's long Description as Markdown WITHOUT
+// rewording it. `--help` is the description's primary consumer, so the string
+// in internal/cli is written for a terminal and this function adapts it rather
+// than the other way round. Two things in a terminal help text are not
+// Markdown-safe:
+//
+//   - an angle-bracketed placeholder (<pattern>) parses as an HTML tag and
+//     vanishes from the page — so prose lines are HTML-escaped;
+//   - an INDENTED example line is an accidental indented code block that also
+//     interrupts the surrounding paragraph — so a run of indented lines is
+//     promoted to an explicit fenced block, which is what it already is on
+//     screen, and its contents are left verbatim (a fence is literal).
+//
+// Everything else is passed through, so an ordinary one-paragraph description
+// renders exactly as it did before.
+func mdDescription(s string) string {
+	var b strings.Builder
+	fenced := false
+	for _, line := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+		indented := strings.TrimSpace(line) != "" && strings.HasPrefix(line, "  ")
+		switch {
+		case indented && !fenced:
+			b.WriteString("```text\n")
+			fenced = true
+		case !indented && fenced:
+			b.WriteString("```\n")
+			fenced = false
+		}
+		if fenced {
+			b.WriteString(line)
+		} else {
+			b.WriteString(escapeHTML(line))
+		}
+		b.WriteString("\n")
+	}
+	if fenced {
+		b.WriteString("```\n")
+	}
+	return b.String()
 }
 
 func fatal(format string, args ...any) {

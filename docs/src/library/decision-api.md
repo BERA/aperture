@@ -24,6 +24,7 @@ extend that behaviour:
 |---|---|
 | `WithScopeResolution(registry *scope.Registry, deps ...ScopeDeps)` | Consult each grant's pluggable scope resolver (selected by its permission's scope-strategy) for object membership, instead of only literal pattern matching. A `nil` registry uses `scope.DefaultRegistry()`. |
 | `WithMembershipEnforcement()` | Require the request's principal to be a member of the active account before any grant is consulted. A non-member is denied at the door (a fail-closed default-deny), rather than erroring. Off by default. |
+| `WithMetadata(f MetadataFetcher)` | Supply the object-metadata source `Enumerate`'s [`Fields` filter](#filtering-by-object-metadata) reads through — normally the same `*provider.Registry` wired as the scope lister. Consulted **only** by a request that carries `Fields`. |
 | `WithClock(now func() time.Time)` | Override the engine clock. It governs impersonation time-box expiry only; the non-impersonated path never reads it. Production uses `time.Now`. |
 
 Two further seams return a **shallow copy** of the engine rather than mutating it,
@@ -120,11 +121,12 @@ the two operations agree by construction.
 
 ```go
 type EnumerateRequest struct {
-	Account   string // active account the enumeration is scoped to
-	Principal string // id of the principal whose access is enumerated
-	Action    string // the verb being enumerated, e.g. "read"
-	Pattern   string // identity pattern bounding the search
-	Limit     int    // caps the number of returned ids; <= 0 means the default bound
+	Account   string         // active account the enumeration is scoped to
+	Principal string         // id of the principal whose access is enumerated
+	Action    string         // the verb being enumerated, e.g. "read"
+	Pattern   string         // identity pattern bounding the search
+	Fields    map[string]any // optional object-metadata predicates; nil/empty filters nothing
+	Limit     int            // caps the number of returned ids; <= 0 means the default bound
 }
 ```
 
@@ -148,6 +150,67 @@ ids, err := eng.Enumerate(ctx, engine.EnumerateRequest{
 An operational failure — a storage fault, an unresolvable scope strategy, or an
 unconfigured object lister an implicit/exclusive grant needs — is returned as a
 coded error, never a silent partial set.
+
+### Filtering by object metadata
+
+`Fields` is an optional set of object-metadata predicates. An allowed candidate
+is returned only when its metadata satisfies **all** of them; a nil or empty map
+(the default) filters nothing and never touches a metadata source, so an
+unfiltered enumeration costs exactly what it always did.
+
+```go
+ids, err := eng.Enumerate(ctx, engine.EnumerateRequest{
+	Account:   "acme",
+	Principal: "alice",
+	Action:    "read",
+	Pattern:   "account:acme/**",
+	Fields:    map[string]any{"tier": "premium", "brands": "brand:Y"},
+	Limit:     10,
+})
+```
+
+The meaning is
+[`provider.Filter`'s `Fields` contract](../concepts/providers.md#the-filterfields-contract)
+verbatim, evaluated by the same `provider.MatchFields` a provider's own `Query`
+calls — so an enumeration filtered here and one filtered inside a provider select
+the same objects. **AND** across keys; a collection field matches by
+**membership**; an **absent field never matches**, not even a `nil` want; and
+comparison is **typed** (`int64(5)` matches a `float64(5)` want, `"5"` does not
+match `5`).
+
+Two orderings are load-bearing:
+
+1. **Deny first.** The predicate runs on candidates that already survived
+   deny-overrides and specificity, so it can only *subtract* from the allowed
+   set. A denied object is never returned, whatever the predicate says.
+2. **Filter before `Limit`.** The candidate set is predicated *before* it is
+   truncated, so asking for the first 10 objects tagged `brand:Y` searches every
+   candidate rather than tagging the first 10 candidates and returning the few
+   that stuck.
+
+Metadata is read through `engine.WithMetadata(fetcher)`, whose seam
+(`MetadataFetcher`) has the signature of `*provider.Registry.Fetch` — the same
+registry that backs the scope lister and the rule evaluator, so a candidate is
+served from the per-type cache the enumeration already warmed:
+
+```go
+eng := engine.New(store,
+	engine.WithScopeResolution(nil, engine.ScopeDeps{Lister: reg, Rules: rulesEngine}),
+	engine.WithMetadata(reg))
+```
+
+Failure is deliberately asymmetric — an enumeration returning fewer objects reads
+as "no access", one returning more is an authorization bug:
+
+- **no metadata source wired, or no provider for the candidate's object-type** →
+  `APERTURE_PROVIDER_UNREGISTERED`, never a silently empty result. The predicate
+  runs per candidate, so this only surfaces once the enumeration has at least one
+  allowed candidate; an empty allowed set returns empty regardless of wiring.
+- **the object has no metadata row** (`APERTURE_NOT_FOUND` from `Fetch`) → every
+  field is absent, absent never matches, so the object is **excluded**.
+- **any other provider failure** → returned verbatim.
+
+`EnumerateBatch` and `EnumerateAs` carry `Fields` through the same path.
 
 ## Explain
 

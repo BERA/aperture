@@ -17,9 +17,10 @@ trace contract live in one place.
 - **Check** `(account, principal, action, object) -> Decision{Allow, Reason,
   DecidingGrantIDs}`. The enforcement gate; deny-overrides with a specificity
   tiebreak. The hot path (NFR p99 < 1ms).
-- **Enumerate** `(account, principal, action, pattern, limit) -> []objectID`.
-  The inverse of Check: which objects under `pattern` the principal may act on.
-  Every id returned is one Check would allow.
+- **Enumerate** `(account, principal, action, pattern, fields, limit) -> []objectID`.
+  The inverse of Check: which objects under `pattern` the principal may act on,
+  optionally narrowed by object-metadata predicates (`fields`). Every id returned
+  is one Check would allow.
 - **Explain** `(account, principal, action, object) -> Trace`. The full
   derivation: the subject set, every grant considered with its per-grant
   outcome, which grants decided the verdict, and the final Decision.
@@ -79,6 +80,61 @@ enumerates unboundedly:
 - The result is capped by `Limit` (default `DefaultEnumerateLimit`), and each
   resolver's `Members` is itself bounded. Output order is deterministic
   (sorted by canonical id).
+
+## Enumerate's metadata filter
+
+`EnumerateRequest.Fields` (`map[string]any`, optional) narrows the result by
+object metadata: an ALLOWED candidate is returned only when its metadata
+satisfies every predicate. Nil or empty — the default — filters nothing and does
+not consult a metadata source at all, so an unfiltered enumeration is unchanged
+and needs nothing wired.
+
+The meaning is `provider.Filter`'s `Fields` contract verbatim, evaluated by the
+same `provider.MatchFields` a provider's `Query` uses, so an enumeration filtered
+by the engine and one filtered inside a provider select the same objects:
+
+- **AND across keys** — every predicate must hold.
+- **A collection field matches by MEMBERSHIP**; a list-valued *want* is a
+  container compared by equality.
+- **An absent field never matches**, not even against a nil want.
+- **Comparison is typed** — `int64(5)` matches a `float64(5)` want, `"5"` does
+  not match `5`.
+
+Two orderings are load-bearing:
+
+1. **Deny first.** The predicate runs on candidates that already survived
+   deny-overrides and specificity, so the filter can only ever SUBTRACT from the
+   allowed set. No predicate surfaces an object `Check` would deny.
+2. **Filter before `Limit`.** The candidate set is predicated *before* it is
+   truncated, so "the first 10 datasets tagged brand:Y" searches every candidate
+   rather than tagging the first 10 candidates. Truncating first would return a
+   silently wrong answer.
+
+Metadata is read through the `MetadataFetcher` seam (`engine.WithMetadata`),
+whose signature is `*provider.Registry.Fetch` — and matches
+`rules.MetadataFetcher` — so a deployment wires ONE source for the scope lister,
+the rule evaluator, and the filter, and a candidate is served from the per-type
+cache the enumeration already warmed. The returned map is read-only,
+transitively.
+
+Failure is deliberately asymmetric, because an enumeration returning fewer
+objects reads as "no access" while one returning more is an authorization bug:
+
+- no source wired, or no provider for the candidate's object-type →
+  `APERTURE_PROVIDER_UNREGISTERED`, never a silently empty result. Note the
+  predicate runs **per candidate**, so this only surfaces when the enumeration
+  has at least one ALLOWED candidate; an empty allowed set returns empty
+  regardless of wiring;
+- the object has no metadata row (`APERTURE_NOT_FOUND` from `Fetch`) → every
+  field is absent, absent never matches, so the object is EXCLUDED — the
+  restrictive direction;
+- any other provider failure → surfaced verbatim.
+
+`EnumerateBatch` and `EnumerateAs` carry `Fields` through the same shared path.
+For how each non-Go surface spells it — the Twirp `map<string,
+google.protobuf.Value>` and its `>2^53` caveat, the CLI's `--field` /
+`--fields-json` precedence, and the MCP schema's load-bearing `omitempty` — see
+`skills/api-surface.md`.
 
 ## The Explain trace (public contract)
 
@@ -160,23 +216,34 @@ Enumerate/Explain over implicit/exclusive/rule strategies need the E2 pieces
 wired together:
 
 ```go
-eng := engine.New(store, engine.WithScopeResolution(nil,
-    engine.ScopeDeps{Lister: providerRegistry, Rules: rulesEngine}))
+eng := engine.New(store,
+    engine.WithScopeResolution(nil,
+        engine.ScopeDeps{Lister: providerRegistry, Rules: rulesEngine}),
+    engine.WithMetadata(providerRegistry))
 svc := service.New(eng)
 ```
 
-`*provider.Registry` satisfies the `ObjectLister` seam and `*rules.Engine`
-satisfies the `RuleEvaluator` seam. The assembly is optional — with no
-providers the literal default still works, and Check never needs the lister
-(membership is computable without enumeration).
+`*provider.Registry` satisfies the `ObjectLister` seam, `*rules.Engine`
+satisfies the `RuleEvaluator` seam, and the same registry satisfies
+`MetadataFetcher` for `Enumerate`'s field predicates. The assembly is optional —
+with no providers the literal default still works, Check never needs the lister
+(membership is computable without enumeration), and an unfiltered Enumerate never
+needs the metadata source. Note `WithMetadata` takes the **strict** registry, not
+the lenient fetcher a rule uses: leniency is right for a rule (empty metadata,
+rule denies) and wrong here, where it would turn a misconfiguration into an empty
+result.
 
 **Every Aperture surface assembles the same graph.** `internal/cli` builds it
-once (`buildDecisionStack`) and both `serve` and the one-shot commands —
-`check`, `enumerate`, `identifiers`, `explain` — use that one builder. This is
+once (`buildDecisionStack`) and `serve`, the one-shot commands — `check`,
+`enumerate`, `identifiers`, `explain` — and `aperture mcp` all use that one
+builder. This is
 load-bearing, not tidiness: the one-shot commands used to construct
 `service.New(engine.New(store))` with no rules engine and no scope resolution, so
 a permission with a rule-backed strategy had no `RuleEvaluator`, the resolver
 reported `APERTURE_SCOPE_RULE_UNCONFIGURED`, and the facade folded that into a
 fail-closed deny. The CLI returned a **different verdict** from the server for
 the same model. A surface that skips the assembly does not merely lose
-diagnostics — it decides differently.
+diagnostics — it decides differently. `aperture mcp` was the last surface still
+building a bare `engine.New(store)`; once the metadata filter landed, a filtered
+`aperture_enumerate` there could only report `APERTURE_PROVIDER_UNREGISTERED`
+however well the seed declared its objects. It now shares the builder.

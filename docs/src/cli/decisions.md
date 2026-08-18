@@ -120,6 +120,70 @@ bin/aperture enumerate alice read 'account:acme/project:atlas/document:*' \
   --seed ./model-with-providers.yaml --limit 100
 ```
 
+### Narrowing by object metadata
+
+`--field` and `--fields-json` filter the listing by the objects' **metadata** —
+"which of the datasets I may list carry brand Y?". They apply on top of the
+access decision, so they can only ever *remove* objects from the list; an object
+a `check` would deny is never returned however the predicate is written.
+
+The predicate is **typed**: a field matches only when its value equals the wanted
+value *and* is of the same kind, so the string `"5"` never matches the number
+`5`. A shell flag only carries a string, and guessing which strings are "really"
+numbers would make `enumerate` return objects `check` then denies — so there are
+two flags rather than one, and each says what it sends:
+
+| Flag | Sends | Notes |
+|---|---|---|
+| `--field key=value` | **always a string** | Repeatable. Everything after the first `=` is the value, so `--field expr=a=b` wants `"a=b"`. |
+| `--fields-json '{…}'` | a JSON object — real numbers, bools, lists | Use it when the metadata value genuinely is not a string. |
+
+**Both may be given.** `--fields-json` is merged **first** and `--field` entries
+then **override it by key**, so a stored JSON body can be reused with one value
+swapped from the shell.
+
+```bash
+# a string field
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --field tier=premium
+
+# a list field, matched by MEMBERSHIP — "datasets carrying brand Y"
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --field brands=brand:Y
+
+# seats is a NUMBER, so it needs the JSON spelling; --field seats=5 matches nothing
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --fields-json '{"seats":5,"active":true}'
+
+# merged: seats from JSON, tier overridden from the shell
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --fields-json '{"seats":5,"tier":"basic"}' --field tier=premium
+```
+
+The rules the listing obeys:
+
+- **Predicates are ANDed** — every one must hold.
+- **A list-valued field matches by membership**; a whole list in
+  `--fields-json` is a container compared by equality.
+- **A field the object does not carry never matches** — not even against
+  `null`.
+- **Filtering happens before `--limit`.** `--field tier=premium --limit 10` gives
+  the first ten *premium* objects, not the premium ones among the first ten
+  candidates.
+
+A malformed predicate is a usage error (`APERTURE_INVALID_INPUT`) naming the
+offending text — a `--field` with no `=`, an empty key, a `--fields-json` that is
+not JSON or is JSON but not an object. It is never silently skipped: a dropped
+predicate would *widen* the result, and a filter that silently widens is a filter
+that authorizes. Parsing happens before the store is opened, so a usage error
+never boots a decision stack.
+
+Filtering needs an object source for the type, exactly as enumeration itself
+does. A model that declares none reports `APERTURE_PROVIDER_UNREGISTERED` rather
+than printing nothing — an empty list would read as "no access". (Because the
+predicate is applied per candidate, you only see that error once the principal is
+allowed at least one object under the pattern.)
+
 Full flags: [`enumerate`](../reference/cli.md#aperture-enumerate).
 
 ## `identifiers` — a type's valid instance ids

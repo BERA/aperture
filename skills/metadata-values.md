@@ -476,6 +476,15 @@ Two properties are load-bearing:
 - **A want that is itself a container compares by equality at both ends**, since
   no element of a legal array (scalars only) could ever equal an array or object.
 
+The same rule governs the **enumerate metadata filter**
+(`engine.EnumerateRequest.Fields`, and its `service.EnumerateQuery.Fields` /
+`--field` / `--fields-json` / Twirp `fields` / MCP `Fields` spellings): it calls
+`provider.MatchFields` too, so a shape that behaves one way inside a provider's
+`Query` behaves identically when the engine filters an enumeration. Two rules are
+the enumeration's own rather than the value model's — the predicate runs only on
+candidates that already survived deny-overrides, and it runs **before** the
+enumeration's `Limit`. See `skills/decision-api.md`.
+
 `provider.ValuesEqual` is the exported leaf comparison. It **reimplements**
 expr-lang's equality rather than importing it, because `provider/` is a strict
 leaf; `csvprovider/membership_equivalence_test.go` runs both over the same
@@ -526,7 +535,7 @@ Changing the value model means changing all of these in the same PR:
 |---|---|
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
 | The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | the "Dates" section above + `docs/src/concepts/providers.md` |
-| The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md` |
+| The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md`, **and** every restatement of it on the enumerate filter (`skills/api-surface.md`, `skills/decision-api.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/cli/decisions.md`) |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
 | A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |

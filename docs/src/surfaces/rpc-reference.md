@@ -47,8 +47,8 @@ and always answer fail-closed.
 |---|---|---|
 | `Check` | `CheckRequest` → `Decision` | Is `principal` allowed `action` on `object` in `account`? Returns `allow`, a `reason`, and the deciding grant ids. |
 | `CheckBatch` | `CheckBatchRequest` → `CheckBatchResponse` | Many `Check`s in one call; results are index-aligned, each either a `Decision` or a per-item error code+message. |
-| `Enumerate` | `EnumerateRequest` → `EnumerateResponse` | Which object ids matching `pattern` may `principal` take `action` on? Optional `limit`. |
-| `EnumerateBatch` | `EnumerateBatchRequest` → `EnumerateBatchResponse` | Batched `Enumerate`; index-aligned results. |
+| `Enumerate` | `EnumerateRequest` → `EnumerateResponse` | Which object ids matching `pattern` may `principal` take `action` on? Optional `fields` (an object-metadata filter, below) and `limit`. |
+| `EnumerateBatch` | `EnumerateBatchRequest` → `EnumerateBatchResponse` | Batched `Enumerate`; index-aligned results. Each query embeds an `EnumerateRequest`, so `fields` is per-query. |
 | `Explain` | `CheckRequest` → `ExplainResponse` | The full decision derivation for a query, as `trace_json` (the recursive engine `Trace`, not modelled in proto). |
 | `ExplainBatch` | `CheckBatchRequest` → `ExplainBatchResponse` | Batched `Explain`; index-aligned `trace_json` or per-item error. |
 
@@ -61,6 +61,71 @@ curl -s -X POST http://localhost:8080/twirp/aperture.ApertureService/Enumerate \
 ```json
 { "object_ids": ["doc:42", "doc:77"] }
 ```
+
+### `EnumerateRequest.fields` — the object-metadata filter
+
+`EnumerateRequest` carries an **optional** `fields` map (field 6,
+`map<string, google.protobuf.Value>`) that narrows the result by object
+metadata. Omitting it filters nothing, so an existing client is unaffected.
+
+```bash
+curl -s -X POST http://localhost:8080/twirp/aperture.ApertureService/Enumerate \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"acme","principal":"alice","action":"read","pattern":"account:acme/**",
+       "fields":{"tier":"premium","seats":5,"brands":"brand:Y"},"limit":50}'
+```
+
+**Semantics** — the same contract a provider's own
+[`Filter.Fields`](../concepts/providers.md#the-filterfields-contract) obeys,
+evaluated by the same code, so a filtered enumeration and a provider-side query
+select the same objects:
+
+| Rule | Meaning |
+|---|---|
+| **AND across keys** | Every predicate must hold. |
+| **Membership on collections** | A list-valued *metadata* field matches when it **contains** the wanted value (`"brands": "brand:Y"`). A list-valued *want* is a container compared by equality. |
+| **Absent never matches** | An object whose metadata lacks the key is excluded — not even a `null` want matches it. |
+| **Typed comparison** | Numbers compare across numeric types by value (`5` matches an `int64` 5), but the string `"5"` never matches the number `5`, and vice versa. |
+| **Filter before `limit`** | Candidates are decided, then filtered, then truncated. Truncating first would return the matches among the first `limit` candidates rather than the first `limit` matches — a silently wrong answer. |
+| **Filter only subtracts** | The predicate runs on candidates that already survived deny-overrides, so it can never surface an object `Check` would deny. |
+
+**Why `Value` and not a JSON string.** The predicate compares by *type*, so the
+string/number/bool/list distinction has to be visible in the schema — a JSON blob
+in a `string` field would be opaque to every generated client and unvalidatable
+at the boundary. Each `Value` kind maps to exactly one shape, recursively, with
+no coercion between kinds: `null`→absent-ish nil, `number`→float64,
+`string`→string, `bool`→bool, `list`→array, `struct`→object.
+
+> **Caveat: integers beyond 2^53.** `google.protobuf.Value` carries every number
+> as a **double**, so an integer larger than 2^53 loses precision in transit.
+> Send such a key as a **string** and store it as a string in metadata. Nothing
+> in the conversion can repair the loss — it is a property of `Value` itself.
+> (`internal/wire/rpc`'s `TestFieldsRoundTrip_LargeIntegerLosesPrecision` pins
+> this, and fails loudly if it ever stops holding.)
+
+**Rejections** are `APERTURE_INVALID_INPUT` / 400, never a dropped predicate — a
+dropped predicate widens the result, and a filter that silently widens is a
+filter that authorizes:
+
+- a **non-finite** number (NaN, ±Inf). It would otherwise become the string
+  `"NaN"`, an unsatisfiable predicate that reads as "no access". Note protojson
+  cannot marshal a non-finite `Value` at all, so only the binary codec can reach
+  this guard;
+- a `Value` with no kind set (unreachable from a generated client, reachable from
+  a hand-rolled one).
+
+In `EnumerateBatch` a malformed predicate fails **only its own item** — that
+item carries the error code/message and never an empty `object_ids`, and the rest
+of the batch runs.
+
+**Wiring**: the server must have an object-metadata source (the same provider
+registry that backs object listing). Filtering a type with no registered
+provider, or with no source configured at all, is
+`APERTURE_PROVIDER_UNREGISTERED` / 404 rather than an empty list — an empty list
+would read as "no access" and hide the misconfiguration. Because the predicate
+runs per candidate, that error only appears when the enumeration has at least one
+allowed candidate. An object the provider has no row for is simply **excluded**
+(every field absent, and absent never matches).
 
 ## Entity CRUD
 

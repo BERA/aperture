@@ -9,6 +9,10 @@ description = "Fine-grained access-control engine for the frankbardon/* family"
 build-dir = "book"
 
 [output.html]
+# Off deliberately: this is a technical book full of literal shell text, and
+# smart punctuation rewrote every CLI long flag into an en dash — the generated
+# reference rendered `--field` as `–field`, which is not a flag that exists.
+smart-punctuation = false
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/frankbardon/aperture"

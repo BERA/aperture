@@ -37,10 +37,35 @@ tool identity), so the SDK-free core and the SDK adapter never drift.
 |---|---|---|
 | `aperture_check` | Decide whether a principal may take an action on an object, scoped to an account. Returns the verdict (allow/deny), a human-readable reason, and the deciding grant ids. **Fail-closed:** an operational failure renders as a *deny*, not an error; only an ill-formed question is an error. | `service.Check` |
 | `aperture_check_batch` | Decide many `(account, principal, action, object)` questions in one round-trip; `results[i]` answers `queries[i]`. A single ill-formed query carries its error in that item without failing the batch. | `service.CheckBatch` |
-| `aperture_enumerate` | List the object ids under a pattern a principal may act on — the inverse of `aperture_check`. Deny-overrides and specificity are honoured, so a denied object is never returned. | `service.Enumerate` |
-| `aperture_enumerate_batch` | Enumerate accessible objects for many queries in one round-trip, aligned with the input queries. | `service.EnumerateBatch` |
+| `aperture_enumerate` | List the object ids under a pattern a principal may act on — the inverse of `aperture_check`. Deny-overrides and specificity are honoured, so a denied object is never returned. Takes an optional `Fields` metadata filter (below). | `service.Enumerate` |
+| `aperture_enumerate_batch` | Enumerate accessible objects for many queries in one round-trip, aligned with the input queries. Each query carries its own `Fields`. | `service.EnumerateBatch` |
 | `aperture_explain` | Return the full structured decision trace for one question: the expanded subject set, every grant considered with its per-grant outcome, which grants decided, and the final verdict. Use to understand *why*. | `service.Explain` |
 | `aperture_explain_batch` | Return decision traces for many questions in one round-trip, aligned with the input queries. | `service.ExplainBatch` |
+
+#### `aperture_enumerate`'s `Fields` filter
+
+`Fields` is an **optional** object of metadata predicates that narrows the
+listing — "which of the datasets alice may list carry brand Y?". Omit it to
+filter nothing; it is not a required property, so an unfiltered enumerate is a
+valid call for a schema-validating client.
+
+```json
+{
+  "Account": "acme", "Principal": "alice", "Action": "list",
+  "Pattern": "account:acme/**",
+  "Fields": { "tier": "premium", "seats": 5, "brands": "brand:Y" }
+}
+```
+
+The predicates are **ANDed**; a field the object does not carry **never
+matches**; a **list-valued field matches by membership**; everything else is
+**typed equality**, so `"5"` never matches `5`. The filter runs on objects the
+principal is already allowed — it can only remove ids, never add one — and it is
+applied **before** `Limit`, so `Limit: 10` returns the first ten *matches*.
+
+The schema is reflected straight off `service.EnumerateQuery`, so the tool input
+and the Go facade query are the same type; the semantics above are carried in the
+property description an agent reads.
 
 ### What-if simulation (read-only, never persisted)
 

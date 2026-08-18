@@ -82,6 +82,15 @@ mode:
   compared *by equality*, never by key membership — so a scalar want against one
   is a plain `false`, not a panic and not an accidental rendering match.
 
+The contract reaches past `Query`. `Enumerate`'s own metadata filter
+(`engine.EnumerateRequest.Fields`, and its `EnumerateQuery.Fields` /
+`--field` / `--fields-json` / Twirp `fields` / MCP `Fields` spellings) is
+evaluated by this same `provider.MatchFields`, so an enumeration filtered by the
+engine and one filtered inside a provider select the same objects. There the
+filter runs on candidates that already survived deny-overrides, and it runs
+*before* the enumeration's `Limit` — see
+[the decision API](../library/decision-api.md#filtering-by-object-metadata).
+
 Because `provider` is a strict leaf (`identity` + `errors` + stdlib), `ValuesEqual`
 **reimplements** the evaluator's equality rather than importing `expr-lang`. It
 agrees with it on every value the metadata value model admits; the two documented
