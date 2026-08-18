@@ -6,8 +6,8 @@ does not own. That data belongs to the **host application** — its database, it
 API, its source of truth — and Aperture reaches it through **providers**. A host
 implements one `ObjectProvider` per object-type; a `Registry` binds each type to
 its provider plus a per-type cache and is the seam every consumer resolves
-through. The code lives in the `provider` package; `csvprovider` is a concrete
-worked example.
+through. The code lives in the `provider` package; `csvprovider` (a file) and
+`sqlprovider` (a database) are the two concrete worked examples.
 
 A load-bearing rule: **Aperture never persists provider data as a source of
 truth.** The host owns it; Aperture only ever caches a copy. Cached metadata is
@@ -287,10 +287,10 @@ observability and the latency benchmark. The `provider` package depends only on
 ## Worked example: `csvprovider`
 
 `csvprovider` implements `ObjectProvider` over a CSV file, so a host can wire real
-object data during development before a database-backed provider exists. It is a
-drop-in adapter: register a `*Provider` under an object-type exactly as a future
-SQL-backed provider would be, and the Registry's cache, invalidation, and rules
-wiring are unchanged.
+object data during development before pointing Aperture at its database. It is a
+drop-in adapter: register a `*Provider` under an object-type exactly as the
+[SQL-backed provider](#worked-example-sqlprovider) is registered, and the
+Registry's cache, invalidation, and rules wiring are unchanged.
 
 ```go
 reg := provider.NewRegistry()
@@ -501,6 +501,182 @@ when called standalone.
 
 Like the core packages, `csvprovider` imports only `errors`, `identity`, and
 `provider` plus the standard library — pure-Go and CGO-free.
+
+## Worked example: `sqlprovider`
+
+`sqlprovider` implements `ObjectProvider` over a relational database, so a host
+serves its real objects from the tables it already has instead of exporting them
+to a CSV. It is a drop-in sibling of `csvprovider` — the Registry's cache,
+invalidation, and rules wiring are identical — and it is a **host** data source,
+unrelated to Aperture's own [storage](storage.md) and sharing no connection
+handling with it.
+
+```go
+db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))   // the host's driver, the host's pool
+if err != nil {
+    return err
+}
+defer db.Close()
+
+brands, err := sqlprovider.New(db, sqlprovider.Config{
+    ObjectType: "brand",
+    FetchQuery: `SELECT tier, seats, to_jsonb(tags) AS tags FROM brands WHERE id = $1`,
+    ListQuery:  `SELECT 'brand:' || b.id AS id, b.tier, b.seats FROM brands b`,
+})
+if err != nil {
+    return err
+}
+reg.MustRegister("brand", brands, provider.WithTTL(30*time.Second))
+```
+
+A [seed document](seed.md#database-backed-providers) declares the same thing in
+YAML with no Go code at all.
+
+### Cast it in the statement
+
+This is the part a developer cannot skip. **The statement is the only typing
+mechanism there is** — there is no `:int` / `:list<T>` suffix here and no
+per-column type declaration in YAML, because the developer is already writing a
+`SELECT` list and two spellings for one intent drift apart. A column becomes a
+metadata field of whatever Go type `database/sql` scanned it into.
+
+| Rule | Write |
+|---|---|
+| **An array must be cast to JSON** — the only way a list-valued field arrives as a list | `to_jsonb(tags) AS tags` |
+| **A day-granular date must be cast to text** — every `time.Time` becomes the *datetime* form | `hired_on::text AS hired_on` |
+| **A `numeric` must be cast** — `::float8` if it is a number, `::text` if it is an identifier | `amount::float8 AS amount` |
+| **The identity is composed in the `id` column**, by the developer; Aperture supplies no template | `'brand:' \|\| b.id AS id` |
+
+#### The trap this package cannot catch for you
+
+Selecting an array column without casting it compiles, runs, and is wrong:
+
+```sql
+SELECT tags FROM brands WHERE id = $1        -- WRONG
+SELECT to_jsonb(tags) AS tags FROM brands WHERE id = $1   -- RIGHT
+```
+
+A Postgres `text[]` does not arrive as a list. It arrives as the raw array
+literal — the string `{a,b}` — which is a perfectly valid metadata string,
+indistinguishable from a string a host meant to store. Nothing in the provider
+can tell them apart, so nothing will complain. What happens instead is that
+**every membership predicate over that field silently matches nothing, forever**,
+and the rule reads as though it never applies. If a list-valued field is matching
+nothing, check its cast first.
+
+### Driver values become metadata
+
+The mapping from a scanned Go type to a metadata value is a **closed table**, not
+an inference — an inference would be a value the expression evaluator silently
+mis-compares:
+
+| Scanned Go type | Metadata value |
+|---|---|
+| `nil` (SQL NULL) | the field is **omitted** — the same absent-vs-zero rule as an empty CSV cell |
+| `bool` / `int64` / `float64` / `string` | the scalar, as-is |
+| `[]byte` | **JSON-decoded** — how arrays and nested objects arrive |
+| `time.Time` | `.UTC()`, then the canonical `2006-01-02T15:04:05Z` |
+| anything else | `APERTURE_SQL_PROVIDER_SCAN` naming the column, the row, and the Go type |
+
+A `[]byte` is JSON **unconditionally** — it never falls back to a string, because
+a fallback would let one column change *type* depending on its contents. So a
+`bytea` column does not work: encode it in the statement (`encode(bytes,'base64')`)
+or leave it out. A `time.Time` is converted to UTC *first*, because a
+`timestamptz` comes back in the process's local zone, then routed through
+`provider.ParseDateValue` like every other loader's date. Numbers inside a JSON
+column normalise exactly as scalar columns do, so
+`object.limits.seats == object.seats` is not a silent `false`. Every mapped row is
+then checked against the [value model](#the-metadata-value-model).
+
+### Fetch, List, and the id column
+
+`Fetch` binds the identity's **terminal segment value**, not the identity string
+— `brand:42` and `account:acme/brand:42` both bind `"42"` — so the statement can
+say `WHERE b.id = $1` against the primary key it already has and hit its index.
+Placeholders are **engine-native and passed through untouched** (`$1` for
+Postgres, `?` for MySQL or SQLite); there is no dialect rewriting. Parameters are
+always bound, never interpolated — that is the SQL-injection boundary of the
+feature and it is not configurable.
+
+Zero rows is `APERTURE_NOT_FOUND`; **more than one row is
+`APERTURE_SQL_PROVIDER_AMBIGUOUS`** and the first row is never silently taken,
+because without an `ORDER BY` which row that is would be unspecified, and an
+object's metadata must not vary between two identical `Check`s.
+
+`List` and `Query` run a **second** statement that takes no parameters, and its
+`id` column carries each row's full identity. The id column takes a `string`, or
+a `[]byte` read as **raw text** — deliberately unlike a metadata column, where a
+`[]byte` is JSON, because the id is not metadata and has no competing JSON
+reading. A row Aperture cannot place — no id column, a NULL/empty/non-textual id,
+an unparseable identity, or an identity whose terminal segment type is not this
+provider's object-type — is `APERTURE_SQL_PROVIDER_ROW_IDENTITY` naming the row's
+position, never a row silently skipped. A short enumeration reads as "no access"
+one layer up, and a wrong-type row would be cached under an identity this
+provider's own `Fetch` could never return.
+
+`Query` applies `Filter.Fields` with `provider.MatchFields`, **in Go** — the
+predicates are never templated into the developer's SQL. Comparison in
+[the contract](#the-filterfields-contract) is typed (`"5" != 5`) and matches
+collections by membership, which is the rules engine's own semantics; Postgres
+would happily coerce `'5'` to `5`, so a predicate rendered into SQL would answer a
+different question than the rule evaluated over the same field. The cost is
+honest: the whole object-type is materialised per enumeration, and the Registry's
+per-type TTL cache is what absorbs it.
+
+Rows stream, and the limit stops the read. One consequence worth knowing: **a
+`Limit` that truncates before a malformed row is reached will not surface that
+row's error** — the same enumeration with a larger limit can fail where the
+bounded one succeeded. `rows.Err()` is checked unconditionally after the loop, so
+a connection that dies mid-result is never reported as a short but successful
+enumeration.
+
+### Timeouts and errors
+
+Every statement runs under `context.WithTimeout` — `DefaultTimeout` is **5s** —
+applied on top of the caller's own context, so the earlier deadline wins. A
+`Fetch` sits under `Check`, which owes a p99 under a millisecond; an unbounded
+query against a host database is not a slow decision but one that never returns.
+There is no "no timeout" setting.
+
+Failures are `APERTURE_SQL_PROVIDER_QUERY` (driver or connection, wrapping the
+cause), `_AMBIGUOUS`, `_SCAN`, `_ROW_IDENTITY`, and — for the declarative wiring
+— `_DSN_LITERAL` and `_CONNECTION`. Every diagnostic names the developer's own
+inputs (the column, the object-type, the row's position, the identity) and never
+a row value, which is host data belonging to some account. An error already
+carrying an `APERTURE_*` code — one a host's wrapping `Querier` raised — passes
+through verbatim.
+
+### The `Querier` seam
+
+The dependency is not a `*sql.DB` but a two-method interface:
+
+```go
+type Querier interface {
+    QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+    QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+```
+
+A `*sql.DB` satisfies it, and so does an `*sql.Conn`, an `*sqlx.DB`, a pgx stdlib
+handle, a `*sql.Tx`, or a host's own tracing, retrying, or read-replica wrapper.
+On this path Aperture owns **no connection lifecycle**: it does not open, close,
+ping, pool, or configure anything. That is also why `sqlprovider` imports **no
+driver** — its dependencies are `database/sql`, `errors`, `identity`, and
+`provider` — so a host that never uses it pays nothing for it, and a host that
+does picks its own driver.
+
+The [seed package](seed.md#database-backed-providers) is the one place Aperture
+links a driver itself: `github.com/jackc/pgx/v5/stdlib`, through `database/sql`,
+Postgres only. It was chosen over `lib/pq` on a **correctness** argument despite
+costing far more binary — `lib/pq` returns `[]byte` for `numeric` and `uuid`,
+which the value model cannot distinguish from `jsonb`, so a `numeric` of `1.50`
+would silently arrive as the float `1.5`. Measured with the project's own build
+flags, `lib/pq` costs +96,432 bytes (+0.34%) and pgx +3,589,088 bytes (+12.5%);
+the whole SQL-provider epic took the stripped binary from 28,621,090 to
+32,867,698 bytes (+14.8%). Both are pure Go, so `CGO_ENABLED=0` holds.
+
+For the full reference — the connection defaults, the pool-sharing rule, and the
+gated real-Postgres test — see the `sql-provider` skill document.
 
 ## In-memory objects: `provider.Static`
 

@@ -21,10 +21,14 @@ groups:        [ ... ]
 grants:        [{ id: g1, account: acme, subject: { kind: principal, id: alice }, permission: doc.read, object: "account:acme/document:*", effect: allow }]
 templates:     [ ... ]
 rules:         [ ... ]
+connections:   { ... }   # named database connections — runtime wiring (see below)
 providers:     [ ... ]   # runtime wiring, not model state (see below)
 objects:       [ ... ]   # inline object metadata — also wiring, not model state
 field_types:   [ ... ]   # declared types for inline metadata fields — also wiring
 ```
+
+`connections:` is a **map** keyed by name, not a list: the name is what a
+provider entry's `connection:` refers to, and a map cannot declare one twice.
 
 Every field mirrors its `model` counterpart in declarative form. The `Document`
 started as a minimal seed shape and was generalized to the complete model, so **an
@@ -228,23 +232,24 @@ row for it and an export never reproduces it.
 `providers:` and `objects:` can each claim the same object type. **Precedence is
 type-level and total:**
 
-> If a `providers:` entry exists for an object type, the file-backed provider
-> wins and **every** inline `objects:` entry for that type is discarded.
+> If a `providers:` entry exists for an object type, the declared provider —
+> `csv` or `sql` alike — wins and **every** inline `objects:` entry for that type
+> is discarded.
 
 There is **no object-level merge, no field-level merge, and no fallback**. An
-inline id the file happens to lack is simply not resolvable — `Fetch` returns
-`APERTURE_NOT_FOUND` and enumeration never lists it, exactly as if the entry had
-never been written. A field only the inline entry declared does not appear on an
-object the file *does* carry.
+inline id the provider's source happens to lack is simply not resolvable —
+`Fetch` returns `APERTURE_NOT_FOUND` and enumeration never lists it, exactly as
+if the entry had never been written. A field only the inline entry declared does
+not appear on an object the source *does* carry.
 
 That is deliberate. Field-level merging is the most useful-sounding behaviour and
-the most impossible to debug: a rule reading a field the CSV silently did not
-override is a support ticket nobody can reproduce. Predictability wins.
+the most impossible to debug: a rule reading a field the CSV or table silently
+did not override is a support ticket nobody can reproduce. Predictability wins.
 
 **This is the default. A collision builds, it does not fail.** Pointing a type at
-a CSV while its inline entries are still in the file is an ordinary migration
-step, not an authoring fault — a seed that booted yesterday must not refuse to
-boot today because someone added a `providers:` row.
+a CSV or a table while its inline entries are still in the file is an ordinary
+migration step, not an authoring fault — a seed that booted yesterday must not
+refuse to boot today because someone added a `providers:` row.
 
 The discard is not silent, though. `BuildRegistry` needs no logger to say so,
 because the document can be asked directly:
@@ -287,11 +292,128 @@ so a malformed declaration fails the load whether or not its type ultimately
 loses to a `providers:` entry. Otherwise a document would silently stop being
 validated the day someone added a CSV for one of its types. The canonicalised
 values are then discarded along with the rest of those entries: a `field_types:`
-declaration never reaches the rows the file-backed provider serves.
+declaration never reaches the rows a declared provider serves — a SQL provider's
+column typing lives in its statement's casts, not here.
 
 Two `providers:` entries for one type remain a duplicate registration,
 `APERTURE_PROVIDER_INVALID` — that is a straight contradiction with no winner to
 pick, not a precedence question.
+
+## Database-backed providers
+
+A `providers:` entry declares its `kind`. `csv` names a file resolved relative to
+the seed file; **`sql`** names two statements run against a **connection**
+declared in the document's top-level `connections:` block. Together they make a
+database-backed deployment a no-Go-code experience:
+
+```yaml
+connections:
+  main:
+    dsn_env: APP_DATABASE_URL     # required — the ONLY way to supply a DSN
+    max_open_conns: 8             # optional
+    max_idle_conns: 4             # optional
+    conn_max_lifetime: 1h         # optional
+    query_timeout: 3s             # optional
+
+providers:
+  - object_type: brand
+    kind: sql
+    connection: main
+    get_one: SELECT tier, seats, to_jsonb(tags) AS tags FROM brands WHERE id = $1
+    get_all: SELECT 'brand:' || b.id AS id, b.tier, b.seats FROM brands b
+    ttl: "30s"
+```
+
+| Provider key | Meaning |
+|---|---|
+| `connection` | the `connections:` entry to read through. Required for `kind: sql`; a name with no matching entry is a hard error at build. |
+| `get_one` | the "get one" statement, taking **exactly one** placeholder, to which the identity's terminal segment value is bound |
+| `get_all` | the "get all" statement, taking **no** parameters and selecting each row's full identity as the id column. Required alongside `get_one` — a provider that could be fetched from but not enumerated would answer `List` with an error, and an errored enumeration reads as "no access". |
+| `id_column` | the `get_all` result column holding the identity. Default `id`. |
+| `ttl` / `max_size` | the per-type cache options, as for any provider entry |
+
+The statements are the developer's own, and **the `SELECT` list is where a
+column's type is decided** — there is no per-column type declaration here the way
+a CSV header carries `:int`. Cast arrays with `to_jsonb(...)`, day-granular dates
+with `::text`, and a `numeric` with `::float8` or `::text`; compose the identity
+in the id column. Getting a cast wrong is not always an error — `SELECT tags`
+yields the raw array literal as a **string**, and every membership predicate over
+it then silently matches nothing. See
+[the SQL provider](providers.md#worked-example-sqlprovider).
+
+### There is no `dsn:` key
+
+A seed file is a committed artifact, and a DSN carries a password. Naming an
+environment variable is therefore not the recommended spelling — it is the only
+one. A literal `dsn:` is refused by `Parse` with
+`APERTURE_SQL_PROVIDER_DSN_LITERAL`, **before the document is usable for
+anything**: not by `Apply`, not by an export round-trip, not by a tool that only
+wanted to read the object types. The refusal names the offending connection and
+never the value, and any DSN is redacted out of driver messages these errors
+carry.
+
+### One pool per named connection, and its defaults
+
+The pool is opened **once per declared connection** and shared by every provider
+entry naming it: three `kind: sql` entries over one database are three providers
+and one pool. Every *declared* connection is opened, not only the referenced
+ones — a declared-but-unused name is far more likely a typo'd `connection:` than
+a deliberate spare. The **query timeout belongs to the connection**, since it is a
+property of the database being read.
+
+| Key | Default | Notes |
+|---|---|---|
+| `query_timeout` | `5s` | bounds **one** statement. Must be positive — there is no "no timeout" setting, because an unbounded statement under `Check` is an unbounded decision. |
+| `max_open_conns` | `10` | deliberately *not* `database/sql`'s unlimited default; negative restores it. An unbounded pool lets a burst of `Check`s exhaust the host's server. |
+| `max_idle_conns` | `5` | zero or negative retains none. Provider traffic is bursty, so keeping half the pool warm avoids re-paying TLS and auth on every wave. |
+| `conn_max_lifetime` | `30m` | `"0"` means reuse forever. A finite lifetime is what survives a connection proxy or a failover pair. |
+
+Durations are Go durations (`"30m"`, `"500ms"`). An unparseable one, a negative
+`conn_max_lifetime`, or a non-positive `query_timeout` is
+`APERTURE_SQL_PROVIDER_CONNECTION` at build.
+
+### Pools have a lifetime, so the build signature changes
+
+A document that declares `connections:` **cannot** be built through the
+one-return `BuildRegistry` — a pool has a lifetime that signature cannot hand
+back, so rather than open pools nothing can close, it refuses the document with
+`APERTURE_SQL_PROVIDER_CONNECTION` naming the call that works:
+
+```go
+reg, conns, err := doc.BuildRegistryWithConnections(dir)
+if err != nil {
+    return err
+}
+defer conns.Close()
+```
+
+This is the one place a *valid* seed file fails the simple call. Every other
+document — `csv` providers, inline `objects:`, no `connections:` block — still
+builds through `BuildRegistry` unchanged.
+
+`*seed.Connections` is the registry's other half: a `*provider.Registry` holds no
+resources, the pools beneath a SQL-backed entry do. It is always non-nil on
+success and empty (`Close` a no-op) for a document declaring no connections, so a
+caller defers unconditionally without asking which kinds the seed used. `Close`
+is idempotent and joins the failures of every pool it closes. Aperture's own CLI
+owns and closes them for the duration of a command.
+
+### Nothing is dialled at build
+
+`sql.Open` is lazy and Aperture does **not** ping. A wrong host, port, password,
+or a database that is simply down surfaces on the **first decision that touches a
+SQL-backed object-type**, as `APERTURE_SQL_PROVIDER_QUERY` — not at startup.
+Making registry construction wait on a round-trip would make every
+`aperture check` a network operation, including the ones that touch no SQL-backed
+type, and would stop a process from booting while the host's database is still
+starting.
+
+Everything Aperture *can* decide without dialling is eager, because a connection
+that only fails under a decision fails as a **denial**: the `dsn_env` variable
+must be set and non-empty, the durations must parse, `query_timeout` must be
+positive, every `connection:` must name a declared connection, and both
+statements must be present. A failure takes the whole build with it and closes
+every pool opened so far, so a failed build strands nothing.
 
 ## What is *not* in the file
 
@@ -300,16 +422,21 @@ Two things are deliberately excluded from the model state file:
 - **Live host domain-object metadata** — that is the [provider](providers.md)
   cache: derived, disposable, never source of truth. Because `Export` reads storage
   back, and a provider produces no model rows, it is never reproduced.
-- **Runtime *wiring*** — the `providers:`, `objects:`, and `field_types:`
-  sections are runtime wiring, not model state. `Apply` never writes any of them
-  to storage; instead `Document.BuildRegistry(baseDir)` turns all three into a
-  live `*provider.Registry`. **The seed file is the source of truth for them**,
-  exactly as auth config is — and an export reproduces none of them. A declared
-  provider names an `object_type`, a `kind` (currently only `csv`), a `path`
-  (resolved relative to the seed file), and optional cache `ttl`/`max_size`. A
-  malformed entry is `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`.
-  When `providers:` and `objects:` claim one type, `providers:` wins the type
-  outright — see
+- **Runtime *wiring*** — the `connections:`, `providers:`, `objects:`, and
+  `field_types:` sections are runtime wiring, not model state. `Apply` never
+  writes any of them to storage; instead `Document.BuildRegistry(baseDir)` — or
+  `BuildRegistryWithConnections` when the document declares `connections:` —
+  turns them into a live `*provider.Registry`. **The seed file is the source of
+  truth for them**, exactly as auth config is — and an export reproduces none of
+  them. A declared provider names an `object_type`, a `kind` (`csv` or `sql`),
+  optional cache `ttl`/`max_size`, and then either a `path` (for `csv`, resolved
+  relative to the seed file) or a `connection` plus `get_one` / `get_all`
+  statements (for `sql` — see
+  [Database-backed providers](#database-backed-providers)). A malformed entry is
+  `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`, and a broken
+  connection declaration is `APERTURE_SQL_PROVIDER_CONNECTION` or
+  `APERTURE_SQL_PROVIDER_DSN_LITERAL`. When `providers:` and `objects:` claim one
+  type, `providers:` wins the type outright — see
   [When both sections claim a type](#when-both-sections-claim-a-type).
 
 ## Related

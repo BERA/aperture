@@ -25,10 +25,11 @@ the whole point.
 | An Aperture error code | `errors/codes.go` — the `AllCodes` slice and a `Registry` entry with a Message + Fixups | `TestCodesHaveFixups` |
 | A `skills/*.md` doc | its YAML frontmatter (`name` matching the file stem + `description`) | `TestEverySkillHasFrontmatter` |
 | The Update-Demand rule | `skills/update-demand.md` (it must stay present with frontmatter) | `TestUpdateDemandDocPresent` |
+| A table that exists in two places — the rule AST vs. the served `rules-serializer.js`, or the SQL driver-value type switch vs. `mappedDriverTypes` | the other half, plus the `skills/` doc that restates it | the registry-parity tests, e.g. `TestEditorOperatorTablesAgree` and `TestDriverValueMappingTableMatchesTheTypeSwitch` |
 
-As real surfaces land, each adds a `skills/<feature>.md` doc and a coverage gate
-in `skills/skills_test.go` that walks that surface's registry, plus a row in the
-`CLAUDE.md` table.
+`CLAUDE.md` carries the full table, row by row. As real surfaces land, each adds
+a `skills/<feature>.md` doc and a coverage gate in `skills/skills_test.go` that
+walks that surface's registry, plus a row there.
 
 ## The enforcing CI gates
 
@@ -49,6 +50,12 @@ they are the mechanical enforcement behind the rule:
   rule self-protecting.
 - **`TestEverySkillHasFrontmatter`** — every `skills/*.md` has a `name` (matching
   its file stem) and a `description` in its YAML frontmatter.
+- **The registry-parity gates** — they read the mirror of a Go table (a served JS
+  file, or the Go source itself) and **fail rather than skip** when it is
+  missing. `TestDriverValueMappingTableMatchesTheTypeSwitch` is the newest: it
+  parses `sqlprovider/values.go` with `go/ast` and fails if the driver-value type
+  switch and `mappedDriverTypes` disagree, so the mapping a developer reads and
+  the mapping the code performs cannot drift.
 
 ## How this differs from the doc generators
 

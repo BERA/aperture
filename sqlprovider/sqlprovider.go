@@ -32,6 +32,48 @@
 // connection handling with it: provider data is pulled, read-only, and never
 // persisted as source of truth.
 //
+// # The two wiring paths
+//
+// There are exactly two ways a *Provider comes to exist, and they MEET at New.
+//
+// The first is the Go path shown above: the host owns the handle, hands it over
+// as a Querier, and Aperture opens nothing. That is the path a library consumer
+// wants, and it is the only one this package knows about.
+//
+// The second is DECLARATIVE, and lives in the seed package: a document's
+// top-level connections: block names a database, and a kind: sql provider entry
+// names that connection and carries both statements inline, so a deployment
+// wires a real database with no Go code at all.
+//
+//	connections:
+//	  main:
+//	    dsn_env: APP_DATABASE_URL   # a literal dsn: is REFUSED at parse
+//	    query_timeout: 3s           # becomes Config.Timeout, per CONNECTION
+//	providers:
+//	  - object_type: brand
+//	    kind: sql
+//	    connection: main
+//	    get_one: SELECT tier, seats FROM brands WHERE id = $1   # → FetchQuery
+//	    get_all: SELECT 'brand:' || b.id AS id, b.tier FROM brands b  # → ListQuery
+//
+// Neither path is a special case of the other. seed resolves the connection
+// name to a pool and then calls THIS package's New with the same Config a host
+// fills in by hand, so every rule the constructor enforces — required
+// statements, the id column, the timeout — is enforced identically whichever way
+// the provider was declared. Everything documented below is therefore true of
+// both.
+//
+// The one asymmetry is resource ownership, and it is the seed package's, not
+// this one's: a declared connection opens ONE pool per NAME, shared by every
+// entry referencing it, and a pool has a lifetime. So a document declaring
+// connections: must be built with Document.BuildRegistryWithConnections and the
+// returned *Connections closed at shutdown; the one-return BuildRegistry refuses
+// such a document rather than opening pools nothing can close. That is also the
+// only place Aperture links a database driver (pgx, Postgres only) — this
+// package still links none. Nothing is pinged at build either way: a wrong host
+// or password surfaces on the first decision touching a SQL-backed type, as
+// APERTURE_SQL_PROVIDER_QUERY, not at startup.
+//
 // # What Fetch binds
 //
 // A fetch statement takes exactly ONE parameter, and Aperture binds the
@@ -116,6 +158,14 @@
 // field predicates, then the limit — so a bounded enumeration stops reading
 // early. A very large table will hurt; that is a known, accepted trade for not
 // having two comparison semantics.
+//
+// Stopping early has one consequence worth knowing: a LIMIT that truncates
+// before a malformed row is reached will NOT surface that row's error. The same
+// enumeration with a larger limit — or none — can fail where the bounded one
+// succeeded, because a row's error is a property of the rows actually READ, not
+// of the table. A row excluded by Filter.Pattern is the same story one step
+// earlier: its metadata is never mapped, so a bad column on it goes unreported.
+// Its IDENTITY still is — every scanned row's id column is checked.
 //
 // A mid-iteration failure is checked (rows.Err) after the loop and reported. It
 // is never a short but successful result: a truncated enumeration under-reports

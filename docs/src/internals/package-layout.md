@@ -21,6 +21,7 @@ this page is a map, not a re-explanation.
 | `scope/` | Pluggable scope-strategy resolvers (implicit / inclusive / exclusive) + a registry. | [Scopes & scope strategies](../concepts/scopes.md) |
 | `provider/` | The object-provider registry + per-type metadata cache. | [Providers](../concepts/providers.md) |
 | `csvprovider/` | A concrete `ObjectProvider` backed by a CSV file — the reference implementation. | [Providers](../concepts/providers.md) |
+| `sqlprovider/` | A concrete `ObjectProvider` backed by a relational database, over a two-method `Querier` seam. Links no driver. | [Providers](../concepts/providers.md#worked-example-sqlprovider) |
 | `auth/` | Authentication adapters (dev / OIDC / parsec) that turn a bearer into a principal. | [Authentication](../concepts/auth.md) |
 | `authz/` | The authorization gate that surfaces call to guard mutations. | [The authz gate](../concepts/authz.md) |
 | `audit/` | The decision/mutation audit log. | [Audit trail](../concepts/audit.md) |

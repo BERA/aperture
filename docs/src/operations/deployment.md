@@ -65,9 +65,19 @@ Aperture is configured, in order of increasing precedence:
    env var. For example `--auth oidc` wins over `APERTURE_AUTH_MODE=dev`.
 
 The seed **model** itself is authored as YAML (or JSON) and supplied with
-`--seed`; that document also carries the `providers:` wiring the server turns
-into a live object-provider registry. Model YAML is data, not process config —
-the two are separate.
+`--seed`; that document also carries the `connections:` and `providers:` wiring
+the server turns into a live object-provider registry. Model YAML is data, not
+process config — the two are separate.
+
+One deployment consequence of that split: a `kind: sql` provider names its
+database through `dsn_env:`, and a **literal `dsn:` in a seed file is refused at
+parse**. So each declared connection needs its environment variable exported
+where the process runs — the seed file names the variable, the environment holds
+the credential. Nothing is dialled at startup (`sql.Open` is lazy and Aperture
+does not ping), so a wrong host or password surfaces on the first decision
+touching a SQL-backed object-type as `APERTURE_SQL_PROVIDER_QUERY`, not as a
+failed boot. See
+[Database-backed providers](../concepts/seed.md#database-backed-providers).
 
 ### Authentication environment variables
 
