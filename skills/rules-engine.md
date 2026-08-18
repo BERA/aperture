@@ -542,7 +542,7 @@ object.hired_at: between bounds are inverted; the lower bound is after the upper
 Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
 `Actual` — carrying **shape and path only, never a metadata value**. That last
 point is not a nicety for dates: a date is often personal data (a birth date, a
-termination date), and the same trace crosses the Twirp and MCP surfaces. Four
+termination date), and the same trace crosses the Twirp and MCP surfaces. Five
 kinds are recorded today:
 
 - `shape_mismatch` — a collection operator met a non-collection, **or** a date
@@ -554,10 +554,27 @@ kinds are recorded today:
   canonical forms. `Expected` names the forms; the offending value never appears.
 - `date_bounds_inverted` — a `between` was written with its lower bound after its
   upper bound, so it matches nothing. `Path` names the compared field.
+- `dangling_reference` — a **declared object reference** pointed at an identity
+  the target type's provider no longer serves, so that identity was **skipped**
+  and the decision proceeded. `Path` is the declaration
+  (`dataset.current_brands`), `Expected` the declared target object-type,
+  `Actual` `"absent"`. The missing identity itself is never carried — it goes to
+  the operator's warning log instead. This is the one kind **not** recorded by
+  rule evaluation: it comes from the engine's enumeration path
+  (`engine/reference.go`), but it is the same class of observation and rides the
+  same collector, so it renders identically. See `skills/object-references.md`.
 
 The channel is opt-in and costs the decision path nothing: `Check` and
 `Enumerate` install no collector, so nothing is recorded and nothing is
-allocated; `Explain` installs one per grant. Direct library use:
+allocated; `Explain` installs one per grant.
+
+> **A `dangling_reference` therefore needs a collector the caller installs.**
+> `Explain` takes a single object and never dereferences, so there is no
+> `Explain`-of-an-enumeration to read it back from; wrap the `Enumerate` call in
+> `rules.WithNoteCollector` to see it. No non-Go surface does that today, so over
+> Twirp, the CLI, and MCP the **warning log is the only signal**.
+
+Direct library use:
 
 ```go
 ctx, notes := rules.WithNoteCollector(ctx) // engine.Explain does this for you

@@ -136,6 +136,47 @@ google.protobuf.Value>` and its `>2^53` caveat, the CLI's `--field` /
 `--fields-json` precedence, and the MCP schema's load-bearing `omitempty` — see
 `skills/api-surface.md`.
 
+## Enumerate's reference edges
+
+`EnumerateRequest.References` (`[]ReferenceEdge`, optional) restricts the result
+to the identities a holder object's DECLARED reference field contains — "the
+brands in dataset X". Nil or empty restricts nothing and consults no reference
+source.
+
+It is a **dereference, not a predicate**, which is why it is not another entry in
+`Fields`. `Fields` answers the mirror image ("which datasets contain brand Y?")
+because the dataset holds the field; a brand holds no field naming its datasets,
+so no predicate on brand can express the first question at all.
+
+Composition mirrors the filter's: several edges **AND**, an edge composes with
+`Fields`, both precede `Limit`, and restriction can only SUBTRACT. Exactly **one
+hop** is taken. The restriction is resolved **once per enumeration**, before
+candidates are gathered, against the same grants and subject set the candidates
+are decided with — so `EnumerateAs` checks the holder with the impersonated
+authority.
+
+The failure modes are the security model, and they are asymmetric on purpose:
+
+- an unreadable holder → **empty result, no error** (an error here is an oracle
+  for objects the caller was never allowed to know about);
+- an absent holder → `APERTURE_NOT_FOUND` **only** inside the request's account
+  and **only** for a member; out of account, or for a non-member, empty;
+- a dangling referenced identity → **skipped**, warning-logged, and noted as
+  `rules.NoteDanglingReference`;
+- an undeclared field, an unregistered holder type, or no reference source
+  (`engine.WithReferences`) → a **coded error**, never an empty list that would
+  read as "no access";
+- a value not pointing at the declared target →
+  `APERTURE_PROVIDER_REFERENCE_MISMATCH`.
+
+A rules-engine dereference is deliberately **not** supported: it would be a join
+on the `Check` hot path (p99 < 1ms) with a recursive cache-miss path behind it.
+
+`EnumerateBatch` and `EnumerateAs` carry `References` through the same shared
+path. The declaration side and the full reasoning are in
+`skills/object-references.md`; the per-surface spellings are in
+`skills/api-surface.md`.
+
 ## The Explain trace (public contract)
 
 `engine.Trace` is serialized by E4 and E6, so its shape is part of the API:

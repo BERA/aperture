@@ -25,6 +25,8 @@ extend that behaviour:
 | `WithScopeResolution(registry *scope.Registry, deps ...ScopeDeps)` | Consult each grant's pluggable scope resolver (selected by its permission's scope-strategy) for object membership, instead of only literal pattern matching. A `nil` registry uses `scope.DefaultRegistry()`. |
 | `WithMembershipEnforcement()` | Require the request's principal to be a member of the active account before any grant is consulted. A non-member is denied at the door (a fail-closed default-deny), rather than erroring. Off by default. |
 | `WithMetadata(f MetadataFetcher)` | Supply the object-metadata source `Enumerate`'s [`Fields` filter](#filtering-by-object-metadata) reads through — normally the same `*provider.Registry` wired as the scope lister. Consulted **only** by a request that carries `Fields`. |
+| `WithReferences(r ReferenceSource)` | Supply the declared-reference source `Enumerate`'s [reference edges](#restricting-through-a-declared-reference) are dereferenced through — normally the same `*provider.Registry` again. Consulted **only** by a request that carries `References`; an engine wired without it fails *loudly* for one that does, never with an empty result. |
+| `WithLogger(l *slog.Logger)` | The sink for non-fatal operational findings — today only a skipped [dangling reference](#restricting-through-a-declared-reference), which is invisible to an operator otherwise. Nil, or unset, means `slog.Default()`. It is **not** a decision log: nothing on the `Check` hot path logs. |
 | `WithClock(now func() time.Time)` | Override the engine clock. It governs impersonation time-box expiry only; the non-impersonated path never reads it. Production uses `time.Now`. |
 
 Two further seams return a **shallow copy** of the engine rather than mutating it,
@@ -121,12 +123,13 @@ the two operations agree by construction.
 
 ```go
 type EnumerateRequest struct {
-	Account   string         // active account the enumeration is scoped to
-	Principal string         // id of the principal whose access is enumerated
-	Action    string         // the verb being enumerated, e.g. "read"
-	Pattern   string         // identity pattern bounding the search
-	Fields    map[string]any // optional object-metadata predicates; nil/empty filters nothing
-	Limit     int            // caps the number of returned ids; <= 0 means the default bound
+	Account    string          // active account the enumeration is scoped to
+	Principal  string          // id of the principal whose access is enumerated
+	Action     string          // the verb being enumerated, e.g. "read"
+	Pattern    string          // identity pattern bounding the search
+	Fields     map[string]any  // optional object-metadata predicates; nil/empty filters nothing
+	References []ReferenceEdge // optional reference edges; nil/empty restricts nothing
+	Limit      int             // caps the number of returned ids; <= 0 means the default bound
 }
 ```
 
@@ -211,6 +214,69 @@ as "no access", one returning more is an authorization bug:
 - **any other provider failure** → returned verbatim.
 
 `EnumerateBatch` and `EnumerateAs` carry `Fields` through the same path.
+
+### Restricting through a declared reference
+
+`References` restricts the enumeration to the identities a holder object's
+**declared reference field** contains — "the brands in dataset X". Nil or empty
+(the default) restricts nothing.
+
+```go
+ids, err := eng.Enumerate(ctx, engine.EnumerateRequest{
+	Account:   "acme",
+	Principal: "alice",
+	Action:    "read",
+	Pattern:   "account:acme/brand:*",
+	References: []engine.ReferenceEdge{{
+		HolderID: "account:acme/dataset:x", // HolderType is optional
+		Field:    "current_brands",         // must be a DECLARED reference
+	}},
+})
+```
+
+**It is a dereference, not a filter, and the distinction is the whole reason it
+exists.** `Fields` answers "which datasets contain brand Y?" because the dataset
+holds `current_brands`. A brand holds no field naming its datasets — references
+are declared on the [holding side
+only](../concepts/providers.md#declared-references) — so no predicate on brand
+can express "which brands belong to dataset X?" at all.
+
+Composition mirrors the filter's: several edges **AND**, an edge composes with
+`Fields`, both apply **before `Limit`**, and the restriction can only *subtract*
+from the allowed set. Exactly **one hop** is taken — the identities an edge
+yields are never themselves dereferenced. The whole restriction is resolved
+**once per enumeration**, before candidates are gathered, against the same grants
+and subject set the candidates are decided with; that is what makes
+`EnumerateAs` check the holder with the **impersonated** authority.
+
+The failure modes are asymmetric, and the asymmetry is the security model:
+
+| Situation | Result |
+|---|---|
+| The principal **may not read the holder** | **Empty result, no error.** "You may not see dataset X" and "dataset X contains nothing you may see" have to be indistinguishable, or the edge is an oracle for objects the caller was never allowed to know about. |
+| The holder is **absent**, inside `Account`, caller is a **member** | `APERTURE_NOT_FOUND` — the ergonomics a typo deserves, confined to a caller already inside the account. Existence is resolved *before* the holder's check precisely so this answer survives. |
+| The holder is **outside** `Account` | **Empty**, whether or not it exists. The disclosure boundary. |
+| The caller is **not a member** | **Empty**, always — membership is decided before the holder is looked up. |
+| A referenced identity **no longer exists** | **Skipped**, with a warning log naming it and a `dangling_reference` note that does not. An application-level foreign key has no database constraint behind it, so one deleted brand must not fail every decision on the dataset that still lists it. |
+| The field is **not declared**, the holder type has **no provider**, or no reference source is wired | `APERTURE_PROVIDER_REFERENCE_INVALID` / `APERTURE_PROVIDER_UNREGISTERED` — loud, never an empty list. A wiring fault describes the deployment, not the data. |
+| A reference value **does not point at the declared target** | `APERTURE_PROVIDER_REFERENCE_MISMATCH` — never a silently dropped value. |
+
+Wire the source alongside the metadata source; it is the same registry:
+
+```go
+eng := engine.New(store,
+	engine.WithScopeResolution(nil, engine.ScopeDeps{Lister: reg, Rules: rulesEngine}),
+	engine.WithMetadata(reg),
+	engine.WithReferences(reg),
+	engine.WithLogger(logger))
+```
+
+A **rules-engine dereference is deliberately not supported**: `Check` owes a p99
+under a millisecond, and following a reference inside rule evaluation is a join
+on the decision hot path with a recursive cache-miss path behind it. Enumeration
+computes the restriction once, off that path.
+
+`EnumerateBatch` and `EnumerateAs` carry `References` through the same path.
 
 ## Explain
 

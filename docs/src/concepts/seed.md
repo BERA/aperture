@@ -330,6 +330,7 @@ providers:
 | `get_one` | the "get one" statement, taking **exactly one** placeholder, to which the identity's terminal segment value is bound |
 | `get_all` | the "get all" statement, taking **no** parameters and selecting each row's full identity as the id column. Required alongside `get_one` — a provider that could be fetched from but not enumerated would answer `List` with an error, and an errored enumeration reads as "no access". |
 | `id_column` | the `get_all` result column holding the identity. Default `id`. |
+| `references` | declared object references: **field name → target object-type**. See [Declaring a reference](#declaring-a-reference). Works on any `kind`. |
 | `ttl` / `max_size` | the per-type cache options, as for any provider entry |
 
 The statements are the developer's own, and **the `SELECT` list is where a
@@ -415,6 +416,67 @@ positive, every `connection:` must name a declared connection, and both
 statements must be present. A failure takes the whole build with it and closes
 every pool opened so far, so a failed build strands nothing.
 
+## Declaring a reference
+
+Any `providers:` entry — `csv` or `sql` — may declare **object references**: a
+mapping from a metadata **field name** this provider serves to the **target
+object-type** its values identify. It is an application-level foreign key with no
+database constraint behind it, so the document is where it is stated:
+
+```yaml
+providers:
+  - object_type: dataset
+    kind: sql
+    connection: main
+    get_one: SELECT d.tier, to_jsonb(d.brand_ids) AS current_brands FROM datasets d WHERE d.id = $1
+    get_all: SELECT 'account:acme/dataset:' || d.id AS id,
+                    to_jsonb(d.brand_ids) AS current_brands
+             FROM datasets d
+    references:
+      current_brands: brand
+
+  - object_type: brand
+    kind: sql
+    connection: main
+    get_one: SELECT b.region FROM brands b WHERE b.id = $1
+    get_all: SELECT 'account:acme/brand:' || b.id AS id, b.region FROM brands b
+```
+
+That declaration is what lets an enumeration be restricted to what a holder
+object names — `aperture enumerate … --via account:acme/dataset:x.current_brands`,
+"which brands belong to dataset x?".
+
+Four rules govern the block, and each closes a door deliberately:
+
+- **It is declared on the HOLDING side only** — the type whose provider actually
+  returns the field. There is no inbound spelling on `brand`: `brand` has no
+  column listing its datasets, so an inbound declaration would describe a derived
+  view with nothing to attach to, and a second referencing field
+  (`archived_brands: brand`) would make the unnamed reverse edge ambiguous.
+- **It is a closed set of one descriptor kind.** A field maps to a target
+  object-type and to **nothing else**. Do **not** add a `type:` key here: the
+  loader is the single typing mechanism (a CSV column suffix, a cast in the
+  developer's SQL), and a second place to declare a type is a second place for
+  the two to disagree.
+- **The field's values are full canonical identities** —
+  `"account:acme/brand:1"`, composed by the developer where the data is loaded,
+  scalar for one and a list for many. Spell them exactly as the object lister
+  yields them; a bare `"brand:1"` in an account-scoped deployment passes the
+  declaration check and then resolves to nothing.
+- **The blocks are applied last, in a second pass**, once every type is
+  registered — so a reference may name a target declared further down the file,
+  or one served by the `objects:` section. Order in the file never matters.
+
+A target no provider serves is `APERTURE_PROVIDER_REFERENCE_INVALID` at build,
+naming the field and the target. A field name **no object happens to carry is not
+an error at all**: metadata fields are discovered at fetch, not declared, so it
+simply resolves to nothing.
+
+Like every other `providers:` key, `references:` is runtime **wiring, not model
+state**: `Apply` writes nothing for it and an export reproduces none of it. See
+[Declared references](providers.md#declared-references) for what a declaration
+buys and the security semantics of enumerating through one.
+
 ## What is *not* in the file
 
 Two things are deliberately excluded from the model state file:
@@ -432,7 +494,9 @@ Two things are deliberately excluded from the model state file:
   optional cache `ttl`/`max_size`, and then either a `path` (for `csv`, resolved
   relative to the seed file) or a `connection` plus `get_one` / `get_all`
   statements (for `sql` — see
-  [Database-backed providers](#database-backed-providers)). A malformed entry is
+  [Database-backed providers](#database-backed-providers)), plus an optional
+  `references:` block (see [Declaring a reference](#declaring-a-reference)). A
+  malformed entry is
   `APERTURE_CONFIG_INVALID` / `APERTURE_PROVIDER_INVALID`, and a broken
   connection declaration is `APERTURE_SQL_PROVIDER_CONNECTION` or
   `APERTURE_SQL_PROVIDER_DSN_LITERAL`. When `providers:` and `objects:` claim one

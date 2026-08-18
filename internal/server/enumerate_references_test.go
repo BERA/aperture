@@ -331,6 +331,26 @@ func TestEnumerateReferenceUndeclaredFieldIsACodedError(t *testing.T) {
 	assertTwirpCode(t, err, aerr.APERTURE_PROVIDER_REFERENCE_INVALID)
 }
 
+// ...and it is loud as a 400, not a 500. An edge naming an undeclared field is
+// the caller's own input — the same class of mistake as a --via with no '.' —
+// and retrying it unchanged can never succeed, so the one status class a client
+// is entitled to retry and an alert rule is entitled to page on is the wrong
+// answer. The Aperture code rides in the twirp meta either way; this pins the
+// HTTP status a client that only reads the status sees.
+func TestEnumerateReferenceUndeclaredFieldIsAnInvalidArgumentNotAnInternal(t *testing.T) {
+	f := newRefFixture(t)
+
+	_, err := f.wire("alice", edge("account:acme/dataset:x", "not_a_reference"))
+	te, ok := err.(twirp.Error)
+	if !ok {
+		t.Fatalf("undeclared reference field = %v, want a twirp.Error", err)
+	}
+	if te.Code() != twirp.InvalidArgument {
+		t.Fatalf("undeclared reference field = twirp code %q (HTTP %d), want invalid_argument (400)",
+			te.Code(), twirp.ServerHTTPStatusFromErrorCode(te.Code()))
+	}
+}
+
 // The batch variant carries the edges PER QUERY, and each item keeps its own
 // answer: one query's NOT_FOUND never becomes another's, and a fail-closed
 // empty result is reported as an empty list rather than an error.

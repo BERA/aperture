@@ -37,8 +37,8 @@ tool identity), so the SDK-free core and the SDK adapter never drift.
 |---|---|---|
 | `aperture_check` | Decide whether a principal may take an action on an object, scoped to an account. Returns the verdict (allow/deny), a human-readable reason, and the deciding grant ids. **Fail-closed:** an operational failure renders as a *deny*, not an error; only an ill-formed question is an error. | `service.Check` |
 | `aperture_check_batch` | Decide many `(account, principal, action, object)` questions in one round-trip; `results[i]` answers `queries[i]`. A single ill-formed query carries its error in that item without failing the batch. | `service.CheckBatch` |
-| `aperture_enumerate` | List the object ids under a pattern a principal may act on — the inverse of `aperture_check`. Deny-overrides and specificity are honoured, so a denied object is never returned. Takes an optional `Fields` metadata filter (below). | `service.Enumerate` |
-| `aperture_enumerate_batch` | Enumerate accessible objects for many queries in one round-trip, aligned with the input queries. Each query carries its own `Fields`. | `service.EnumerateBatch` |
+| `aperture_enumerate` | List the object ids under a pattern a principal may act on — the inverse of `aperture_check`. Deny-overrides and specificity are honoured, so a denied object is never returned. Takes an optional `Fields` metadata filter and optional `References` edges (both below). | `service.Enumerate` |
+| `aperture_enumerate_batch` | Enumerate accessible objects for many queries in one round-trip, aligned with the input queries. Each query carries its own `Fields` and `References`. | `service.EnumerateBatch` |
 | `aperture_explain` | Return the full structured decision trace for one question: the expanded subject set, every grant considered with its per-grant outcome, which grants decided, and the final verdict. Use to understand *why*. | `service.Explain` |
 | `aperture_explain_batch` | Return decision traces for many questions in one round-trip, aligned with the input queries. | `service.ExplainBatch` |
 
@@ -66,6 +66,47 @@ applied **before** `Limit`, so `Limit: 10` returns the first ten *matches*.
 The schema is reflected straight off `service.EnumerateQuery`, so the tool input
 and the Go facade query are the same type; the semantics above are carried in the
 property description an agent reads.
+
+#### `aperture_enumerate`'s `References` edges
+
+`References` is an **optional** list of reference edges that restricts the
+listing to the identities a holder object's **declared reference field**
+contains — "which brands belong to dataset X?". Omit it to restrict nothing; like
+`Fields`, it is not a required property.
+
+```json
+{
+  "Account": "acme", "Principal": "alice", "Action": "read",
+  "Pattern": "account:acme/brand:*",
+  "References": [{ "HolderID": "account:acme/dataset:x", "Field": "current_brands" }]
+}
+```
+
+`HolderID` and `Field` are required properties of an edge; `HolderType` is
+optional and, when given, must agree with `HolderID`'s last segment type.
+
+**This is not the same thing as `Fields`, and an agent that treats them as
+interchangeable will get the wrong answer.** `Fields` is a *filter* — "which
+datasets contain brand Y?" — and works because the dataset holds the field.
+`References` is a *dereference* — "which brands belong to dataset X?" — and
+exists because a brand holds **no** field naming its datasets, so no filter can
+express that question at all.
+
+Several edges are **ANDed**, an edge composes with `Fields`, both apply **before
+`Limit`**, and exactly **one hop** is taken.
+
+The answers an agent must not over-read:
+
+- A holder the principal **may not see** returns an **empty list, not an error**.
+  Emptiness here means "nothing you may see", and it is deliberately
+  indistinguishable from "you may not see the holder" — do not report it as a
+  permission failure.
+- An **absent** holder is `APERTURE_NOT_FOUND` only when it is inside the
+  request's account and the principal is a member of it. Out of account, or for a
+  non-member, the answer is empty.
+- An edge naming a field that is **not a declared reference** is a loud
+  `APERTURE_PROVIDER_REFERENCE_INVALID`, never an empty list — it means the
+  deployment is not wired for that question, not that access was denied.
 
 ### What-if simulation (read-only, never persisted)
 

@@ -211,6 +211,88 @@ reflected schema marks the predicate REQUIRED, making an unfiltered
 schema-validating client. The JSON name stays PascalCase `Fields` so one object
 does not mix two spellings. Do not drop either tag in a refactor.
 
+## The enumerate reference edge
+
+`Enumerate` (and `EnumerateBatch`, and `EnumerateAs`) also takes an OPTIONAL set
+of **reference edges** that restrict the result to the identities a holder
+object's *declared* reference field contains — "the brands in dataset X". It is a
+**dereference, not a predicate**, which is why it is a separate input rather than
+another entry in `Fields`: a brand carries no field naming its datasets, so no
+predicate on brand can express the question. `Fields` answers the mirror image
+("which datasets contain brand Y?") because *that* side holds the field. The full
+model is `skills/object-references.md`.
+
+| Layer | Spelling |
+|---|---|
+| `engine.EnumerateRequest` | `References []engine.ReferenceEdge` |
+| `service.EnumerateQuery` | `References []service.ReferenceEdge` — converted field-for-field by `request()`, never parsed or validated |
+| Twirp (`service.proto`) | `EnumerateRequest.references`, `repeated ReferenceEdge` (field 7). `EnumerateBatchRequest` embeds `EnumerateRequest`, so edges ride **per query** |
+| CLI | `aperture enumerate --via <holder-identity>.<field>` (repeatable) |
+| MCP | `aperture_enumerate` / `aperture_enumerate_batch` input `References`, reflected off `service.EnumerateQuery` |
+
+An edge is **three plain strings** — `{HolderType, HolderID, Field}` — so unlike
+the metadata filter it needs no `google.protobuf.Value` gymnastics and no value
+model at all: an edge *names* a field, it never carries one. `HolderID` and
+`Field` are mandatory; `HolderType` is optional and, when given, must **agree**
+with `HolderID`'s terminal segment type. The CLI does not spell the type at all,
+so the two cannot disagree. An omitted edge list is a nil Go slice at every
+layer, so an existing client is unaffected.
+
+**No surface validates an edge on the way in.** Whether the holder identity
+parses, whether its type serves a provider, and whether the field is declared are
+all decisions with a disclosure consequence, so they are made in exactly one
+place (`engine/reference.go`); a surface that answered one separately would be a
+second place for the answer to differ.
+
+### Composition and ordering
+
+Several edges **AND**; an edge composes with `Fields`; and both are applied
+**before `Limit`**, for the same reason the filter is. Exactly **one hop** is
+taken — the identities an edge yields are never themselves dereferenced. The
+restriction only ever *subtracts*, and it is computed **once per enumeration**,
+before candidates are gathered, against the same grants and subject set the
+candidates are decided with (so `EnumerateAs` checks the holder with the
+**impersonated** authority).
+
+### The empty-vs-`NOT_FOUND` split is a per-surface contract
+
+This is the part most likely to be lost in translation, and it is asserted per
+surface rather than assumed — a boundary that turned an empty result into a 404,
+or a 404 into an empty list, would silently change what the system discloses
+about objects it never let the caller see, and no test in `engine/` can catch it:
+
+| Situation | Every surface answers |
+|---|---|
+| the holder is **unreadable** by the principal | **empty result, HTTP 200** — never 403, never 404 |
+| the holder is **absent, in-account**, caller is a **member** | `APERTURE_NOT_FOUND` / **404** |
+| the holder is **out of account** | **empty**, whether or not it exists |
+| the caller is a **non-member** | **empty**, always — membership is decided before the holder is looked up |
+| the field is **not declared** (a wiring fault) | `APERTURE_PROVIDER_REFERENCE_INVALID` / **400** — loud, never empty |
+| the holder type has **no provider** | `APERTURE_PROVIDER_UNREGISTERED` / **404** — loud, never empty |
+
+`APERTURE_PROVIDER_REFERENCE_INVALID` is mapped to `twirp.InvalidArgument`
+explicitly, out of `codeToTwirp`'s 500 default: the only way it reaches a client
+is an edge naming an undeclared field, which is the caller's own input and can
+never succeed on retry, so a 5xx would tell a retrying client and a paging alert
+rule exactly the wrong thing.
+
+### The CLI's `--via`, and the MCP `omitempty`
+
+`--via` is split on the **LAST** `.`: a `.` is legal inside an identity component
+(`dataset:2026.q1`) while a reference field is a single metadata key, so the final
+dot is the only unambiguous boundary. It is repeatable, edges are ANDed, and a
+malformed value is `APERTURE_INVALID_INPUT` naming the offending text — in the
+same words a malformed `--field` gets — rejected before the store is opened. The
+format, the AND, and the empty-not-error rule are in the help text and asserted
+there.
+
+On the MCP side `mcp.EnumerateIn` aliases the facade query, so the edges arrive
+typed; the `omitempty` on `References` is what keeps them **optional** in the
+reflected schema, exactly as it is for `Fields`. Without it an edge-less
+`aperture_enumerate` — by far the common call — is unrepresentable for a
+schema-validating client. `HolderID` and `Field` are required properties;
+`HolderType` is not.
+
 ## Auth + admin-tier policy
 
 - **Decision RPCs are open** — `Check` / `Enumerate` / `Explain` require no

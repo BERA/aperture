@@ -1164,14 +1164,24 @@ func mapErr(err error) error {
 // codeToTwirp maps an Aperture code to a Twirp error code (and thus an HTTP
 // status): InvalidArgument→400, Unauthenticated→401, PermissionDenied→403,
 // NotFound→404, Unimplemented→501, Internal→500.
+//
+// APERTURE_PROVIDER_REFERENCE_INVALID is deliberately a 400 rather than the
+// default 500. The only way it reaches a client is an enumerate reference edge
+// naming a field no references: declaration binds, which is the caller's own
+// input — the same class of mistake as a --via with no '.', which is already an
+// APERTURE_INVALID_INPUT. Retrying the request unchanged can never succeed, so a
+// 5xx would tell a retrying client and a paging alert rule exactly the wrong
+// thing. Its sibling APERTURE_PROVIDER_REFERENCE_MISMATCH stays a 500: that one
+// says the HOST'S OWN data does not point where its declaration claims, which no
+// change to the request can fix.
 func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 	switch code {
 	case aerr.APERTURE_INVALID_INPUT, aerr.APERTURE_IDENTITY_INVALID,
 		aerr.APERTURE_ACTION_UNDECLARED, aerr.APERTURE_SCOPE_INVALID,
 		aerr.APERTURE_SCOPE_UNKNOWN_STRATEGY, aerr.APERTURE_RULE_INVALID,
 		aerr.APERTURE_RULE_UNKNOWN_VARIABLE, aerr.APERTURE_RULE_TYPE_ERROR,
-		aerr.APERTURE_PROVIDER_INVALID, aerr.APERTURE_TEMPLATE_INVALID,
-		aerr.APERTURE_TEMPLATE_PARAM:
+		aerr.APERTURE_PROVIDER_INVALID, aerr.APERTURE_PROVIDER_REFERENCE_INVALID,
+		aerr.APERTURE_TEMPLATE_INVALID, aerr.APERTURE_TEMPLATE_PARAM:
 		return twirp.InvalidArgument
 	case aerr.APERTURE_NOT_FOUND, aerr.APERTURE_RULE_NOT_FOUND,
 		aerr.APERTURE_PROVIDER_UNREGISTERED:

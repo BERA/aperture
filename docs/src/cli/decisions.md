@@ -184,6 +184,65 @@ than printing nothing — an empty list would read as "no access". (Because the
 predicate is applied per candidate, you only see that error once the principal is
 allowed at least one object under the pattern.)
 
+### Restricting to what a reference names
+
+`--via` asks the **other** direction. `--field` asks "which datasets contain
+brand Y?"; `--via` asks "which brands does dataset X list?".
+
+```bash
+bin/aperture enumerate alice read 'account:acme/brand:*' --seed ./model.yaml \
+  --via account:acme/dataset:x.current_brands
+```
+
+It restricts the listing to the identities held in a **declared reference field**
+on one holder object — a `references:` block in the seed document
+([Declaring a reference](../concepts/seed.md#declaring-a-reference)) is what makes
+the field dereferenceable.
+
+**The two are not interchangeable, and the asymmetry is the reason `--via`
+exists.** The dataset holds `current_brands`, so a predicate on dataset expresses
+"which datasets contain brand Y?" — that is `--field`. A brand holds **no** field
+naming its datasets, so no predicate on brand can express "which brands belong to
+dataset X?" at all. `--field` is a filter; `--via` is a dereference.
+
+The spelling is `<holder-identity>.<field>`, split on the **last** `.` — a `.` is
+legal inside an identity component (`dataset:2026.q1`) while a reference field is
+a single metadata key, so the final dot is the only unambiguous boundary. The
+holder's *type* is deliberately not spelled: it is the identity's last segment
+type, which the engine derives itself, so the two cannot disagree.
+
+The rules the restriction obeys:
+
+- **Repeatable, and edges are ANDed.** Two `--via` flags give "the brands in
+  dataset x *and* in campaign spring".
+- **It composes with `--field`**, and both apply **before `--limit`**.
+- **It only subtracts.** Restriction runs on candidates that still go through the
+  access decision, so `--via` can never surface an object `check` would deny.
+- **Exactly one hop.** The brands a dataset names are not themselves
+  dereferenced, however many references `brand` declares.
+
+**A holder you may not read prints nothing and exits 0.** That is deliberate, not
+a bug: "you may not see dataset X" and "dataset X lists nothing you may see" must
+not be tellable apart, or `--via` becomes a way to probe for objects you were
+never allowed to know about. The same goes for a holder in **another account** —
+empty whether or not it exists — and for a principal who is not a member of
+`--account`.
+
+An **absent** holder is `APERTURE_NOT_FOUND` only when it is inside `--account`
+*and* the principal is a member of it. That is the ergonomics a typo deserves,
+confined to someone already inside the account.
+
+A wiring fault stays loud rather than printing nothing: a field with no
+`references:` declaration is `APERTURE_PROVIDER_REFERENCE_INVALID`, and a holder
+type with no provider is `APERTURE_PROVIDER_UNREGISTERED`. A malformed `--via` —
+no `.`, an empty holder, an empty field — is `APERTURE_INVALID_INPUT` naming the
+offending text, rejected before the store is opened.
+
+If a `--via` returns nothing you expected, check the **server log** first: a
+referenced identity the provider no longer serves is skipped with a warning
+naming it, and the commonest cause is an identity composed in the wrong shape
+(`brand:1` where the deployment yields `account:acme/brand:1`).
+
 Full flags: [`enumerate`](../reference/cli.md#aperture-enumerate).
 
 ## `identifiers` — a type's valid instance ids

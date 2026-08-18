@@ -34,9 +34,19 @@ gets the same verdict as every other surface — and a filtered
   is typed equality (`"5"` never matches `5`). It only ever removes ids from the
   allowed set, and it is applied BEFORE `Limit`, so `Limit` counts matches. The
   schema is reflected off `service.EnumerateQuery`, where `Fields` carries
-  `omitempty` so an unfiltered enumerate stays representable.
+  `omitempty` so an unfiltered enumerate stays representable. Also takes an
+  OPTIONAL `References` list of reference edges (`HolderID` + `Field`, and an
+  optional `HolderType`) restricting the result to what a holder object's
+  DECLARED reference field names — "which brands belong to dataset X?". That is a
+  DEREFERENCE, not a filter: `Fields` answers the mirror image ("which datasets
+  contain brand Y?") because that side holds the field. Edges are ANDed, compose
+  with `Fields`, apply before `Limit`, and take exactly one hop. A holder the
+  principal may not see is an EMPTY list and NOT an error — do not report it as a
+  permission failure; an undeclared field is a loud
+  `APERTURE_PROVIDER_REFERENCE_INVALID`, which means the deployment is not wired
+  for that question rather than that access was denied.
 - `aperture_enumerate_batch` — bulk enumerate, aligned with queries; each query
-  carries its own `Fields`.
+  carries its own `Fields` and `References`.
 - `aperture_explain` — the full decision trace: subject set, every grant
   considered with its per-grant outcome, the deciding grants, the verdict.
 - `aperture_explain_batch` — bulk explain, aligned with queries.

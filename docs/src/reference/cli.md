@@ -140,6 +140,19 @@ Both may be given together: --fields-json is merged FIRST and --field entries th
 OVERRIDE it by key. Predicates are ANDed; a field the object does not carry never
 matches; a list-valued field matches by membership. Filtering happens before --limit.
 
+--via restricts the list to what a DECLARED REFERENCE names — the other direction:
+--field asks "which datasets contain brand Y?", --via asks "which brands does
+dataset X list?". It is spelled &lt;holder-identity&gt;.&lt;field&gt;, where the field is
+everything after the LAST '.', and it is repeatable (edges are ANDed):
+
+```text
+  --via account:acme/dataset:x.current_brands
+```
+
+A holder you may not read yields an EMPTY list and no error, which is deliberate:
+"you may not see dataset X" and "dataset X lists nothing you may see" must not be
+tellable apart. Restriction, like filtering, happens before --limit.
+
 ```
 aperture enumerate [options] <principal> <action> <pattern>
 ```
@@ -152,6 +165,7 @@ aperture enumerate [options] <principal> <action> <pattern>
 | `--limit` | — | int | `0` | cap the number of returned object ids (&lt;=0 means the default) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
 | `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--via` | — | string | — | restrict the result to the objects a holder's declared reference field names, as &lt;holder-identity&gt;.&lt;field&gt; (e.g. --via account:acme/dataset:x.current_brands); repeatable, and several edges are ANDed. The FIELD is everything after the LAST '.' |
 
 ## `aperture explain`
 

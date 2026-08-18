@@ -284,6 +284,110 @@ clears a type, `InvalidateAll` clears every cache. `Stats(objectType)` exposes
 observability and the latency benchmark. The `provider` package depends only on
 `identity` and `errors` — never scope, engine, or model — so it stays a leaf.
 
+## Declared references
+
+A registry also holds **references**: declarations that one object-type's
+metadata *field* holds identities of another object-type. `dataset.current_brands
+→ brand` is an **application-level foreign key** — nothing in a database enforces
+it, so the declaration lives beside the provider that serves the field.
+
+```yaml
+providers:
+  - object_type: dataset
+    kind: sql
+    connection: main
+    get_one: SELECT d.tier, to_jsonb(d.brand_ids) AS current_brands FROM datasets d WHERE d.id = $1
+    get_all: SELECT 'account:acme/dataset:' || d.id AS id,
+                    to_jsonb(d.brand_ids) AS current_brands
+             FROM datasets d
+    references:
+      current_brands: brand      # field name → target object-type
+```
+
+```go
+reg.MustRegister("brand", brands)
+reg.MustRegister("dataset", datasets)
+reg.MustDeclareReference("dataset", "current_brands", "brand")
+```
+
+Both paths reach the same `Registry.DeclareReference`, so anything expressible in
+YAML is expressible in Go. `ReferenceTarget(type, field)`, `References(type)` and
+`AllReferences()` read the declarations back as a registry lookup rather than a
+re-parse of the document, and `ResolveReference(ctx, id, field)` turns one
+object's field into the identities it names.
+
+Three properties are closed on purpose:
+
+- **The holding side only.** A reference is declared on the type whose provider
+  actually *returns* the field. There is no inbound form on `brand`, because
+  `brand` has no column listing its datasets — an inbound declaration would
+  describe a derived view with nothing to attach to, and a second referencing
+  field (`archived_brands`) would make the unnamed reverse edge ambiguous anyway.
+- **One descriptor kind.** A reference names its **target object-type and nothing
+  else**. There is deliberately no `type:` key: the loader is the single typing
+  mechanism (a CSV column suffix, a cast in the developer's SQL), and a second
+  place to declare a type is a second place for the two to disagree.
+- **Values are full canonical identities** — `"account:acme/brand:1"`, composed
+  by the developer where the data is loaded, never a bare primary key Aperture
+  would template. That is what lets the ordinary
+  [`Filter.Fields` contract](#the-filterfields-contract) match one with no new
+  code: `{"current_brands": "account:acme/brand:Y"}` is just a membership test
+  over a list of strings.
+
+Declaring a reference on a field **no object happens to carry is not an error** —
+metadata fields are discovered at fetch, not declared, so it resolves to nothing.
+A *value* that does not point where the declaration says — a `"team:7"` in a
+field declared to hold brands — **is** an error
+(`APERTURE_PROVIDER_REFERENCE_MISMATCH`), because an enumeration that silently
+dropped it would read as "no access" and hide the fault. A target type with no
+registered provider is `APERTURE_PROVIDER_REFERENCE_INVALID` at build.
+
+A seed document applies its `references:` blocks in a **second pass, after every
+type is registered**, so a reference may name a target declared further down the
+file or served by the `objects:` section. Like the rest of `providers:`, a
+declaration is runtime wiring: `Apply` writes none of it and an export reproduces
+none of it.
+
+### What a declaration buys: enumerating through it
+
+`Enumerate` can be restricted to the identities a holder object's declared field
+contains:
+
+```bash
+aperture enumerate alice read 'account:acme/brand:*' \
+  --seed ./model.yaml --via account:acme/dataset:x.current_brands
+```
+
+The mirror-image question — "which datasets contain brand Y?" — is a **filter**,
+not a dereference, and the metadata filter already answered it. The two look
+symmetric and are not: the dataset holds the field, so a predicate on dataset
+expresses that question; a brand holds no field naming its datasets, so no
+predicate on brand can express the first one at all.
+
+Its security semantics are the reason the dereference lives in the engine rather
+than being a caller-side two-call workaround, and they are deliberately
+asymmetric:
+
+- a holder the principal **may not read** yields an **empty result and no
+  error** — "you may not see dataset X" and "dataset X contains nothing you may
+  see" must be indistinguishable, or the edge is an oracle for objects the caller
+  was never allowed to know about;
+- an **absent** holder is `APERTURE_NOT_FOUND` **only** inside the request's
+  account and **only** for a member — outside the account, or for a non-member,
+  the answer is empty and never `NOT_FOUND`;
+- a **dangling** identity (referenced, no longer served) is skipped, logged at
+  warning, and noted as `dangling_reference`, never a failed decision;
+- exactly **one hop** is taken, several edges **AND**, and the restriction is
+  applied **before** `limit`.
+
+A rules-engine dereference is deliberately **not** supported: `Check` owes a p99
+under a millisecond, and a join on the decision hot path — with a recursive
+cache-miss path behind it — is a cost that belongs to the host's data rather than
+to the rule. Enumeration computes the restriction once, off that path.
+
+The full model, including the exact ordering and the per-surface tests that pin
+it, is in `skills/object-references.md`.
+
 ## Worked example: `csvprovider`
 
 `csvprovider` implements `ObjectProvider` over a CSV file, so a host can wire real
