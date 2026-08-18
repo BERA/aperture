@@ -143,17 +143,19 @@ func TestFetchPassesTheStatementThroughUntouched(t *testing.T) {
 
 // Every returned column becomes a metadata field keyed by its column name; a
 // NULL omits the field rather than storing nil (csvprovider's absent-vs-zero
-// rule), and a timestamp is canonicalised to the shared date value model's UTC
-// layout so two rows naming one instant are one string.
+// rule), a []byte is JSON-decoded (how an array reaches metadata at all), and a
+// timestamp is canonicalised to the shared date value model's UTC layout so two
+// rows naming one instant are one string. The rule-by-rule mapping table lives
+// in values_test.go.
 func TestFetchMapsColumnsToMetadata(t *testing.T) {
 	s := &script{
-		cols: []string{"tier", "seats", "budget", "active", "slug", "hired_at", "note"},
+		cols: []string{"tier", "seats", "budget", "active", "tags", "hired_at", "note"},
 		rows: [][]driver.Value{{
 			"gold",
 			int64(5),
 			float64(2.5),
 			true,
-			[]byte("acme"),
+			[]byte(`["red", "blue"]`), // to_jsonb(tags) AS tags
 			time.Date(2026, 3, 4, 12, 30, 0, 0, time.FixedZone("east", 5*3600)),
 			nil,
 		}},
@@ -168,7 +170,7 @@ func TestFetchMapsColumnsToMetadata(t *testing.T) {
 		"seats":    int64(5),
 		"budget":   float64(2.5),
 		"active":   true,
-		"slug":     "acme",
+		"tags":     []any{"red", "blue"},
 		"hired_at": "2026-03-04T07:30:00Z", // converted to UTC, canonical layout
 	}
 	if !reflect.DeepEqual(md, want) {

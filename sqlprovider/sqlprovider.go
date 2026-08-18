@@ -74,16 +74,64 @@
 // stored nil is a value that compares — and a zero that compares is how a NULL
 // end_date silently satisfies every "before" rule ever written against it.
 //
-// The driver values this story maps are database/sql's own documented set for a
-// scan into *any: bool, string, []byte (read as a string), int64, float64,
-// time.Time (canonicalised to the shared date value model's
-// "2006-01-02T15:04:05Z", always UTC), and NULL. Any other Go type is a hard
-// APERTURE_SQL_PROVIDER_SCAN error naming the column and the type rather than a
-// value the rules engine cannot compare; the full driver-value mapping table
-// (numerics, arrays, JSON/JSONB, uuid) lands in E2-S2. Every mapped row is then
-// checked against the shared metadata value model (provider.ValidateMetadata)
-// before it is returned, so a shape the expression evaluator cannot handle fails
-// the fetch instead of surfacing as an evaluation error on the Check hot path.
+// # Driver values become metadata
+//
+// What a column becomes is decided by the GO TYPE database/sql scans it into,
+// and that mapping is a closed table:
+//
+//	NULL       →  the field is OMITTED (absent is not zero)
+//	bool       →  the scalar, as-is
+//	int64      →  the scalar, as-is
+//	float64    →  the scalar, as-is
+//	string     →  the scalar, as-is
+//	[]byte     →  JSON-DECODED (this is how arrays and nested objects arrive)
+//	time.Time  →  converted to UTC, then the canonical "2006-01-02T15:04:05Z"
+//	anything else → APERTURE_SQL_PROVIDER_SCAN naming the column and the type
+//
+// Every mapped row is then checked against the shared metadata value model
+// (provider.ValidateMetadata) before it is returned, so a shape the expression
+// evaluator cannot handle fails the fetch instead of surfacing as an evaluation
+// error on the Check hot path. See values.go for the rule-by-rule reasoning; the
+// three consequences a developer has to act on are these.
+//
+// CAST IT IN THE STATEMENT. The statement is the only typing mechanism there is.
+// There is no per-column type declaration to write in YAML, because two
+// spellings for one intent drift apart, and the statement is the one the
+// developer is already writing. So:
+//
+//	to_jsonb(tags) AS tags     an array — the ONLY way one arrives
+//	hired_on::text AS hired_on a day-granular date ("2026-03-04")
+//	amount::float8 AS amount   a numeric meant as a number
+//	sku::text AS sku           a numeric or uuid meant as an identifier
+//
+// A []byte IS JSON, unconditionally. It does not fall back to a string. That is
+// deliberate: a fallback would let one column change TYPE depending on its
+// contents. A bytea therefore does not work — encode it in the statement, or
+// leave it out, since an access-control decision has no business reading a blob.
+// A JSON null omits its field, exactly as a SQL NULL does.
+//
+// A time.Time is ALWAYS a timestamp, never a day. A database date and a database
+// timestamp are the same Go type, so granularity cannot be inferred; the
+// datetime form is the one that loses nothing. Write `col::text` for a day.
+//
+// # The trap this package cannot catch for you
+//
+// Selecting an array column WITHOUT casting it compiles, runs, and is wrong:
+//
+//	SELECT tags FROM brands WHERE id = $1        -- WRONG
+//
+// A Postgres text[] does not arrive as a list. It arrives as the raw array
+// literal, the six-character string "{a,b}" — a perfectly valid metadata string,
+// indistinguishable from a string a host meant to store. Nothing in this package
+// can tell the two apart, so nothing here will complain. What happens instead is
+// that every membership predicate written against that field silently matches
+// nothing, forever, and the rule reads as though it simply never applies.
+//
+// The fix is one function call in the SELECT list:
+//
+//	SELECT to_jsonb(tags) AS tags FROM brands WHERE id = $1   -- RIGHT
+//
+// If a list-valued field is matching nothing, check its cast first.
 //
 // # Absent, ambiguous, and broken
 //
@@ -133,7 +181,6 @@ package sqlprovider
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strings"
 	"time"
 
@@ -375,14 +422,15 @@ func scanRow(rows *sql.Rows, id identity.Identity) (provider.Metadata, error) {
 		}
 		seen[name] = true
 
-		v, ok, err := metadataValue(vals[i])
+		// values.go owns the driver-value mapping table and builds its own coded
+		// errors, so every rejection already names the column and this row's
+		// identity.
+		v, present, err := metadataValue(vals[i], name, id)
 		if err != nil {
-			return nil, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
-				"sqlprovider: result column holds a driver value of a Go type this provider does not map; cast or serialise it in the statement",
-				map[string]any{"id": id.String(), "column": name, "type": err.Error()})
+			return nil, err
 		}
-		if !ok {
-			continue // NULL omits the field
+		if !present {
+			continue // a NULL — or a JSON null — omits the field
 		}
 		md[name] = v
 	}
@@ -395,60 +443,4 @@ func scanRow(rows *sql.Rows, id identity.Identity) (provider.Metadata, error) {
 			"sqlprovider: row for %s rejected by the metadata value model", id.String())
 	}
 	return md, nil
-}
-
-// unmappedType is the sentinel metadataValue returns for a driver value it does
-// not know: its message is the offending Go type, so the caller can name it
-// without carrying the value itself (which is host data).
-type unmappedType struct{ name string }
-
-func (u unmappedType) Error() string { return u.name }
-
-// metadataValue maps one scanned driver value to a metadata value. It reports
-// ok=false for SQL NULL, which omits the field rather than storing nil.
-//
-// The set handled here is database/sql's own documented result set for a scan
-// into *any — the types every driver is required to produce — plus time.Time,
-// which is canonicalised through the shared date value model's layout so a
-// timestamp column arrives as the same string a ":datetime" CSV column would
-// produce and a rule can compare the two. Anything else is refused by name: the
-// broader driver-value mapping (numerics, arrays, JSON/JSONB, uuid) is E2-S2,
-// and guessing at it here would mean a value the expression evaluator silently
-// mis-compares, which is the worst failure mode an access-control engine has.
-func metadataValue(v any) (any, bool, error) {
-	switch x := v.(type) {
-	case nil:
-		return nil, false, nil
-	case bool:
-		return x, true, nil
-	case string:
-		return x, true, nil
-	case []byte:
-		// Copied into a string: a driver may reuse its buffer for the next row,
-		// and a Metadata is read by other goroutines for as long as the Registry
-		// caches it.
-		return string(x), true, nil
-	case int64:
-		return x, true, nil
-	case float64:
-		return x, true, nil
-	case time.Time:
-		// Always UTC and always the canonical layout: two rows naming one instant
-		// must be one string for a Filter.Fields equality predicate to work, and a
-		// zone-carrying rendering would restate the instant in whatever zone the
-		// connection happened to have.
-		return x.UTC().Format(provider.DateTimeLayout), true, nil
-	default:
-		return nil, false, unmappedType{name: goTypeName(v)}
-	}
-}
-
-// goTypeName names a value's Go type for a diagnostic. It renders the TYPE and
-// never the value — a metadata value is host data, frequently another account's,
-// and an error is a thing that gets logged.
-func goTypeName(v any) string {
-	if v == nil {
-		return "nil"
-	}
-	return fmt.Sprintf("%T", v)
 }

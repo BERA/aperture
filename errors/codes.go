@@ -100,8 +100,10 @@ const (
 	APERTURE_SQL_PROVIDER_AMBIGUOUS Code = "APERTURE_SQL_PROVIDER_AMBIGUOUS"
 	// APERTURE_SQL_PROVIDER_SCAN — a row the host's database returned could not
 	// be turned into object metadata: an unnamed or duplicated result column, a
-	// scan failure, or a driver value of a Go type this provider does not map.
-	// The statement ran; its shape or its values are the problem.
+	// scan failure, a driver value of a Go type the provider does not map, a
+	// []byte column that is not valid JSON, or a timestamp the canonical date
+	// value model cannot represent. The statement ran; its shape or its values
+	// are the problem, and the fix is a cast in the SELECT list.
 	APERTURE_SQL_PROVIDER_SCAN Code = "APERTURE_SQL_PROVIDER_SCAN"
 	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
 	// metadata value model: a value that is neither a scalar, a []any of
@@ -332,7 +334,9 @@ var Registry = map[Code]Metadata{
 		Message: "SQL object provider could not read a row into object metadata",
 		Fixups: []string{
 			"Give every selected expression a name, and alias duplicates: each result column becomes a metadata field keyed by its column name.",
-			"Cast or serialise a column whose Go type the provider does not map (the driver value's type is named in the error).",
+			"Cast or serialise a column whose Go type the provider does not map (the driver value's type is named in the error, alongside the types that are mapped).",
+			"A []byte column is decoded as JSON, never as a string: wrap an array in to_jsonb(...), and cast a numeric, uuid, or bytea to ::text, ::float8, or encode(...) in the statement.",
+			"A list-valued field only arrives as a list when the statement casts it — SELECT to_jsonb(tags) AS tags, not SELECT tags, which yields the raw array literal as a string that silently matches nothing.",
 		},
 	},
 	APERTURE_METADATA_INVALID: {
