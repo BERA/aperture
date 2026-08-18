@@ -292,6 +292,10 @@ type Engine struct {
 	store             model.Storage
 	coverer           coverer
 	enforceMembership bool
+	// metadata is the object-metadata source Enumerate's Fields predicate reads
+	// through (WithMetadata). Nil by default and consulted ONLY by a request that
+	// carries Fields, so the unfiltered decision path never touches it.
+	metadata MetadataFetcher
 	// now is the engine's clock, injected so impersonation time-box expiry is
 	// deterministic in tests. It defaults to time.Now and is only consulted on the
 	// impersonated decision path (CheckAs/EnumerateAs/ExplainAs); the
