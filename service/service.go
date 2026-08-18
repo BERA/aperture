@@ -265,7 +265,14 @@ type EnumerateQuery struct {
 	// it is evaluated in exactly one place, provider.MatchFields. A surface that
 	// re-interpreted a value on the way in — parsing "5" into a number, say —
 	// would make an enumeration select objects a Check then denies.
-	Fields map[string]any
+	//
+	// The struct tags are the MCP surface's, which reflects its tool schema
+	// straight off this type (mcp.EnumerateIn is an alias for it). `omitempty`
+	// is load-bearing there: without it the reflected schema marks the predicate
+	// REQUIRED and an agent could not ask an unfiltered question at all. The
+	// name is kept in the struct's existing PascalCase so one object does not
+	// mix two spellings.
+	Fields map[string]any `json:"Fields,omitempty" jsonschema:"Optional object-metadata predicates narrowing the result. ANDed; a field the object does not carry never matches; a list-valued field matches by membership; everything else by typed equality, so \"5\" never matches 5. Omit to filter nothing."`
 	// Limit caps the number of returned object ids; <= 0 means the default.
 	Limit int
 }

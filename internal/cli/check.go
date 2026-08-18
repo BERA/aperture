@@ -90,18 +90,29 @@ func runCheck(ctx context.Context, cmd *ucli.Command) error {
 }
 
 // enumerateCommand is `aperture enumerate <principal> <action> <pattern>`: it
-// lists the object ids the principal may act on under the pattern.
+// lists the object ids the principal may act on under the pattern, optionally
+// narrowed by object-metadata predicates (--field / --fields-json).
 func enumerateCommand() *ucli.Command {
 	return &ucli.Command{
 		Name:      "enumerate",
 		Usage:     "List the objects a principal may act on",
 		ArgsUsage: "<principal> <action> <pattern>",
-		Flags: []ucli.Flag{
+		Description: "Lists every object id under <pattern> that <principal> may take <action> on.\n\n" +
+			"--field and --fields-json narrow that list by OBJECT METADATA. The predicate is typed:\n" +
+			"a field matches only when its value equals the wanted value AND is of the same kind, so\n" +
+			"the string \"5\" never matches the number 5. --field always sends a STRING; use\n" +
+			"--fields-json when a number, bool, or list is genuinely meant:\n\n" +
+			"  --field tier=premium --field current_brands=brand:Y\n" +
+			"  --fields-json '{\"seats\":5,\"active\":true,\"tags\":[\"public\"]}'\n\n" +
+			"Both may be given together: --fields-json is merged FIRST and --field entries then\n" +
+			"OVERRIDE it by key. Predicates are ANDed; a field the object does not carry never\n" +
+			"matches; a list-valued field matches by membership. Filtering happens before --limit.",
+		Flags: append([]ucli.Flag{
 			&ucli.StringFlag{Name: "seed", Usage: "path to a JSON/YAML seed model (defaults to the embedded example)"},
 			&ucli.StringFlag{Name: "store", Usage: "sqlite DSN for the backing store (defaults to in-memory)"},
 			&ucli.StringFlag{Name: "account", Usage: "active account the enumeration is scoped to", Value: seed.ExampleAccount},
 			&ucli.IntFlag{Name: "limit", Usage: "cap the number of returned object ids (<=0 means the default)"},
-		},
+		}, metadataFilterFlags()...),
 		Action: runEnumerate,
 	}
 }
@@ -111,6 +122,12 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 	if args.Len() != 3 {
 		return aerr.Newf(aerr.APERTURE_INVALID_INPUT,
 			"enumerate takes exactly 3 arguments (<principal> <action> <pattern>), got %d", args.Len())
+	}
+	// Parsed BEFORE the store is opened: a malformed predicate is a usage error
+	// and there is no reason to boot a decision stack to report one.
+	fields, err := parseMetadataFilter(cmd.String(fieldsJSONFlagName), cmd.StringSlice(fieldFlagName))
+	if err != nil {
+		return err
 	}
 	store, err := buildStore(ctx, cmd.String("store"), cmd.String("seed"))
 	if err != nil {
@@ -130,6 +147,7 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 		Principal: args.Get(0),
 		Action:    args.Get(1),
 		Pattern:   args.Get(2),
+		Fields:    fields,
 		Limit:     cmd.Int("limit"),
 	})
 	if err != nil {

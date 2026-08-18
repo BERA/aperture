@@ -3,10 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 
-	"github.com/frankbardon/aperture/engine"
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/mcp/gosdk"
+	"github.com/frankbardon/aperture/model"
 	"github.com/frankbardon/aperture/service"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -49,6 +50,29 @@ func mcpCommand() *ucli.Command {
 	}
 }
 
+// mcpService builds the read-only facade the MCP tools are driven through.
+//
+// It is the SAME decision stack `serve` and the one-shot commands build. This
+// used to be a bare engine.New(store), which made the agent-facing surface
+// answer differently from every other surface: no rule evaluator, no object
+// lister, and — once the metadata filter landed — no metadata source, so an
+// aperture_enumerate carrying `Fields` could only report
+// APERTURE_PROVIDER_UNREGISTERED however well the seed declared its objects.
+//
+// warnings receives the seed's provider/objects collision report. stdout is the
+// MCP transport, so the caller passes stderr.
+func mcpService(store model.Storage, seedPath string, warnings io.Writer) (*service.Service, error) {
+	stack, err := buildDecisionStack(store, seedPath)
+	if err != nil {
+		return nil, err
+	}
+	stack.reportCollisions(warnings)
+
+	// Read-only facade: the stack for decisions + the store for inspection and the
+	// what-if overlay base. No mutators are wired — the MCP surface never writes.
+	return stack.newService(service.WithStorage(store)), nil
+}
+
 func runMCP(ctx context.Context, cmd *ucli.Command) error {
 	store, err := buildStore(ctx, cmd.String("store"), cmd.String("seed"))
 	if err != nil {
@@ -56,10 +80,10 @@ func runMCP(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	// Read-only facade: the engine for decisions + the store for inspection and the
-	// what-if overlay base. No mutators are wired — the MCP surface never writes.
-	eng := engine.New(store)
-	svc := service.New(eng, service.WithStorage(store))
+	svc, err := mcpService(store, cmd.String("seed"), cmd.ErrWriter)
+	if err != nil {
+		return err
+	}
 
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    mcpServerName,
