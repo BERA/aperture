@@ -115,6 +115,25 @@ const (
 	// object-type's rows under another's and cache metadata under identities no
 	// Fetch of that provider could ever return.
 	APERTURE_SQL_PROVIDER_ROW_IDENTITY Code = "APERTURE_SQL_PROVIDER_ROW_IDENTITY"
+	// APERTURE_SQL_PROVIDER_DSN_LITERAL — a declarative connection carries a
+	// literal dsn: instead of naming an environment variable with dsn_env:. A
+	// seed file is a committed artifact, so a DSN written into one is a password
+	// written into version control, and that is only ever noticed afterwards.
+	// The key is refused at PARSE time, before anything is opened, so the
+	// document cannot be loaded by accident on the way to being fixed.
+	APERTURE_SQL_PROVIDER_DSN_LITERAL Code = "APERTURE_SQL_PROVIDER_DSN_LITERAL"
+	// APERTURE_SQL_PROVIDER_CONNECTION — a declared database connection could
+	// not be resolved into a live pool, or a provider entry referenced one that
+	// does not exist: an unset or empty DSN environment variable, an unparseable
+	// pool setting, an unknown connection name, or a driver that refused to open
+	// the handle. It is raised while the registry is being BUILT, never lazily on
+	// the first query, because a connection that only fails under a decision
+	// fails as a denial.
+	//
+	// A DSN is redacted out of anything this error carries: the whole point of
+	// forbidding a literal dsn: is to keep the password out of committed and
+	// logged text, and an error message is logged text.
+	APERTURE_SQL_PROVIDER_CONNECTION Code = "APERTURE_SQL_PROVIDER_CONNECTION"
 	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
 	// metadata value model: a value that is neither a scalar, a []any of
 	// scalars, nor a map[string]any one level deeper; an array holding an object
@@ -358,6 +377,23 @@ var Registry = map[Code]Metadata{
 			"Check that the identity's terminal segment type is the object-type this provider is registered under; a 'brand:1' row served by the 'dataset' provider is rejected rather than cached.",
 		},
 	},
+	APERTURE_SQL_PROVIDER_DSN_LITERAL: {
+		Message: "a declarative database connection carries a literal dsn instead of dsn_env",
+		Fixups: []string{
+			"Replace the connection's dsn: key with dsn_env: naming the environment variable that holds the DSN.",
+			"Export the DSN in the process environment (or a .env file the deployment loads) rather than writing it into the seed file.",
+			"Rotate the credential if a literal DSN was ever committed — the seed file is a version-controlled artifact.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_CONNECTION: {
+		Message: "a declared database connection could not be resolved into a live pool",
+		Fixups: []string{
+			"Set the environment variable named by the connection's dsn_env: to a non-empty DSN before starting the process.",
+			"Check that every kind: sql provider entry's connection: matches a name declared in the top-level connections: block.",
+			"Give pool settings valid values: conn_max_lifetime and query_timeout are Go durations (\"30m\", \"5s\"), and query_timeout must be positive — there is no 'no timeout' setting.",
+			"Verify the DSN's host, port, database, and credentials by connecting with psql; the driver's message is redacted here because a DSN parse failure commonly echoes the password.",
+		},
+	},
 	APERTURE_METADATA_INVALID: {
 		Message: "object metadata violates the metadata value model",
 		Fixups: []string{
@@ -493,6 +529,8 @@ var AllCodes = []Code{
 	APERTURE_SQL_PROVIDER_AMBIGUOUS,
 	APERTURE_SQL_PROVIDER_SCAN,
 	APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+	APERTURE_SQL_PROVIDER_DSN_LITERAL,
+	APERTURE_SQL_PROVIDER_CONNECTION,
 	APERTURE_METADATA_INVALID,
 	APERTURE_RULE_INVALID,
 	APERTURE_RULE_UNKNOWN_VARIABLE,

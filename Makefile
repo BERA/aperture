@@ -26,6 +26,21 @@ run: build
 clean:
 	rm -rf $(BUILD_DIR)
 
+# test runs the whole suite with NO external services: CI has no containers, so
+# every test here passes with no database present. The SQL provider's unit tests
+# use a hand-rolled database/sql driver returning canned rows.
+#
+# The one test that needs a live Postgres is GATED and skips by default. Run it
+# explicitly against a scratch database (it creates and drops its own table):
+#
+#   APERTURE_PG_INTEGRATION=1 \
+#   APERTURE_PG_DSN='postgres://user:pass@localhost:5432/db?sslmode=disable' \
+#   $(GO) test -run TestPostgresIntegration ./seed/
+#
+# The gate is deliberately fail-loud in one direction: with
+# APERTURE_PG_INTEGRATION=1 and no APERTURE_PG_DSN the test FAILS rather than
+# skips, so asking for the integration run and silently not getting one cannot
+# happen. Never put a DSN in a file — pass it in the environment.
 test:
 	$(GO) test ./...
 

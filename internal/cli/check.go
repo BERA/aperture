@@ -61,6 +61,7 @@ func runCheck(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = stack.Close() }()
 	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
@@ -139,6 +140,7 @@ func runEnumerate(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = stack.Close() }()
 	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
@@ -193,6 +195,7 @@ func runIdentifiers(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = stack.Close() }()
 	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()
@@ -238,6 +241,7 @@ func runExplain(ctx context.Context, cmd *ucli.Command) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = stack.Close() }()
 	stack.reportCollisions(cmd.ErrWriter)
 
 	svc := stack.newService()

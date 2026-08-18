@@ -140,6 +140,11 @@ Gated, NOT in `make test` (a loaded runner would flake them):
   fixtures.
 - `node internal/server/static/js/rules-serializer.test.js` — CI is node-free, so
   this is a manual development aid; the Go contract tests above are the real gate.
+- `APERTURE_PG_INTEGRATION=1 APERTURE_PG_DSN=<dsn> go test -run TestPostgresIntegration ./seed/`
+  — the only test that talks to a real Postgres (CI has no service containers).
+  It skips when ungated and **fails** when gated with an empty `APERTURE_PG_DSN`,
+  so asking for it and silently not getting it cannot happen. Never put a DSN in
+  a file; pass it in the environment.
 
 ## What NOT to do
 

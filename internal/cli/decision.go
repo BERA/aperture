@@ -10,6 +10,7 @@ import (
 	"github.com/frankbardon/aperture/model"
 	"github.com/frankbardon/aperture/provider"
 	"github.com/frankbardon/aperture/rules"
+	"github.com/frankbardon/aperture/seed"
 	"github.com/frankbardon/aperture/service"
 )
 
@@ -50,6 +51,25 @@ type decisionStack struct {
 	// silently would be hostile, and `seed` has no logging path of its own, so it
 	// reports the fact and the caller surfaces it (reportCollisions).
 	collisions []string
+	// conns are the database pools BuildRegistryWithConnections opened for the
+	// seed's `connections:` block — one per named connection, shared by every
+	// `kind: sql` provider entry referencing it. It is the only part of the stack
+	// that holds an OS resource, and Close is what releases it. Always non-nil.
+	conns *seed.Connections
+}
+
+// Close releases everything the stack holds open. Today that is the seed's
+// database pools; a stack built from a seed with no `connections:` block closes
+// nothing and the call is free, so every command defers it unconditionally
+// rather than asking which kinds the seed happened to use.
+//
+// It is idempotent, so a `serve` that closes explicitly on shutdown may also
+// defer it.
+func (s decisionStack) Close() error {
+	if s.conns == nil {
+		return nil
+	}
+	return s.conns.Close()
 }
 
 // reportCollisions writes a warning naming every object type whose inline
@@ -92,7 +112,11 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	if err != nil {
 		return decisionStack{}, err
 	}
-	reg, err := doc.BuildRegistry(seedBaseDir(seedPath))
+	// The two-return form, always: the seed may declare `connections:`, whose
+	// pools outlive the build and have to be closed by whoever owns the stack.
+	// The one-return BuildRegistry refuses such a document precisely because it
+	// cannot hand the pools back.
+	reg, conns, err := doc.BuildRegistryWithConnections(seedBaseDir(seedPath))
 	if err != nil {
 		return decisionStack{}, aerr.Wrap(aerr.APERTURE_BOOT, "cli: building object providers failed", err)
 	}
@@ -136,6 +160,7 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		ruleSource: ruleSource,
 		fetcher:    fetcher,
 		collisions: doc.ProviderCollisions(),
+		conns:      conns,
 	}, nil
 }
 

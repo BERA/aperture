@@ -61,16 +61,20 @@ func mcpCommand() *ucli.Command {
 //
 // warnings receives the seed's provider/objects collision report. stdout is the
 // MCP transport, so the caller passes stderr.
-func mcpService(store model.Storage, seedPath string, warnings io.Writer) (*service.Service, error) {
+//
+// The stack is returned alongside the facade because it OWNS resources — the
+// seed's database pools — and the facade does not: something has to outlive this
+// call to close them. Callers defer stack.Close().
+func mcpService(store model.Storage, seedPath string, warnings io.Writer) (*service.Service, decisionStack, error) {
 	stack, err := buildDecisionStack(store, seedPath)
 	if err != nil {
-		return nil, err
+		return nil, decisionStack{}, err
 	}
 	stack.reportCollisions(warnings)
 
 	// Read-only facade: the stack for decisions + the store for inspection and the
 	// what-if overlay base. No mutators are wired — the MCP surface never writes.
-	return stack.newService(service.WithStorage(store)), nil
+	return stack.newService(service.WithStorage(store)), stack, nil
 }
 
 func runMCP(ctx context.Context, cmd *ucli.Command) error {
@@ -80,10 +84,11 @@ func runMCP(ctx context.Context, cmd *ucli.Command) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	svc, err := mcpService(store, cmd.String("seed"), cmd.ErrWriter)
+	svc, stack, err := mcpService(store, cmd.String("seed"), cmd.ErrWriter)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = stack.Close() }()
 
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    mcpServerName,
