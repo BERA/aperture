@@ -254,6 +254,18 @@ type EnumerateQuery struct {
 	Action string
 	// Pattern is the identity pattern bounding the search.
 	Pattern string
+	// Fields are OPTIONAL object-metadata predicates narrowing the result: an
+	// allowed object is returned only when its metadata satisfies every one of
+	// them. Nil or empty (the default) filters nothing.
+	//
+	// The facade passes the map to the engine UNCHANGED — it does not parse,
+	// coerce, or normalise a value. That is deliberate: the predicate's meaning
+	// is provider.Filter's Fields contract (AND across keys, absent never
+	// matches, membership for a collection field, typed equality otherwise) and
+	// it is evaluated in exactly one place, provider.MatchFields. A surface that
+	// re-interpreted a value on the way in — parsing "5" into a number, say —
+	// would make an enumeration select objects a Check then denies.
+	Fields map[string]any
 	// Limit caps the number of returned object ids; <= 0 means the default.
 	Limit int
 }
@@ -264,6 +276,7 @@ func (q EnumerateQuery) request() engine.EnumerateRequest {
 		Principal: q.Principal,
 		Action:    q.Action,
 		Pattern:   q.Pattern,
+		Fields:    q.Fields,
 		Limit:     q.Limit,
 	}
 }

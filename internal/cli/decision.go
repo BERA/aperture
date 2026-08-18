@@ -98,6 +98,15 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	}
 
 	var fetcher rules.MetadataFetcher // nil => empty object metadata (unchanged default)
+	// metaSource is the STRICT metadata source Enumerate's Fields predicate reads
+	// through — the registry itself, not lenientFetcher. The leniency is right for
+	// a rule (an unreadable object evaluates against empty metadata and the rule
+	// denies) and wrong here: a filtered enumeration that quietly saw empty
+	// metadata for every object would return nothing and read as "no access", so
+	// the engine wants the registry's real error. Nil when the seed declares no
+	// object source at all, which makes a filtered enumeration report
+	// APERTURE_PROVIDER_UNREGISTERED rather than an empty result.
+	var metaSource engine.MetadataFetcher
 	scopeDeps := engine.ScopeDeps{}
 	// The guard MUST test both wiring sections. Gating on `providers:` alone made
 	// a seed that declared only `objects:` build a populated registry that nothing
@@ -105,6 +114,7 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	if hasObjectSources(doc) {
 		fetcher = lenientFetcher{reg: reg}
 		scopeDeps.Lister = reg
+		metaSource = reg
 	}
 
 	// The rules engine resolves references against the SAME store the node editor
@@ -113,8 +123,11 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	ruleSource := service.NewStorageRuleSource(store)
 	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher)
 
-	opts := make([]engine.Option, 0, len(engOpts)+1)
+	opts := make([]engine.Option, 0, len(engOpts)+2)
 	opts = append(opts, engine.WithScopeResolution(nil, scopeDeps))
+	if metaSource != nil {
+		opts = append(opts, engine.WithMetadata(metaSource))
+	}
 	opts = append(opts, engOpts...)
 
 	return decisionStack{

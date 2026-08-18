@@ -3,6 +3,8 @@ syntax = "proto3";
 package aperture;
 option go_package = "github.com/frankbardon/aperture/internal/wire/rpc";
 
+import "google/protobuf/struct.proto";
+
 // ApertureService is Aperture's full access-control RPC: the decision API
 // (Check / Enumerate / Explain, single and bulk) plus the model mutations
 // (CRUD for the RBAC entities, grants, delegation, and impersonation). It is
@@ -207,6 +209,25 @@ message EnumerateRequest {
   string action = 3;
   string pattern = 4;
   int32 limit = 5;
+  // fields are OPTIONAL object-metadata predicates narrowing the result: an
+  // allowed object is returned only when its metadata satisfies every one of
+  // them. Omitting the map is exactly a nil map in Go — it filters nothing, so
+  // an existing client is unaffected.
+  //
+  // The meaning is provider.Filter's Fields contract verbatim: AND across keys,
+  // a field ABSENT from an object never matches (not even against a null want),
+  // a COLLECTION field matches by MEMBERSHIP, everything else by EQUALITY, and
+  // comparison is TYPED. google.protobuf.Value is used rather than a JSON string
+  // precisely because it preserves the string/number/bool/list distinction the
+  // typed comparison rests on: a Value string "5" does NOT match a numeric 5 in
+  // metadata, while a Value number 5 matches an integer 5 (numbers compare
+  // across Go numeric types by value). A list Value is a CONTAINER want and
+  // therefore compares by equality, not membership.
+  //
+  // CAVEAT: google.protobuf.Value carries a number as a double, so an integer
+  // beyond 2^53 loses precision in transit. Send a key that large as a string
+  // and store it as a string.
+  map<string, google.protobuf.Value> fields = 6;
 }
 
 message EnumerateResponse {

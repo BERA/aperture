@@ -115,10 +115,32 @@ func (h *twirpHandler) CheckBatch(ctx context.Context, req *rpc.CheckBatchReques
 	return &rpc.CheckBatchResponse{Results: out}, nil
 }
 
+// enumerateQuery translates one wire enumerate request onto the facade query,
+// decoding the metadata predicates on the way. The decode is the ONLY
+// interpretation the surface performs: Value -> the Go shapes the value model
+// admits, with no coercion between them (see rpc.FieldsFromWire). An omitted
+// map arrives as a nil map, which is exactly an unfiltered enumeration.
+func enumerateQuery(q *rpc.EnumerateRequest) (service.EnumerateQuery, error) {
+	fields, err := rpc.FieldsFromWire(q.GetFields())
+	if err != nil {
+		return service.EnumerateQuery{}, err
+	}
+	return service.EnumerateQuery{
+		Account:   q.Account,
+		Principal: q.Principal,
+		Action:    q.Action,
+		Pattern:   q.Pattern,
+		Fields:    fields,
+		Limit:     int(q.Limit),
+	}, nil
+}
+
 func (h *twirpHandler) Enumerate(ctx context.Context, req *rpc.EnumerateRequest) (*rpc.EnumerateResponse, error) {
-	ids, err := h.svc.Enumerate(ctx, service.EnumerateQuery{
-		Account: req.Account, Principal: req.Principal, Action: req.Action, Pattern: req.Pattern, Limit: int(req.Limit),
-	})
+	q, err := enumerateQuery(req)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	ids, err := h.svc.Enumerate(ctx, q)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -127,16 +149,32 @@ func (h *twirpHandler) Enumerate(ctx context.Context, req *rpc.EnumerateRequest)
 
 func (h *twirpHandler) EnumerateBatch(ctx context.Context, req *rpc.EnumerateBatchRequest) (*rpc.EnumerateBatchResponse, error) {
 	qs := make([]service.EnumerateQuery, len(req.Queries))
+	// A malformed predicate is an input-validation failure for THAT query alone,
+	// so it rides in the item's error slot exactly as an engine validation error
+	// does. One bad query never fails the batch (BatchResult's contract), and a
+	// query that never ran must not be silently reported as "no objects".
+	bad := make([]error, len(req.Queries))
 	for i, q := range req.Queries {
-		qs[i] = service.EnumerateQuery{Account: q.Account, Principal: q.Principal, Action: q.Action, Pattern: q.Pattern, Limit: int(q.Limit)}
+		query, err := enumerateQuery(q)
+		if err != nil {
+			bad[i] = err
+			continue
+		}
+		qs[i] = query
 	}
 	results := h.svc.EnumerateBatch(ctx, qs)
 	out := make([]*rpc.BatchEnumeration, len(results))
 	for i, r := range results {
 		be := &rpc.BatchEnumeration{}
-		if r.Err != nil {
-			be.ErrorCode = string(aerr.CodeOf(r.Err))
-			be.ErrorMessage = r.Err.Error()
+		err := r.Err
+		if i < len(bad) && bad[i] != nil {
+			// The decode failed, so this item's engine result describes a
+			// zero-valued query, not the caller's. Report the decode error.
+			err = bad[i]
+		}
+		if err != nil {
+			be.ErrorCode = string(aerr.CodeOf(err))
+			be.ErrorMessage = err.Error()
 		} else {
 			be.ObjectIds = r.Result
 		}

@@ -9,6 +9,7 @@ package rpc
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -556,12 +557,31 @@ func (x *CheckBatchResponse) GetResults() []*BatchDecision {
 }
 
 type EnumerateRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Account       string                 `protobuf:"bytes,1,opt,name=account,proto3" json:"account,omitempty"`
-	Principal     string                 `protobuf:"bytes,2,opt,name=principal,proto3" json:"principal,omitempty"`
-	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
-	Pattern       string                 `protobuf:"bytes,4,opt,name=pattern,proto3" json:"pattern,omitempty"`
-	Limit         int32                  `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Account   string                 `protobuf:"bytes,1,opt,name=account,proto3" json:"account,omitempty"`
+	Principal string                 `protobuf:"bytes,2,opt,name=principal,proto3" json:"principal,omitempty"`
+	Action    string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
+	Pattern   string                 `protobuf:"bytes,4,opt,name=pattern,proto3" json:"pattern,omitempty"`
+	Limit     int32                  `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`
+	// fields are OPTIONAL object-metadata predicates narrowing the result: an
+	// allowed object is returned only when its metadata satisfies every one of
+	// them. Omitting the map is exactly a nil map in Go — it filters nothing, so
+	// an existing client is unaffected.
+	//
+	// The meaning is provider.Filter's Fields contract verbatim: AND across keys,
+	// a field ABSENT from an object never matches (not even against a null want),
+	// a COLLECTION field matches by MEMBERSHIP, everything else by EQUALITY, and
+	// comparison is TYPED. google.protobuf.Value is used rather than a JSON string
+	// precisely because it preserves the string/number/bool/list distinction the
+	// typed comparison rests on: a Value string "5" does NOT match a numeric 5 in
+	// metadata, while a Value number 5 matches an integer 5 (numbers compare
+	// across Go numeric types by value). A list Value is a CONTAINER want and
+	// therefore compares by equality, not membership.
+	//
+	// CAVEAT: google.protobuf.Value carries a number as a double, so an integer
+	// beyond 2^53 loses precision in transit. Send a key that large as a string
+	// and store it as a string.
+	Fields        map[string]*structpb.Value `protobuf:"bytes,6,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -629,6 +649,13 @@ func (x *EnumerateRequest) GetLimit() int32 {
 		return x.Limit
 	}
 	return 0
+}
+
+func (x *EnumerateRequest) GetFields() map[string]*structpb.Value {
+	if x != nil {
+		return x.Fields
+	}
+	return nil
 }
 
 type EnumerateResponse struct {
@@ -2794,7 +2821,7 @@ var File_service_proto protoreflect.FileDescriptor
 
 const file_service_proto_rawDesc = "" +
 	"\n" +
-	"\rservice.proto\x12\baperture\"\a\n" +
+	"\rservice.proto\x12\baperture\x1a\x1cgoogle/protobuf/struct.proto\"\a\n" +
 	"\x05Empty\"L\n" +
 	"\x0eFieldPredicate\x12\x14\n" +
 	"\x05field\x18\x01 \x01(\tR\x05field\x12\x0e\n" +
@@ -2827,13 +2854,17 @@ const file_service_proto_rawDesc = "" +
 	"error_code\x18\x02 \x01(\tR\terrorCode\x12#\n" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\"G\n" +
 	"\x12CheckBatchResponse\x121\n" +
-	"\aresults\x18\x01 \x03(\v2\x17.aperture.BatchDecisionR\aresults\"\x92\x01\n" +
+	"\aresults\x18\x01 \x03(\v2\x17.aperture.BatchDecisionR\aresults\"\xa5\x02\n" +
 	"\x10EnumerateRequest\x12\x18\n" +
 	"\aaccount\x18\x01 \x01(\tR\aaccount\x12\x1c\n" +
 	"\tprincipal\x18\x02 \x01(\tR\tprincipal\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x18\n" +
 	"\apattern\x18\x04 \x01(\tR\apattern\x12\x14\n" +
-	"\x05limit\x18\x05 \x01(\x05R\x05limit\"2\n" +
+	"\x05limit\x18\x05 \x01(\x05R\x05limit\x12>\n" +
+	"\x06fields\x18\x06 \x03(\v2&.aperture.EnumerateRequest.FieldsEntryR\x06fields\x1aQ\n" +
+	"\vFieldsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12,\n" +
+	"\x05value\x18\x02 \x01(\v2\x16.google.protobuf.ValueR\x05value:\x028\x01\"2\n" +
 	"\x11EnumerateResponse\x12\x1d\n" +
 	"\n" +
 	"object_ids\x18\x01 \x03(\tR\tobjectIds\"U\n" +
@@ -3075,7 +3106,7 @@ func file_service_proto_rawDescGZIP() []byte {
 	return file_service_proto_rawDescData
 }
 
-var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 49)
+var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 50)
 var file_service_proto_goTypes = []any{
 	(*Empty)(nil),                     // 0: aperture.Empty
 	(*FieldPredicate)(nil),            // 1: aperture.FieldPredicate
@@ -3125,7 +3156,9 @@ var file_service_proto_goTypes = []any{
 	(*ImpersonationStartRequest)(nil), // 45: aperture.ImpersonationStartRequest
 	(*ImpersonationSession)(nil),      // 46: aperture.ImpersonationSession
 	(*ImpersonationStopRequest)(nil),  // 47: aperture.ImpersonationStopRequest
-	nil,                               // 48: aperture.ApplyTemplateRequest.ParamsEntry
+	nil,                               // 48: aperture.EnumerateRequest.FieldsEntry
+	nil,                               // 49: aperture.ApplyTemplateRequest.ParamsEntry
+	(*structpb.Value)(nil),            // 50: google.protobuf.Value
 }
 var file_service_proto_depIdxs = []int32{
 	1,  // 0: aperture.Filter.predicates:type_name -> aperture.FieldPredicate
@@ -3133,150 +3166,152 @@ var file_service_proto_depIdxs = []int32{
 	5,  // 2: aperture.CheckBatchRequest.queries:type_name -> aperture.CheckRequest
 	6,  // 3: aperture.BatchDecision.decision:type_name -> aperture.Decision
 	8,  // 4: aperture.CheckBatchResponse.results:type_name -> aperture.BatchDecision
-	10, // 5: aperture.EnumerateBatchRequest.queries:type_name -> aperture.EnumerateRequest
-	17, // 6: aperture.EnumerateBatchResponse.results:type_name -> aperture.BatchEnumeration
-	20, // 7: aperture.ExplainBatchResponse.results:type_name -> aperture.BatchTrace
-	4,  // 8: aperture.EntityRequest.actor:type_name -> aperture.Actor
-	4,  // 9: aperture.GetRequest.actor:type_name -> aperture.Actor
-	4,  // 10: aperture.DeleteRequest.actor:type_name -> aperture.Actor
-	4,  // 11: aperture.RuleRequest.actor:type_name -> aperture.Actor
-	4,  // 12: aperture.SimulateRequest.actor:type_name -> aperture.Actor
-	5,  // 13: aperture.SimulateRequest.query:type_name -> aperture.CheckRequest
-	4,  // 14: aperture.MembershipKeyRequest.actor:type_name -> aperture.Actor
-	4,  // 15: aperture.ListGrantsRequest.actor:type_name -> aperture.Actor
-	2,  // 16: aperture.ListGrantsRequest.filter:type_name -> aperture.Filter
-	4,  // 17: aperture.TemplateKeyRequest.actor:type_name -> aperture.Actor
-	4,  // 18: aperture.ApplyTemplateRequest.actor:type_name -> aperture.Actor
-	48, // 19: aperture.ApplyTemplateRequest.params:type_name -> aperture.ApplyTemplateRequest.ParamsEntry
-	4,  // 20: aperture.BulkGrantsRequest.actor:type_name -> aperture.Actor
-	4,  // 21: aperture.BulkDeleteGrantsRequest.actor:type_name -> aperture.Actor
-	4,  // 22: aperture.ExportRequest.actor:type_name -> aperture.Actor
-	4,  // 23: aperture.ImportRequest.actor:type_name -> aperture.Actor
-	4,  // 24: aperture.QueryAuditRequest.actor:type_name -> aperture.Actor
-	46, // 25: aperture.ImpersonationStopRequest.session:type_name -> aperture.ImpersonationSession
-	5,  // 26: aperture.ApertureService.Check:input_type -> aperture.CheckRequest
-	7,  // 27: aperture.ApertureService.CheckBatch:input_type -> aperture.CheckBatchRequest
-	10, // 28: aperture.ApertureService.Enumerate:input_type -> aperture.EnumerateRequest
-	16, // 29: aperture.ApertureService.EnumerateBatch:input_type -> aperture.EnumerateBatchRequest
-	5,  // 30: aperture.ApertureService.Explain:input_type -> aperture.CheckRequest
-	7,  // 31: aperture.ApertureService.ExplainBatch:input_type -> aperture.CheckBatchRequest
-	22, // 32: aperture.ApertureService.PutObjectType:input_type -> aperture.EntityRequest
-	23, // 33: aperture.ApertureService.GetObjectType:input_type -> aperture.GetRequest
-	3,  // 34: aperture.ApertureService.ListObjectTypes:input_type -> aperture.ListRequest
-	24, // 35: aperture.ApertureService.DeleteObjectType:input_type -> aperture.DeleteRequest
-	12, // 36: aperture.ApertureService.ObjectIdentifiers:input_type -> aperture.ObjectIdentifiersRequest
-	22, // 37: aperture.ApertureService.PutPermission:input_type -> aperture.EntityRequest
-	23, // 38: aperture.ApertureService.GetPermission:input_type -> aperture.GetRequest
-	3,  // 39: aperture.ApertureService.ListPermissions:input_type -> aperture.ListRequest
-	24, // 40: aperture.ApertureService.DeletePermission:input_type -> aperture.DeleteRequest
-	22, // 41: aperture.ApertureService.PutPrincipal:input_type -> aperture.EntityRequest
-	23, // 42: aperture.ApertureService.GetPrincipal:input_type -> aperture.GetRequest
-	3,  // 43: aperture.ApertureService.ListPrincipals:input_type -> aperture.ListRequest
-	24, // 44: aperture.ApertureService.DeletePrincipal:input_type -> aperture.DeleteRequest
-	22, // 45: aperture.ApertureService.PutRole:input_type -> aperture.EntityRequest
-	23, // 46: aperture.ApertureService.GetRole:input_type -> aperture.GetRequest
-	3,  // 47: aperture.ApertureService.ListRoles:input_type -> aperture.ListRequest
-	24, // 48: aperture.ApertureService.DeleteRole:input_type -> aperture.DeleteRequest
-	22, // 49: aperture.ApertureService.PutGroup:input_type -> aperture.EntityRequest
-	23, // 50: aperture.ApertureService.GetGroup:input_type -> aperture.GetRequest
-	3,  // 51: aperture.ApertureService.ListGroups:input_type -> aperture.ListRequest
-	24, // 52: aperture.ApertureService.DeleteGroup:input_type -> aperture.DeleteRequest
-	22, // 53: aperture.ApertureService.PutAccount:input_type -> aperture.EntityRequest
-	23, // 54: aperture.ApertureService.GetAccount:input_type -> aperture.GetRequest
-	3,  // 55: aperture.ApertureService.ListAccounts:input_type -> aperture.ListRequest
-	24, // 56: aperture.ApertureService.DeleteAccount:input_type -> aperture.DeleteRequest
-	27, // 57: aperture.ApertureService.PutRule:input_type -> aperture.RuleRequest
-	23, // 58: aperture.ApertureService.GetRule:input_type -> aperture.GetRequest
-	0,  // 59: aperture.ApertureService.ListRules:input_type -> aperture.Empty
-	24, // 60: aperture.ApertureService.DeleteRule:input_type -> aperture.DeleteRequest
-	27, // 61: aperture.ApertureService.ValidateRule:input_type -> aperture.RuleRequest
-	30, // 62: aperture.ApertureService.Simulate:input_type -> aperture.SimulateRequest
-	30, // 63: aperture.ApertureService.SimulateExplain:input_type -> aperture.SimulateRequest
-	14, // 64: aperture.ApertureService.EvaluateRule:input_type -> aperture.EvaluateRuleRequest
-	22, // 65: aperture.ApertureService.PutMembership:input_type -> aperture.EntityRequest
-	31, // 66: aperture.ApertureService.DeleteMembership:input_type -> aperture.MembershipKeyRequest
-	22, // 67: aperture.ApertureService.PutGrant:input_type -> aperture.EntityRequest
-	23, // 68: aperture.ApertureService.GetGrant:input_type -> aperture.GetRequest
-	32, // 69: aperture.ApertureService.ListGrants:input_type -> aperture.ListGrantsRequest
-	24, // 70: aperture.ApertureService.DeleteGrant:input_type -> aperture.DeleteRequest
-	22, // 71: aperture.ApertureService.PutTemplate:input_type -> aperture.EntityRequest
-	34, // 72: aperture.ApertureService.GetTemplate:input_type -> aperture.TemplateKeyRequest
-	3,  // 73: aperture.ApertureService.ListTemplates:input_type -> aperture.ListRequest
-	34, // 74: aperture.ApertureService.DeleteTemplate:input_type -> aperture.TemplateKeyRequest
-	35, // 75: aperture.ApertureService.ApplyTemplate:input_type -> aperture.ApplyTemplateRequest
-	36, // 76: aperture.ApertureService.BulkPutGrants:input_type -> aperture.BulkGrantsRequest
-	37, // 77: aperture.ApertureService.BulkDeleteGrants:input_type -> aperture.BulkDeleteGrantsRequest
-	38, // 78: aperture.ApertureService.Export:input_type -> aperture.ExportRequest
-	40, // 79: aperture.ApertureService.Import:input_type -> aperture.ImportRequest
-	41, // 80: aperture.ApertureService.QueryAudit:input_type -> aperture.QueryAuditRequest
-	43, // 81: aperture.ApertureService.Bestow:input_type -> aperture.BestowRequest
-	44, // 82: aperture.ApertureService.Revoke:input_type -> aperture.RevokeRequest
-	45, // 83: aperture.ApertureService.ImpersonationStart:input_type -> aperture.ImpersonationStartRequest
-	47, // 84: aperture.ApertureService.ImpersonationStop:input_type -> aperture.ImpersonationStopRequest
-	6,  // 85: aperture.ApertureService.Check:output_type -> aperture.Decision
-	9,  // 86: aperture.ApertureService.CheckBatch:output_type -> aperture.CheckBatchResponse
-	11, // 87: aperture.ApertureService.Enumerate:output_type -> aperture.EnumerateResponse
-	18, // 88: aperture.ApertureService.EnumerateBatch:output_type -> aperture.EnumerateBatchResponse
-	19, // 89: aperture.ApertureService.Explain:output_type -> aperture.ExplainResponse
-	21, // 90: aperture.ApertureService.ExplainBatch:output_type -> aperture.ExplainBatchResponse
-	0,  // 91: aperture.ApertureService.PutObjectType:output_type -> aperture.Empty
-	25, // 92: aperture.ApertureService.GetObjectType:output_type -> aperture.EntityResponse
-	26, // 93: aperture.ApertureService.ListObjectTypes:output_type -> aperture.EntityListResponse
-	0,  // 94: aperture.ApertureService.DeleteObjectType:output_type -> aperture.Empty
-	13, // 95: aperture.ApertureService.ObjectIdentifiers:output_type -> aperture.ObjectIdentifiersResponse
-	0,  // 96: aperture.ApertureService.PutPermission:output_type -> aperture.Empty
-	25, // 97: aperture.ApertureService.GetPermission:output_type -> aperture.EntityResponse
-	26, // 98: aperture.ApertureService.ListPermissions:output_type -> aperture.EntityListResponse
-	0,  // 99: aperture.ApertureService.DeletePermission:output_type -> aperture.Empty
-	0,  // 100: aperture.ApertureService.PutPrincipal:output_type -> aperture.Empty
-	25, // 101: aperture.ApertureService.GetPrincipal:output_type -> aperture.EntityResponse
-	26, // 102: aperture.ApertureService.ListPrincipals:output_type -> aperture.EntityListResponse
-	0,  // 103: aperture.ApertureService.DeletePrincipal:output_type -> aperture.Empty
-	0,  // 104: aperture.ApertureService.PutRole:output_type -> aperture.Empty
-	25, // 105: aperture.ApertureService.GetRole:output_type -> aperture.EntityResponse
-	26, // 106: aperture.ApertureService.ListRoles:output_type -> aperture.EntityListResponse
-	0,  // 107: aperture.ApertureService.DeleteRole:output_type -> aperture.Empty
-	0,  // 108: aperture.ApertureService.PutGroup:output_type -> aperture.Empty
-	25, // 109: aperture.ApertureService.GetGroup:output_type -> aperture.EntityResponse
-	26, // 110: aperture.ApertureService.ListGroups:output_type -> aperture.EntityListResponse
-	0,  // 111: aperture.ApertureService.DeleteGroup:output_type -> aperture.Empty
-	0,  // 112: aperture.ApertureService.PutAccount:output_type -> aperture.Empty
-	25, // 113: aperture.ApertureService.GetAccount:output_type -> aperture.EntityResponse
-	26, // 114: aperture.ApertureService.ListAccounts:output_type -> aperture.EntityListResponse
-	0,  // 115: aperture.ApertureService.DeleteAccount:output_type -> aperture.Empty
-	0,  // 116: aperture.ApertureService.PutRule:output_type -> aperture.Empty
-	28, // 117: aperture.ApertureService.GetRule:output_type -> aperture.RuleResponse
-	29, // 118: aperture.ApertureService.ListRules:output_type -> aperture.RuleListResponse
-	0,  // 119: aperture.ApertureService.DeleteRule:output_type -> aperture.Empty
-	0,  // 120: aperture.ApertureService.ValidateRule:output_type -> aperture.Empty
-	6,  // 121: aperture.ApertureService.Simulate:output_type -> aperture.Decision
-	19, // 122: aperture.ApertureService.SimulateExplain:output_type -> aperture.ExplainResponse
-	15, // 123: aperture.ApertureService.EvaluateRule:output_type -> aperture.EvaluateRuleResponse
-	0,  // 124: aperture.ApertureService.PutMembership:output_type -> aperture.Empty
-	0,  // 125: aperture.ApertureService.DeleteMembership:output_type -> aperture.Empty
-	0,  // 126: aperture.ApertureService.PutGrant:output_type -> aperture.Empty
-	25, // 127: aperture.ApertureService.GetGrant:output_type -> aperture.EntityResponse
-	33, // 128: aperture.ApertureService.ListGrants:output_type -> aperture.ListGrantsResponse
-	0,  // 129: aperture.ApertureService.DeleteGrant:output_type -> aperture.Empty
-	0,  // 130: aperture.ApertureService.PutTemplate:output_type -> aperture.Empty
-	25, // 131: aperture.ApertureService.GetTemplate:output_type -> aperture.EntityResponse
-	26, // 132: aperture.ApertureService.ListTemplates:output_type -> aperture.EntityListResponse
-	0,  // 133: aperture.ApertureService.DeleteTemplate:output_type -> aperture.Empty
-	26, // 134: aperture.ApertureService.ApplyTemplate:output_type -> aperture.EntityListResponse
-	0,  // 135: aperture.ApertureService.BulkPutGrants:output_type -> aperture.Empty
-	0,  // 136: aperture.ApertureService.BulkDeleteGrants:output_type -> aperture.Empty
-	39, // 137: aperture.ApertureService.Export:output_type -> aperture.ExportResponse
-	0,  // 138: aperture.ApertureService.Import:output_type -> aperture.Empty
-	42, // 139: aperture.ApertureService.QueryAudit:output_type -> aperture.QueryAuditResponse
-	0,  // 140: aperture.ApertureService.Bestow:output_type -> aperture.Empty
-	0,  // 141: aperture.ApertureService.Revoke:output_type -> aperture.Empty
-	46, // 142: aperture.ApertureService.ImpersonationStart:output_type -> aperture.ImpersonationSession
-	0,  // 143: aperture.ApertureService.ImpersonationStop:output_type -> aperture.Empty
-	85, // [85:144] is the sub-list for method output_type
-	26, // [26:85] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	48, // 5: aperture.EnumerateRequest.fields:type_name -> aperture.EnumerateRequest.FieldsEntry
+	10, // 6: aperture.EnumerateBatchRequest.queries:type_name -> aperture.EnumerateRequest
+	17, // 7: aperture.EnumerateBatchResponse.results:type_name -> aperture.BatchEnumeration
+	20, // 8: aperture.ExplainBatchResponse.results:type_name -> aperture.BatchTrace
+	4,  // 9: aperture.EntityRequest.actor:type_name -> aperture.Actor
+	4,  // 10: aperture.GetRequest.actor:type_name -> aperture.Actor
+	4,  // 11: aperture.DeleteRequest.actor:type_name -> aperture.Actor
+	4,  // 12: aperture.RuleRequest.actor:type_name -> aperture.Actor
+	4,  // 13: aperture.SimulateRequest.actor:type_name -> aperture.Actor
+	5,  // 14: aperture.SimulateRequest.query:type_name -> aperture.CheckRequest
+	4,  // 15: aperture.MembershipKeyRequest.actor:type_name -> aperture.Actor
+	4,  // 16: aperture.ListGrantsRequest.actor:type_name -> aperture.Actor
+	2,  // 17: aperture.ListGrantsRequest.filter:type_name -> aperture.Filter
+	4,  // 18: aperture.TemplateKeyRequest.actor:type_name -> aperture.Actor
+	4,  // 19: aperture.ApplyTemplateRequest.actor:type_name -> aperture.Actor
+	49, // 20: aperture.ApplyTemplateRequest.params:type_name -> aperture.ApplyTemplateRequest.ParamsEntry
+	4,  // 21: aperture.BulkGrantsRequest.actor:type_name -> aperture.Actor
+	4,  // 22: aperture.BulkDeleteGrantsRequest.actor:type_name -> aperture.Actor
+	4,  // 23: aperture.ExportRequest.actor:type_name -> aperture.Actor
+	4,  // 24: aperture.ImportRequest.actor:type_name -> aperture.Actor
+	4,  // 25: aperture.QueryAuditRequest.actor:type_name -> aperture.Actor
+	46, // 26: aperture.ImpersonationStopRequest.session:type_name -> aperture.ImpersonationSession
+	50, // 27: aperture.EnumerateRequest.FieldsEntry.value:type_name -> google.protobuf.Value
+	5,  // 28: aperture.ApertureService.Check:input_type -> aperture.CheckRequest
+	7,  // 29: aperture.ApertureService.CheckBatch:input_type -> aperture.CheckBatchRequest
+	10, // 30: aperture.ApertureService.Enumerate:input_type -> aperture.EnumerateRequest
+	16, // 31: aperture.ApertureService.EnumerateBatch:input_type -> aperture.EnumerateBatchRequest
+	5,  // 32: aperture.ApertureService.Explain:input_type -> aperture.CheckRequest
+	7,  // 33: aperture.ApertureService.ExplainBatch:input_type -> aperture.CheckBatchRequest
+	22, // 34: aperture.ApertureService.PutObjectType:input_type -> aperture.EntityRequest
+	23, // 35: aperture.ApertureService.GetObjectType:input_type -> aperture.GetRequest
+	3,  // 36: aperture.ApertureService.ListObjectTypes:input_type -> aperture.ListRequest
+	24, // 37: aperture.ApertureService.DeleteObjectType:input_type -> aperture.DeleteRequest
+	12, // 38: aperture.ApertureService.ObjectIdentifiers:input_type -> aperture.ObjectIdentifiersRequest
+	22, // 39: aperture.ApertureService.PutPermission:input_type -> aperture.EntityRequest
+	23, // 40: aperture.ApertureService.GetPermission:input_type -> aperture.GetRequest
+	3,  // 41: aperture.ApertureService.ListPermissions:input_type -> aperture.ListRequest
+	24, // 42: aperture.ApertureService.DeletePermission:input_type -> aperture.DeleteRequest
+	22, // 43: aperture.ApertureService.PutPrincipal:input_type -> aperture.EntityRequest
+	23, // 44: aperture.ApertureService.GetPrincipal:input_type -> aperture.GetRequest
+	3,  // 45: aperture.ApertureService.ListPrincipals:input_type -> aperture.ListRequest
+	24, // 46: aperture.ApertureService.DeletePrincipal:input_type -> aperture.DeleteRequest
+	22, // 47: aperture.ApertureService.PutRole:input_type -> aperture.EntityRequest
+	23, // 48: aperture.ApertureService.GetRole:input_type -> aperture.GetRequest
+	3,  // 49: aperture.ApertureService.ListRoles:input_type -> aperture.ListRequest
+	24, // 50: aperture.ApertureService.DeleteRole:input_type -> aperture.DeleteRequest
+	22, // 51: aperture.ApertureService.PutGroup:input_type -> aperture.EntityRequest
+	23, // 52: aperture.ApertureService.GetGroup:input_type -> aperture.GetRequest
+	3,  // 53: aperture.ApertureService.ListGroups:input_type -> aperture.ListRequest
+	24, // 54: aperture.ApertureService.DeleteGroup:input_type -> aperture.DeleteRequest
+	22, // 55: aperture.ApertureService.PutAccount:input_type -> aperture.EntityRequest
+	23, // 56: aperture.ApertureService.GetAccount:input_type -> aperture.GetRequest
+	3,  // 57: aperture.ApertureService.ListAccounts:input_type -> aperture.ListRequest
+	24, // 58: aperture.ApertureService.DeleteAccount:input_type -> aperture.DeleteRequest
+	27, // 59: aperture.ApertureService.PutRule:input_type -> aperture.RuleRequest
+	23, // 60: aperture.ApertureService.GetRule:input_type -> aperture.GetRequest
+	0,  // 61: aperture.ApertureService.ListRules:input_type -> aperture.Empty
+	24, // 62: aperture.ApertureService.DeleteRule:input_type -> aperture.DeleteRequest
+	27, // 63: aperture.ApertureService.ValidateRule:input_type -> aperture.RuleRequest
+	30, // 64: aperture.ApertureService.Simulate:input_type -> aperture.SimulateRequest
+	30, // 65: aperture.ApertureService.SimulateExplain:input_type -> aperture.SimulateRequest
+	14, // 66: aperture.ApertureService.EvaluateRule:input_type -> aperture.EvaluateRuleRequest
+	22, // 67: aperture.ApertureService.PutMembership:input_type -> aperture.EntityRequest
+	31, // 68: aperture.ApertureService.DeleteMembership:input_type -> aperture.MembershipKeyRequest
+	22, // 69: aperture.ApertureService.PutGrant:input_type -> aperture.EntityRequest
+	23, // 70: aperture.ApertureService.GetGrant:input_type -> aperture.GetRequest
+	32, // 71: aperture.ApertureService.ListGrants:input_type -> aperture.ListGrantsRequest
+	24, // 72: aperture.ApertureService.DeleteGrant:input_type -> aperture.DeleteRequest
+	22, // 73: aperture.ApertureService.PutTemplate:input_type -> aperture.EntityRequest
+	34, // 74: aperture.ApertureService.GetTemplate:input_type -> aperture.TemplateKeyRequest
+	3,  // 75: aperture.ApertureService.ListTemplates:input_type -> aperture.ListRequest
+	34, // 76: aperture.ApertureService.DeleteTemplate:input_type -> aperture.TemplateKeyRequest
+	35, // 77: aperture.ApertureService.ApplyTemplate:input_type -> aperture.ApplyTemplateRequest
+	36, // 78: aperture.ApertureService.BulkPutGrants:input_type -> aperture.BulkGrantsRequest
+	37, // 79: aperture.ApertureService.BulkDeleteGrants:input_type -> aperture.BulkDeleteGrantsRequest
+	38, // 80: aperture.ApertureService.Export:input_type -> aperture.ExportRequest
+	40, // 81: aperture.ApertureService.Import:input_type -> aperture.ImportRequest
+	41, // 82: aperture.ApertureService.QueryAudit:input_type -> aperture.QueryAuditRequest
+	43, // 83: aperture.ApertureService.Bestow:input_type -> aperture.BestowRequest
+	44, // 84: aperture.ApertureService.Revoke:input_type -> aperture.RevokeRequest
+	45, // 85: aperture.ApertureService.ImpersonationStart:input_type -> aperture.ImpersonationStartRequest
+	47, // 86: aperture.ApertureService.ImpersonationStop:input_type -> aperture.ImpersonationStopRequest
+	6,  // 87: aperture.ApertureService.Check:output_type -> aperture.Decision
+	9,  // 88: aperture.ApertureService.CheckBatch:output_type -> aperture.CheckBatchResponse
+	11, // 89: aperture.ApertureService.Enumerate:output_type -> aperture.EnumerateResponse
+	18, // 90: aperture.ApertureService.EnumerateBatch:output_type -> aperture.EnumerateBatchResponse
+	19, // 91: aperture.ApertureService.Explain:output_type -> aperture.ExplainResponse
+	21, // 92: aperture.ApertureService.ExplainBatch:output_type -> aperture.ExplainBatchResponse
+	0,  // 93: aperture.ApertureService.PutObjectType:output_type -> aperture.Empty
+	25, // 94: aperture.ApertureService.GetObjectType:output_type -> aperture.EntityResponse
+	26, // 95: aperture.ApertureService.ListObjectTypes:output_type -> aperture.EntityListResponse
+	0,  // 96: aperture.ApertureService.DeleteObjectType:output_type -> aperture.Empty
+	13, // 97: aperture.ApertureService.ObjectIdentifiers:output_type -> aperture.ObjectIdentifiersResponse
+	0,  // 98: aperture.ApertureService.PutPermission:output_type -> aperture.Empty
+	25, // 99: aperture.ApertureService.GetPermission:output_type -> aperture.EntityResponse
+	26, // 100: aperture.ApertureService.ListPermissions:output_type -> aperture.EntityListResponse
+	0,  // 101: aperture.ApertureService.DeletePermission:output_type -> aperture.Empty
+	0,  // 102: aperture.ApertureService.PutPrincipal:output_type -> aperture.Empty
+	25, // 103: aperture.ApertureService.GetPrincipal:output_type -> aperture.EntityResponse
+	26, // 104: aperture.ApertureService.ListPrincipals:output_type -> aperture.EntityListResponse
+	0,  // 105: aperture.ApertureService.DeletePrincipal:output_type -> aperture.Empty
+	0,  // 106: aperture.ApertureService.PutRole:output_type -> aperture.Empty
+	25, // 107: aperture.ApertureService.GetRole:output_type -> aperture.EntityResponse
+	26, // 108: aperture.ApertureService.ListRoles:output_type -> aperture.EntityListResponse
+	0,  // 109: aperture.ApertureService.DeleteRole:output_type -> aperture.Empty
+	0,  // 110: aperture.ApertureService.PutGroup:output_type -> aperture.Empty
+	25, // 111: aperture.ApertureService.GetGroup:output_type -> aperture.EntityResponse
+	26, // 112: aperture.ApertureService.ListGroups:output_type -> aperture.EntityListResponse
+	0,  // 113: aperture.ApertureService.DeleteGroup:output_type -> aperture.Empty
+	0,  // 114: aperture.ApertureService.PutAccount:output_type -> aperture.Empty
+	25, // 115: aperture.ApertureService.GetAccount:output_type -> aperture.EntityResponse
+	26, // 116: aperture.ApertureService.ListAccounts:output_type -> aperture.EntityListResponse
+	0,  // 117: aperture.ApertureService.DeleteAccount:output_type -> aperture.Empty
+	0,  // 118: aperture.ApertureService.PutRule:output_type -> aperture.Empty
+	28, // 119: aperture.ApertureService.GetRule:output_type -> aperture.RuleResponse
+	29, // 120: aperture.ApertureService.ListRules:output_type -> aperture.RuleListResponse
+	0,  // 121: aperture.ApertureService.DeleteRule:output_type -> aperture.Empty
+	0,  // 122: aperture.ApertureService.ValidateRule:output_type -> aperture.Empty
+	6,  // 123: aperture.ApertureService.Simulate:output_type -> aperture.Decision
+	19, // 124: aperture.ApertureService.SimulateExplain:output_type -> aperture.ExplainResponse
+	15, // 125: aperture.ApertureService.EvaluateRule:output_type -> aperture.EvaluateRuleResponse
+	0,  // 126: aperture.ApertureService.PutMembership:output_type -> aperture.Empty
+	0,  // 127: aperture.ApertureService.DeleteMembership:output_type -> aperture.Empty
+	0,  // 128: aperture.ApertureService.PutGrant:output_type -> aperture.Empty
+	25, // 129: aperture.ApertureService.GetGrant:output_type -> aperture.EntityResponse
+	33, // 130: aperture.ApertureService.ListGrants:output_type -> aperture.ListGrantsResponse
+	0,  // 131: aperture.ApertureService.DeleteGrant:output_type -> aperture.Empty
+	0,  // 132: aperture.ApertureService.PutTemplate:output_type -> aperture.Empty
+	25, // 133: aperture.ApertureService.GetTemplate:output_type -> aperture.EntityResponse
+	26, // 134: aperture.ApertureService.ListTemplates:output_type -> aperture.EntityListResponse
+	0,  // 135: aperture.ApertureService.DeleteTemplate:output_type -> aperture.Empty
+	26, // 136: aperture.ApertureService.ApplyTemplate:output_type -> aperture.EntityListResponse
+	0,  // 137: aperture.ApertureService.BulkPutGrants:output_type -> aperture.Empty
+	0,  // 138: aperture.ApertureService.BulkDeleteGrants:output_type -> aperture.Empty
+	39, // 139: aperture.ApertureService.Export:output_type -> aperture.ExportResponse
+	0,  // 140: aperture.ApertureService.Import:output_type -> aperture.Empty
+	42, // 141: aperture.ApertureService.QueryAudit:output_type -> aperture.QueryAuditResponse
+	0,  // 142: aperture.ApertureService.Bestow:output_type -> aperture.Empty
+	0,  // 143: aperture.ApertureService.Revoke:output_type -> aperture.Empty
+	46, // 144: aperture.ApertureService.ImpersonationStart:output_type -> aperture.ImpersonationSession
+	0,  // 145: aperture.ApertureService.ImpersonationStop:output_type -> aperture.Empty
+	87, // [87:146] is the sub-list for method output_type
+	28, // [28:87] is the sub-list for method input_type
+	28, // [28:28] is the sub-list for extension type_name
+	28, // [28:28] is the sub-list for extension extendee
+	0,  // [0:28] is the sub-list for field type_name
 }
 
 func init() { file_service_proto_init() }
@@ -3290,7 +3325,7 @@ func file_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_service_proto_rawDesc), len(file_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   49,
+			NumMessages:   50,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
