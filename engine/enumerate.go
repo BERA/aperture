@@ -47,6 +47,26 @@ type EnumerateRequest struct {
 	// Filtering an object-type that has no metadata source is an APERTURE_*
 	// coded error, never a silently empty result.
 	Fields map[string]any
+	// References are OPTIONAL reference edges that restrict the result to the
+	// identities a holder object's DECLARED reference field contains — "the brands
+	// in dataset X". Nil or empty (the default) restricts nothing.
+	//
+	// It is a DEREFERENCE, not a predicate, which is why it is not spelled through
+	// Fields: a brand carries no field naming its datasets, so no predicate on
+	// brand can express the question. Fields answers the mirror image ("which
+	// datasets contain brand Y?") because THAT side holds the field.
+	//
+	// Several edges AND: brands in dataset X and in campaign Z. An edge composes
+	// with Fields in the same request, and both are applied BEFORE Limit. Exactly
+	// one hop is taken — the identities an edge yields are never themselves
+	// dereferenced.
+	//
+	// See reference.go for the security semantics, which are the point: the holder
+	// is Checked with this request's Action and a failure yields an EMPTY result
+	// rather than an error, an absent holder is APERTURE_NOT_FOUND only inside the
+	// request's account, and a dangling referenced identity is skipped rather than
+	// failing the decision.
+	References []ReferenceEdge
 	// Limit caps the number of returned object ids. <= 0 means the default bound.
 	Limit int
 }
@@ -96,6 +116,13 @@ func WithMetadata(f MetadataFetcher) Option {
 // asking for the first 10 objects tagged "brand:Y" searches every candidate for
 // them rather than tagging the first 10 candidates and returning the few that
 // stuck.
+//
+// When the request carries References, the enumeration is FIRST restricted to the
+// identities those declared reference fields name — "the brands in dataset X" —
+// and only then decided and predicated. Restriction, decision and Fields all
+// precede Limit for the same reason. See reference.go for the dereference's
+// fail-closed rules; the one that shows up here is that a holder the principal
+// may not see yields an EMPTY result and no error.
 //
 // Enumerate is the most cache-sensitive op, so it is deliberately bounded: each
 // resolver's Members is itself limited, and the overall result is capped by
@@ -154,6 +181,19 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 	// The decision context reused per candidate. Object is filled per candidate.
 	decReq := Request{Account: req.Account, Principal: req.Principal, Action: req.Action}
 
+	// Reference edges are dereferenced ONCE for the whole enumeration, against the
+	// same grants and subject set the candidates are decided with. A holder the
+	// principal may not see — or one absent from outside the account — fails
+	// closed to an empty result rather than an error, so it is indistinguishable
+	// from a holder that simply contains nothing visible.
+	restrictTo, open, err := e.referenceRestriction(ctx, req, decReq, grants, permCache)
+	if err != nil {
+		return nil, err
+	}
+	if !open {
+		return []string{}, nil
+	}
+
 	// Gather candidate ids from the ALLOW grants whose action matches.
 	seen := make(map[string]struct{})
 	candidates := make([]identity.Identity, 0)
@@ -190,6 +230,14 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 
 	out := make([]string, 0, len(candidates))
 	for _, obj := range candidates {
+		// The reference restriction is a set membership test with no I/O behind it,
+		// so it runs first: a candidate the holder never named cannot be returned
+		// however the decision goes. A nil set means the request carried no edges.
+		if restrictTo != nil {
+			if _, in := restrictTo[obj.String()]; !in {
+				continue
+			}
+		}
 		decReq.Object = obj.String()
 		dec, err := e.evaluate(ctx, decReq, obj, grants, permCache)
 		if err != nil {
@@ -275,6 +323,15 @@ func validateEnumerateRequest(req EnumerateRequest) error {
 		return aerr.New(aerr.APERTURE_INVALID_INPUT, "engine: enumerate action is empty")
 	case req.Pattern == "":
 		return aerr.New(aerr.APERTURE_INVALID_INPUT, "engine: enumerate pattern is empty")
+	}
+	// Reference edges are syntax-checked here — before membership, storage, or any
+	// provider is touched — because a malformed edge says nothing about the data
+	// and everything about the caller. What an edge POINTS AT is resolved later,
+	// where the fail-closed rules apply.
+	for _, edge := range req.References {
+		if _, _, err := edge.holder(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

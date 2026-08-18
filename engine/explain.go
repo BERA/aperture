@@ -115,6 +115,12 @@ type GrantEvaluation struct {
 // record every surface can serialize (the Twirp trace JSON and the MCP explain
 // tool both carry Trace verbatim) without importing the rules package's types.
 //
+// A Trace's notes all come from rule evaluation, but the CHANNEL is wider than
+// that: an enumeration that skips a dangling object reference records a
+// "dangling_reference" note on the same collector (see engine/reference.go), so a
+// caller that installs one with rules.WithNoteCollector reads both kinds back
+// through this same projection.
+//
 // SHAPE AND PATH ONLY. A note names the variable path, the shape expected and the
 // shape found. It NEVER carries a metadata value, an object id, or anything else
 // that could leak data across accounts — Explain output crosses account
@@ -125,7 +131,7 @@ type EvaluationNote struct {
 	// Rule is the rule reference that was evaluated.
 	Rule string
 	// Kind classifies the observation ("shape_mismatch", "absent_field",
-	// "date_invalid", "date_bounds_inverted").
+	// "date_invalid", "date_bounds_inverted", "dangling_reference").
 	Kind string
 	// Op is the comparison operator that made the observation ("hasAll", ...).
 	Op string

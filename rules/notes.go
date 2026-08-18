@@ -65,6 +65,21 @@ const (
 	// object, which is indistinguishable from a rule nothing satisfies unless it
 	// is said out loud.
 	NoteDateBoundsInverted NoteKind = "date_bounds_inverted"
+	// NoteDanglingReference records that a DECLARED OBJECT REFERENCE pointed at an
+	// identity the target type's provider no longer serves — a dataset still
+	// listing a brand that has since been deleted. The identity is SKIPPED and the
+	// decision proceeds: an application-level foreign key has no database
+	// constraint behind it, so one deleted row must not take down every decision
+	// that traverses the field holding it.
+	//
+	// It is not recorded by rule evaluation — the reference channel is the engine's
+	// enumeration path — but it is the same class of observation and rides the same
+	// collector, so it renders through Explain's notes exactly like the others.
+	// Path is the DECLARATION ("dataset.current_brands"), Expected the declared
+	// target object-type, Actual "absent". As with every note, the dangling
+	// identity itself is never carried: it goes to the operator's log, not to a
+	// diagnostic that crosses account boundaries.
+	NoteDanglingReference NoteKind = "dangling_reference"
 )
 
 // Note is one diagnostic observation recorded during rule evaluation.
@@ -99,6 +114,7 @@ const anonymousOperand = "(expression)"
 //	object.tags: absent; hasNone matched because the field is missing
 //	object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z
 //	object.hired_at: between bounds are inverted; the lower bound is after the upper bound, so nothing can match
+//	dataset.current_brands: references a brand that no longer exists; the identity was skipped
 func (n Note) String() string {
 	path := n.Path
 	if path == "" {
@@ -114,6 +130,9 @@ func (n Note) String() string {
 	case NoteDateBoundsInverted:
 		return fmt.Sprintf("%s: %s bounds are inverted; the lower bound is after the upper "+
 			"bound, so nothing can match", path, n.Op)
+	case NoteDanglingReference:
+		return fmt.Sprintf("%s: references a %s that no longer exists; the identity was skipped",
+			path, n.Expected)
 	default:
 		return fmt.Sprintf("%s: %s (%s)", path, n.Kind, n.Op)
 	}
