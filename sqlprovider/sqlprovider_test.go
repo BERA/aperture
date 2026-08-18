@@ -24,13 +24,23 @@ var (
 	_ Querier = (*sql.Tx)(nil)
 )
 
-const stmt = `SELECT tier, seats FROM brands WHERE id = $1`
+const (
+	stmt    = `SELECT tier, seats FROM brands WHERE id = $1`
+	allStmt = `SELECT 'brand:' || b.id AS id, b.tier, b.seats FROM brands b`
+	objType = "brand"
+)
 
 // newProvider wires a Provider onto a fake database with the given script.
 func newProvider(t *testing.T, s *script, cfg Config) *Provider {
 	t.Helper()
+	if cfg.ObjectType == "" {
+		cfg.ObjectType = objType
+	}
 	if cfg.FetchQuery == "" {
 		cfg.FetchQuery = stmt
+	}
+	if cfg.ListQuery == "" {
+		cfg.ListQuery = allStmt
 	}
 	p, err := New(newFakeDB(t, s), cfg)
 	if err != nil {
@@ -56,10 +66,17 @@ func TestNewRejectsMisconfiguration(t *testing.T) {
 		q    Querier
 		cfg  Config
 	}{
-		{"nil querier", nil, Config{FetchQuery: stmt}},
-		{"blank fetch query", db, Config{}},
-		{"whitespace fetch query", db, Config{FetchQuery: "   \n\t "}},
-		{"negative timeout", db, Config{FetchQuery: stmt, Timeout: -time.Second}},
+		{"nil querier", nil, Config{ObjectType: objType, FetchQuery: stmt, ListQuery: allStmt}},
+		{"blank object type", db, Config{FetchQuery: stmt, ListQuery: allStmt}},
+		{"whitespace object type", db, Config{ObjectType: "  ", FetchQuery: stmt, ListQuery: allStmt}},
+		{"blank fetch query", db, Config{ObjectType: objType, ListQuery: allStmt}},
+		{"whitespace fetch query", db, Config{ObjectType: objType, FetchQuery: "   \n\t ", ListQuery: allStmt}},
+		// A provider that could be fetched from but not enumerated would answer
+		// List with an error, and an errored enumeration reads as "no access" one
+		// layer up. Both statements are therefore required.
+		{"blank list query", db, Config{ObjectType: objType, FetchQuery: stmt}},
+		{"whitespace list query", db, Config{ObjectType: objType, FetchQuery: stmt, ListQuery: " \n "}},
+		{"negative timeout", db, Config{ObjectType: objType, FetchQuery: stmt, ListQuery: allStmt, Timeout: -time.Second}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -412,16 +429,6 @@ func TestFetchIsSafeForConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-}
-
-// List and Query land in E2-S3. Until then they report a code rather than an
-// empty slice: an empty enumeration reads as "no access" and would hide the gap.
-func TestListAndQueryAreNotImplementedYet(t *testing.T) {
-	p := newProvider(t, &script{}, Config{})
-	_, err := p.List(context.Background())
-	mustCode(t, err, aerr.APERTURE_UNIMPLEMENTED)
-	_, err = p.Query(context.Background(), provider.Filter{})
-	mustCode(t, err, aerr.APERTURE_UNIMPLEMENTED)
 }
 
 // A *Provider is registrable exactly as csvprovider's is, which is the whole

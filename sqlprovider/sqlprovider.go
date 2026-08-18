@@ -7,7 +7,9 @@
 //
 //	db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 //	brands, err := sqlprovider.New(db, sqlprovider.Config{
+//		ObjectType: "brand",
 //		FetchQuery: `SELECT tier, seats, active FROM brands WHERE id = $1`,
+//		ListQuery:  `SELECT 'brand:' || b.id AS id, tier, seats, active FROM brands b`,
 //	})
 //	if err != nil { return err }
 //	reg.MustRegister("brand", brands)
@@ -53,6 +55,71 @@
 // originates outside the process, so a provider that pasted it into a statement
 // would hand every caller of Check arbitrary SQL execution. There is no API here
 // that builds a statement from a value.
+//
+// # What List and Query enumerate
+//
+// Enumeration runs a SECOND statement, Config.ListQuery — the "get all" — and it
+// binds NO parameters. Every row it returns is one object of this provider's
+// type, and one of its columns, Config.IDColumn (default "id"), carries that
+// object's IDENTITY.
+//
+// The identity is COMPOSED BY THE DEVELOPER, in SQL, and Aperture supplies no
+// template for it:
+//
+//	SELECT 'brand:' || b.id AS id, b.tier, b.seats FROM brands b
+//
+// That is deliberate. An Aperture identity is hierarchical and host-shaped —
+// "brand:42" for one deployment, "account:acme/brand:42" for another — and the
+// prefix is exactly where a host expresses its tenancy. A template baked in here
+// would be a second place tenancy is decided, disagreeing with the first. The
+// column is a string, so the statement can build whatever the host's identities
+// actually look like, and Fetch's `WHERE id = $1` still binds a bare key.
+//
+// The id column is the identity, not a metadata field: it is removed from the
+// row before the remaining columns become metadata. Every other column maps
+// exactly as it does for Fetch, through the same table.
+//
+// A row Aperture cannot place is an APERTURE_SQL_PROVIDER_ROW_IDENTITY error
+// naming the row's position in the result, never a row silently skipped:
+//
+//   - the result has no id column at all,
+//   - the row's id is NULL, empty, or not textual,
+//   - the id does not parse as an identity,
+//   - the identity's TERMINAL SEGMENT TYPE is not this provider's object-type.
+//
+// The last one is the one that matters most. A "brand:1" row returned by the
+// statement wired under the "dataset" object-type must never reach the cache:
+// it would be cached under an identity this provider's own Fetch could never
+// return, so a later Check would read one type's row as another type's object.
+// Skipping such rows instead would be worse still — enumeration would come back
+// short, and short enumeration reads as "no access".
+//
+// # Query filters in Go, never in SQL
+//
+// Query runs the SAME "get all" statement and applies Filter.Fields with
+// provider.MatchFields, in Go. Predicates are NEVER templated into the
+// developer's statement.
+//
+// That is a decision about correctness, not convenience. The Fields contract
+// says comparison is TYPED and never a string rendering — "5" does not equal 5,
+// and int64(5) does equal float64(5) — because those are the rules engine's own
+// comparison semantics, and Enumerate must not select an object that Check then
+// denies over the same value. Postgres will happily coerce '5' to 5, so a
+// predicate rendered into SQL would answer a different question than the rule
+// evaluated over the same field. Reproducing a collection field's MEMBERSHIP
+// rule across text[], jsonb, and a delimited string is the same hazard again.
+// Aperture therefore does the comparison once, in one place, for every provider.
+//
+// The cost is honest: the whole object-type is materialised per enumeration, and
+// the Registry's per-type TTL cache is what absorbs it. Filter.Pattern and
+// Filter.Limit are applied to the rows as they stream — pattern first, then the
+// field predicates, then the limit — so a bounded enumeration stops reading
+// early. A very large table will hurt; that is a known, accepted trade for not
+// having two comparison semantics.
+//
+// A mid-iteration failure is checked (rows.Err) after the loop and reported. It
+// is never a short but successful result: a truncated enumeration under-reports
+// access, and under-reported access denies silently.
 //
 // # Columns become metadata
 //
@@ -216,8 +283,22 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// DefaultIDColumn is the result column ListQuery must expose the identity in
+// when Config.IDColumn is empty. It is "id" because that is what the developer
+// writing `SELECT 'brand:' || b.id AS id` already types, and the CSV loader's
+// required header column is spelled the same way.
+const DefaultIDColumn = "id"
+
 // Config is the developer-supplied wiring for one object-type's provider.
 type Config struct {
+	// ObjectType is the object-type this provider serves — the same key it is
+	// registered under in a provider.Registry.
+	//
+	// It is required, and it is not decoration: every row the list statement
+	// returns is checked against it, so a row whose identity belongs to another
+	// type is rejected instead of cached under an identity this provider's own
+	// Fetch could never return.
+	ObjectType string
 	// FetchQuery is the "get one" statement. It takes exactly one placeholder,
 	// written in the database's own syntax and passed through untouched, to which
 	// Fetch binds the identity's terminal segment value:
@@ -227,6 +308,24 @@ type Config struct {
 	// Every column it returns becomes a metadata field keyed by the column name,
 	// so the SELECT list is the field list. Required.
 	FetchQuery string
+	// ListQuery is the "get all" statement behind List and Query. It takes NO
+	// parameters, returns one row per object of this type, and must select the
+	// object's full identity as IDColumn:
+	//
+	//	SELECT 'brand:' || b.id AS id, b.tier, b.seats FROM brands b
+	//
+	// Every other column becomes a metadata field keyed by its column name,
+	// exactly as for FetchQuery.
+	//
+	// It is required. An ObjectProvider owes List and Query, and a provider that
+	// answered them with an error would enumerate as "no objects" one layer up —
+	// which reads as "no access". A provider that can be fetched from but not
+	// enumerated is therefore not a configuration this package offers.
+	ListQuery string
+	// IDColumn names the ListQuery result column holding each row's identity.
+	// Empty means DefaultIDColumn ("id"). The column is removed from the row
+	// before the rest becomes metadata: it is the identity, not a field.
+	IDColumn string
 	// Timeout bounds one statement, applied with context.WithTimeout on top of
 	// the caller's context. Zero means DefaultTimeout; negative is a
 	// configuration error. There is no "no timeout" setting.
@@ -238,7 +337,10 @@ type Config struct {
 // pooling happens beneath it.
 type Provider struct {
 	q          Querier
+	objectType string
 	fetchQuery string
+	listQuery  string
+	idColumn   string
 	timeout    time.Duration
 }
 
@@ -246,8 +348,9 @@ type Provider struct {
 // Register it under the object-type whose instances the statement describes.
 //
 // Unlike csvprovider.New — which defers to first use because the file it names
-// may not exist yet — this validates now: a nil Querier, a blank FetchQuery, or
-// a negative Timeout is a wiring mistake that would otherwise first surface as a
+// may not exist yet — this validates now: a nil Querier, a blank ObjectType,
+// FetchQuery, or ListQuery, or a negative Timeout is a wiring mistake that would
+// otherwise first surface as a
 // failed decision, and an access-control engine should not learn about its own
 // misconfiguration from a denied Check.
 func New(q Querier, cfg Config) (*Provider, error) {
@@ -255,10 +358,24 @@ func New(q Querier, cfg Config) (*Provider, error) {
 		return nil, aerr.New(aerr.APERTURE_CONFIG_INVALID,
 			"sqlprovider: nil Querier; pass a *sql.DB or another handle with QueryContext and QueryRowContext")
 	}
+	objectType := strings.TrimSpace(cfg.ObjectType)
+	if objectType == "" {
+		return nil, aerr.New(aerr.APERTURE_CONFIG_INVALID,
+			"sqlprovider: Config.ObjectType is required; it is the object-type this provider is registered under, and every enumerated row's identity is checked against it")
+	}
 	stmt := strings.TrimSpace(cfg.FetchQuery)
 	if stmt == "" {
 		return nil, aerr.New(aerr.APERTURE_CONFIG_INVALID,
 			"sqlprovider: Config.FetchQuery is required; it is the statement that fetches one object by its terminal segment value")
+	}
+	listStmt := strings.TrimSpace(cfg.ListQuery)
+	if listStmt == "" {
+		return nil, aerr.New(aerr.APERTURE_CONFIG_INVALID,
+			"sqlprovider: Config.ListQuery is required; it is the statement that returns every object of this type, with its identity composed in the id column (SELECT 'brand:' || b.id AS id, ...)")
+	}
+	idColumn := strings.TrimSpace(cfg.IDColumn)
+	if idColumn == "" {
+		idColumn = DefaultIDColumn
 	}
 	if cfg.Timeout < 0 {
 		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
@@ -269,7 +386,14 @@ func New(q Querier, cfg Config) (*Provider, error) {
 	if timeout == 0 {
 		timeout = DefaultTimeout
 	}
-	return &Provider{q: q, fetchQuery: stmt, timeout: timeout}, nil
+	return &Provider{
+		q:          q,
+		objectType: objectType,
+		fetchQuery: stmt,
+		listQuery:  listStmt,
+		idColumn:   idColumn,
+		timeout:    timeout,
+	}, nil
 }
 
 // Fetch returns id's metadata by running the configured fetch statement with
@@ -331,25 +455,201 @@ func (p *Provider) Fetch(ctx context.Context, id identity.Identity) (provider.Me
 	return md, nil
 }
 
-// List returns the objects of this provider's type.
+// List returns every object of this provider's type, in the order the "get all"
+// statement returns them. It is Query with the zero Filter.
 //
-// Enumeration is E2-S3: it needs a second configured statement and an id column
-// to build each identity from, neither of which exists yet. It reports
-// APERTURE_UNIMPLEMENTED rather than an empty slice, because an empty
-// enumeration reads as "no objects" — and, through scope resolution, as "no
-// access" — which would hide the gap instead of naming it.
-func (p *Provider) List(_ context.Context) ([]provider.Object, error) {
-	return nil, aerr.New(aerr.APERTURE_UNIMPLEMENTED,
-		"sqlprovider: List is not implemented yet; this provider currently serves Fetch only")
+// Each row's IDColumn is the object's identity, composed by the developer in
+// SQL; every other column becomes a metadata field keyed by its column name. A
+// row Aperture cannot place — no id column, a NULL/empty/non-textual id, an
+// unparseable identity, or an identity whose terminal segment type is not this
+// provider's object-type — is an APERTURE_SQL_PROVIDER_ROW_IDENTITY error naming
+// the row, never a row silently skipped.
+func (p *Provider) List(ctx context.Context) ([]provider.Object, error) {
+	return p.enumerate(ctx, provider.Filter{})
 }
 
-// Query returns the objects of this provider's type that satisfy filter. Like
-// List it lands in E2-S3, and reports APERTURE_UNIMPLEMENTED for the same
-// reason: a silently empty filtered enumeration is indistinguishable from a
-// denial.
-func (p *Provider) Query(_ context.Context, _ provider.Filter) ([]provider.Object, error) {
-	return nil, aerr.New(aerr.APERTURE_UNIMPLEMENTED,
-		"sqlprovider: Query is not implemented yet; this provider currently serves Fetch only")
+// Query returns the objects of this provider's type that satisfy filter.
+//
+// It runs the SAME "get all" statement List runs and applies Filter.Fields with
+// provider.MatchFields, in Go. The predicates are never templated into the
+// developer's SQL: the Fields contract is typed comparison ("5" != 5) and
+// membership for collection fields, which is the rules engine's own semantics,
+// and a database's own coercion rules do not reproduce it — an Enumerate that
+// selected what a Check then denies is exactly the disagreement that contract
+// exists to prevent.
+//
+// Filter.Pattern and Filter.Limit are honoured here as well as by the Registry,
+// so a bounded enumeration stops reading rows early and Query is correct when
+// called standalone. Pattern is applied first, then the field predicates, then
+// the limit.
+func (p *Provider) Query(ctx context.Context, filter provider.Filter) ([]provider.Object, error) {
+	return p.enumerate(ctx, filter)
+}
+
+// enumerate is the one implementation behind List and Query: run the "get all"
+// statement, turn every row into an Object, and keep the ones filter selects.
+//
+// It streams — the rows are consumed one at a time and never buffered as driver
+// values — but it does materialise every selected object, which is the accepted
+// cost of filtering in Go rather than in the host's SQL. The Registry's per-type
+// TTL cache is what amortises it.
+func (p *Provider) enumerate(ctx context.Context, filter provider.Filter) ([]provider.Object, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	// No arguments: the "get all" statement takes no parameters, and nothing a
+	// caller supplied is ever interpolated into it.
+	rows, err := p.q.QueryContext(ctx, p.listQuery)
+	if err != nil {
+		return nil, p.listError(err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_SCAN, err,
+			"sqlprovider: cannot read the result columns of the list statement for object-type %q", p.objectType)
+	}
+	// The column shape is a property of the STATEMENT, so it is validated once
+	// rather than re-derived per row.
+	where := map[string]any{"object_type": p.objectType}
+	if err := validateColumns(cols, where); err != nil {
+		return nil, err
+	}
+	idIndex := indexOf(cols, p.idColumn)
+	if idIndex < 0 {
+		return nil, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: the list statement's result has no id column; select each object's full identity under that name (SELECT 'brand:' || b.id AS id, ...)",
+			map[string]any{"object_type": p.objectType, "id_column": p.idColumn, "columns": strings.Join(cols, ", ")})
+	}
+
+	// One scan buffer for the whole result — see scanSlots for why reusing it is
+	// safe — and a non-nil result slice, so an empty enumeration is an empty
+	// slice rather than a nil that a caller might read as "unset".
+	vals, dest := scanSlots(len(cols))
+	out := make([]provider.Object, 0, 16)
+	row := 0
+	for rows.Next() {
+		row++
+		if err := rows.Scan(dest...); err != nil {
+			return nil, aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_SCAN, err,
+				"sqlprovider: cannot scan row %d of the list statement for object-type %q", row, p.objectType)
+		}
+		id, err := p.rowIdentity(vals[idIndex], row)
+		if err != nil {
+			return nil, err
+		}
+		if filter.Pattern != nil && !filter.Pattern.Matches(id) {
+			continue
+		}
+		md, err := rowMetadata(cols, vals, idIndex, id)
+		if err != nil {
+			return nil, err
+		}
+		if !provider.MatchFields(md, filter.Fields) {
+			continue
+		}
+		out = append(out, provider.Object{ID: id, Metadata: md})
+		if filter.Limit > 0 && len(out) >= filter.Limit {
+			break
+		}
+	}
+	// rows.Err LAST and unconditionally. A connection that dies half way through
+	// a result set ends the loop exactly as a complete one does, so skipping this
+	// would report a truncated enumeration as a successful one — and a short
+	// enumeration is, one layer up, an access the caller silently does not have.
+	if err := rows.Err(); err != nil {
+		return nil, p.listError(err)
+	}
+	return out, nil
+}
+
+// rowIdentity turns the id column of the row'th row into an identity of this
+// provider's object-type.
+//
+// The id must be TEXT. A []byte is accepted as raw text here — unlike a metadata
+// column, where a []byte is JSON — because the id column is not metadata and has
+// no JSON reading that could compete: some drivers hand back a string column as
+// bytes, and an identity is a string either way. Anything else, a bare integer
+// key included, is rejected with the composition it is missing, because
+// "42" is not an identity and Aperture supplies no template that would make it
+// one.
+func (p *Provider) rowIdentity(v any, row int) (identity.Identity, error) {
+	// Every diagnostic here names the ROW's position in the result, which is the
+	// only handle a developer has on a row whose id is exactly what went wrong.
+	base := map[string]any{"object_type": p.objectType, "id_column": p.idColumn, "row": row}
+	where := func(extra map[string]any) map[string]any { return mergeContext(base, extra) }
+
+	var raw string
+	switch x := v.(type) {
+	case string:
+		raw = x
+	case []byte:
+		raw = string(x)
+	case nil:
+		return identity.Identity{}, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: a row's id column is NULL; every enumerated row needs an identity, so exclude the row in the statement or give it one",
+			where(nil))
+	default:
+		return identity.Identity{}, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: a row's id column is not text; compose the full identity in the statement ('brand:' || b.id AS id), casting the key with ::text if it is numeric",
+			where(map[string]any{"type": goTypeName(v)}))
+	}
+	if strings.TrimSpace(raw) == "" {
+		return identity.Identity{}, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: a row's id column is empty; every enumerated row needs an identity",
+			where(nil))
+	}
+
+	id, err := identity.Parse(raw)
+	if err != nil {
+		// The id is the developer's own composition, not host row data, so naming
+		// it is actionable rather than a leak.
+		return identity.Identity{}, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: a row's id column does not parse as an object identity; compose it as type:value in the statement ('brand:' || b.id AS id)",
+			where(map[string]any{"id": raw, "error": err.Error()}))
+	}
+	segs := id.Segments()
+	if len(segs) == 0 || segs[len(segs)-1].Type != p.objectType {
+		// The row belongs to another object-type. It is rejected rather than
+		// skipped: caching it would key one type's metadata under an identity
+		// this provider's own Fetch could never return, and skipping it would
+		// under-report the enumeration, which reads as "no access".
+		return identity.Identity{}, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+			"sqlprovider: a row's identity belongs to a different object-type than this provider serves; the terminal segment's type must be the registered object-type",
+			where(map[string]any{"id": id.String(), "terminal_type": terminalType(segs)}))
+	}
+	return id, nil
+}
+
+// listError normalises a failure of the "get all" statement. Like queryError it
+// passes an already-coded error through verbatim, and names the object-type
+// rather than any row value.
+func (p *Provider) listError(err error) error {
+	if aerr.CodeOf(err) != "" {
+		return err
+	}
+	return aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_QUERY, err,
+		"sqlprovider: list statement failed for object-type %q", p.objectType)
+}
+
+// terminalType names the type of an identity's terminal segment, for a
+// diagnostic. It renders "" for an identity with no segments.
+func terminalType(segs []identity.Segment) string {
+	if len(segs) == 0 {
+		return ""
+	}
+	return segs[len(segs)-1].Type
+}
+
+// indexOf reports where name sits in cols, or -1.
+func indexOf(cols []string, name string) int {
+	for i, c := range cols {
+		if c == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // terminalValue extracts the value Fetch binds: the id part of the identity's
@@ -394,34 +694,76 @@ func scanRow(rows *sql.Rows, id identity.Identity) (provider.Metadata, error) {
 			"sqlprovider: cannot read the result columns for %s", id.String())
 	}
 
-	vals := make([]any, len(cols))
-	dest := make([]any, len(cols))
-	for i := range vals {
-		dest[i] = &vals[i]
+	if err := validateColumns(cols, map[string]any{"id": id.String()}); err != nil {
+		return nil, err
 	}
+
+	vals, dest := scanSlots(len(cols))
 	if err := rows.Scan(dest...); err != nil {
 		return nil, aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_SCAN, err,
 			"sqlprovider: cannot scan the row for %s", id.String())
 	}
+	// -1: a fetch result has no identity column to skip — the identity is the
+	// caller's own input, not something the row carries.
+	return rowMetadata(cols, vals, -1, id)
+}
 
-	md := make(provider.Metadata, len(cols))
+// validateColumns checks the shape of a result's column names, which is a
+// property of the STATEMENT and therefore checked once per statement rather than
+// once per row. where names whatever the caller can say about the context — a
+// fetch's identity, or an enumeration's object-type — and is merged into every
+// diagnostic.
+func validateColumns(cols []string, where map[string]any) error {
 	seen := make(map[string]bool, len(cols))
 	for i, name := range cols {
 		if name == "" {
-			return nil, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
+			return aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 				"sqlprovider: result column has no name; alias every selected expression, because a column name is the metadata field key",
-				map[string]any{"id": id.String(), "index": i})
+				mergeContext(where, map[string]any{"index": i}))
 		}
 		if seen[name] {
 			// Last-wins would make the field's value depend on the SELECT list's
 			// order, which is exactly the kind of invisible dependency that turns
 			// a schema change into a changed decision.
-			return nil, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
+			return aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 				"sqlprovider: result has two columns with the same name; alias one, because a column name is the metadata field key",
-				map[string]any{"id": id.String(), "column": name})
+				mergeContext(where, map[string]any{"column": name}))
 		}
 		seen[name] = true
+	}
+	return nil
+}
 
+// scanSlots allocates one row's scan destinations. The values are plain `any`s
+// so database/sql hands back the driver's own Go type, which is what the mapping
+// table in values.go switches on.
+//
+// An enumeration reuses one pair across every row, which is safe precisely
+// because nothing downstream retains a scanned value: a scalar is copied by
+// assignment, database/sql clones a []byte into a fresh slice, and jsonValue
+// decodes into containers it allocates itself.
+func scanSlots(n int) (vals []any, dest []any) {
+	vals = make([]any, n)
+	dest = make([]any, n)
+	for i := range vals {
+		dest[i] = &vals[i]
+	}
+	return vals, dest
+}
+
+// rowMetadata maps one scanned row into a fresh Metadata keyed by column name,
+// skipping the column at index skip (the identity column of an enumeration; -1
+// when there is none).
+//
+// The map and every container inside it are allocated for this one row — a
+// Provider retains nothing between rows — which is what keeps the transitively
+// read-only Metadata contract true for concurrent holders.
+func rowMetadata(cols []string, vals []any, skip int, id identity.Identity) (provider.Metadata, error) {
+	md := make(provider.Metadata, len(cols))
+	for i, name := range cols {
+		if i == skip {
+			continue // the identity, not a field
+		}
 		// values.go owns the driver-value mapping table and builds its own coded
 		// errors, so every rejection already names the column and this row's
 		// identity.
@@ -436,11 +778,24 @@ func scanRow(rows *sql.Rows, id identity.Identity) (provider.Metadata, error) {
 	}
 
 	// The shared value model is the single authority on what a metadata value may
-	// be; the loader never re-implements those rules. A violation fails the fetch
+	// be; the loader never re-implements those rules. A violation fails the read
 	// rather than reaching the expression evaluator.
 	if err := provider.ValidateMetadata(md); err != nil {
 		return nil, aerr.Wrapf(aerr.APERTURE_METADATA_INVALID, err,
 			"sqlprovider: row for %s rejected by the metadata value model", id.String())
 	}
 	return md, nil
+}
+
+// mergeContext copies base and overlays extra, so a shared diagnostic helper can
+// add its own keys without mutating a map its caller reuses.
+func mergeContext(base, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }

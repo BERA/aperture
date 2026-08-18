@@ -105,6 +105,16 @@ const (
 	// value model cannot represent. The statement ran; its shape or its values
 	// are the problem, and the fix is a cast in the SELECT list.
 	APERTURE_SQL_PROVIDER_SCAN Code = "APERTURE_SQL_PROVIDER_SCAN"
+	// APERTURE_SQL_PROVIDER_ROW_IDENTITY — a row returned by a SQL-backed
+	// ObjectProvider's "get all" statement did not yield a usable object
+	// identity: the result set had no id column, the row's id was NULL, empty,
+	// or not textual, it did not parse as an identity, or its terminal segment
+	// type is not the object-type that provider serves. The identity is
+	// composed by the developer inside the statement ('brand:' || b.id AS id),
+	// so Aperture cannot repair it — and admitting the row would enumerate one
+	// object-type's rows under another's and cache metadata under identities no
+	// Fetch of that provider could ever return.
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY Code = "APERTURE_SQL_PROVIDER_ROW_IDENTITY"
 	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
 	// metadata value model: a value that is neither a scalar, a []any of
 	// scalars, nor a map[string]any one level deeper; an array holding an object
@@ -339,6 +349,15 @@ var Registry = map[Code]Metadata{
 			"A list-valued field only arrives as a list when the statement casts it — SELECT to_jsonb(tags) AS tags, not SELECT tags, which yields the raw array literal as a string that silently matches nothing.",
 		},
 	},
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY: {
+		Message: "SQL object provider could not turn a row's id column into an object identity of its type",
+		Fixups: []string{
+			"Compose the full identity in the get-all statement's id column — SELECT 'brand:' || b.id AS id — because a bare primary key is not an identity and Aperture supplies no template.",
+			"Name the identity column id, or set the provider's id column to the alias the statement actually uses.",
+			"Make the id column textual and never NULL: cast a numeric or uuid key with ::text before concatenating it.",
+			"Check that the identity's terminal segment type is the object-type this provider is registered under; a 'brand:1' row served by the 'dataset' provider is rejected rather than cached.",
+		},
+	},
 	APERTURE_METADATA_INVALID: {
 		Message: "object metadata violates the metadata value model",
 		Fixups: []string{
@@ -473,6 +492,7 @@ var AllCodes = []Code{
 	APERTURE_SQL_PROVIDER_QUERY,
 	APERTURE_SQL_PROVIDER_AMBIGUOUS,
 	APERTURE_SQL_PROVIDER_SCAN,
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY,
 	APERTURE_METADATA_INVALID,
 	APERTURE_RULE_INVALID,
 	APERTURE_RULE_UNKNOWN_VARIABLE,
