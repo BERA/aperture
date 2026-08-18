@@ -84,6 +84,22 @@ const (
 	// already carry an APERTURE_* code (e.g. APERTURE_NOT_FOUND for an
 	// absent object) pass through unwrapped instead.
 	APERTURE_PROVIDER_FETCH Code = "APERTURE_PROVIDER_FETCH"
+	// APERTURE_PROVIDER_REFERENCE_INVALID — a declared object reference is not
+	// usable: an empty object-type, field, or target; a target object-type with
+	// no registered provider; a field declared twice on one type; or a request to
+	// resolve a field no reference declares. A reference is an application-level
+	// foreign key with no database constraint behind it, so the declaration is
+	// checked where it is made — at registry build — rather than being discovered
+	// by the first decision that followed it.
+	APERTURE_PROVIDER_REFERENCE_INVALID Code = "APERTURE_PROVIDER_REFERENCE_INVALID"
+	// APERTURE_PROVIDER_REFERENCE_MISMATCH — the VALUE of a declared reference
+	// field does not point where the declaration says: it is neither an identity
+	// string nor a list of them, it does not parse as a canonical identity, or
+	// its terminal segment type is not the declared target ("team:7" in a field
+	// declared to hold brands). It is an error rather than a skipped element on
+	// purpose — an enumeration that silently dropped the value would read as "no
+	// access" and hide the fault.
+	APERTURE_PROVIDER_REFERENCE_MISMATCH Code = "APERTURE_PROVIDER_REFERENCE_MISMATCH"
 	// APERTURE_SQL_PROVIDER_QUERY — a SQL-backed ObjectProvider's statement did
 	// not run: a connection, permission, syntax, placeholder-arity, or timeout
 	// failure reported by the host's database. The driver's error is wrapped
@@ -343,6 +359,23 @@ var Registry = map[Code]Metadata{
 			"Return APERTURE_NOT_FOUND from the provider for an object that does not exist.",
 		},
 	},
+	APERTURE_PROVIDER_REFERENCE_INVALID: {
+		Message: "a declared object reference is not usable",
+		Fixups: []string{
+			"Register a provider for the target object-type: a references: entry may only point at a type this registry serves.",
+			"Declare each field at most once per object-type; several fields may point at the same target, but one field has one target.",
+			"Declare the reference on the HOLDING side — the type whose provider actually returns the field — because that is the only side with a value to resolve.",
+			"Resolving a field means declaring it first: reg.DeclareReference(\"dataset\", \"current_brands\", \"brand\"), or a references: entry in the provider's seed block.",
+		},
+	},
+	APERTURE_PROVIDER_REFERENCE_MISMATCH: {
+		Message: "a reference field's value does not identify an object of its declared target type",
+		Fixups: []string{
+			"Store FULL canonical identities in a reference field ('brand:1', 'account:acme/brand:1'), not bare primary keys — compose them where the data is loaded, e.g. SELECT 'brand:' || b.id.",
+			"Make the field a string or a list of strings; a number, a map, or a list holding anything but strings cannot be an identity.",
+			"Check the declared target against the values the field actually carries: an identity whose terminal segment type is not the declared type is rejected rather than skipped.",
+		},
+	},
 	APERTURE_SQL_PROVIDER_QUERY: {
 		Message: "SQL object provider could not run its statement",
 		Fixups: []string{
@@ -525,6 +558,8 @@ var AllCodes = []Code{
 	APERTURE_PROVIDER_INVALID,
 	APERTURE_PROVIDER_UNREGISTERED,
 	APERTURE_PROVIDER_FETCH,
+	APERTURE_PROVIDER_REFERENCE_INVALID,
+	APERTURE_PROVIDER_REFERENCE_MISMATCH,
 	APERTURE_SQL_PROVIDER_QUERY,
 	APERTURE_SQL_PROVIDER_AMBIGUOUS,
 	APERTURE_SQL_PROVIDER_SCAN,

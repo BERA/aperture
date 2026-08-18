@@ -3,6 +3,7 @@ package seed
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/frankbardon/aperture/csvprovider"
@@ -64,6 +65,41 @@ type Provider struct {
 	TTL string `yaml:"ttl,omitempty" json:"ttl,omitempty"`
 	// MaxSize caps cached entries for this type; 0 uses the registry default.
 	MaxSize int `yaml:"max_size,omitempty" json:"max_size,omitempty"`
+	// References declares that a metadata field this provider serves holds
+	// identities of another object-type — an application-level foreign key, with
+	// no database constraint behind it. It maps FIELD NAME to TARGET OBJECT-TYPE:
+	//
+	//	- object_type: dataset
+	//	  kind: sql
+	//	  connection: main
+	//	  get_one: SELECT to_jsonb(d.brand_ids) AS current_brands FROM datasets d WHERE d.id = $1
+	//	  get_all: SELECT 'dataset:' || d.id AS id, to_jsonb(d.brand_ids) AS current_brands FROM datasets d
+	//	  references:
+	//	    current_brands: brand
+	//
+	// The field's VALUE is full canonical identities ("brand:1", or
+	// "account:acme/brand:1"), composed by the developer where the data is
+	// loaded — a scalar for a single reference, a list for many. That is what
+	// lets an enumeration filter on one through the ordinary Filter.Fields
+	// contract with no new matching code.
+	//
+	// It is declared on the HOLDING side only: the type whose provider actually
+	// returns the field. There is no inbound spelling on brand, because brand has
+	// no column listing its datasets — and a second referencing field
+	// (archived_brands) would make an unnamed reverse edge ambiguous anyway.
+	//
+	// The block is a CLOSED SET OF ONE DESCRIPTOR KIND: a field name maps to a
+	// target object-type and to nothing else. In particular, do NOT add a type:
+	// descriptor here — the loader is the single typing mechanism (a CSV column
+	// suffix, a cast in the developer's SQL), and a second place to declare a
+	// type is a second place for the two declarations to disagree.
+	//
+	// The target must be a type this document's registry serves; an unknown one
+	// is APERTURE_PROVIDER_REFERENCE_INVALID at build, naming the field and the
+	// target. A field name that matches nothing is NOT an error: metadata fields
+	// are discovered at fetch, not declared. Like the rest of this struct it is
+	// runtime wiring — never written to storage, never reproduced by an export.
+	References map[string]string `yaml:"references,omitempty" json:"references,omitempty"`
 }
 
 // ParseFile reads path and parses it into a Document, inferring the format from
@@ -177,6 +213,13 @@ func StrictProviderCollision() BuildOption {
 // a typo'd declaration fails the build even in a document that declares no
 // objects at all.
 //
+// A providers: entry's references: block is applied LAST, once every type is
+// registered, so a reference may name a target declared later in the file. A
+// reference whose target no provider serves is
+// APERTURE_PROVIDER_REFERENCE_INVALID naming the field and the target; a
+// reference on a field name no object happens to carry is not an error at all,
+// because metadata fields are discovered at fetch rather than declared.
+//
 // No section touches storage: Apply writes no row for any of them, and an export
 // reproduces none.
 // A document declaring connections: owns database pools, which have a lifetime
@@ -249,7 +292,39 @@ func (d *Document) BuildRegistryWithConnections(baseDir string, opts ...BuildOpt
 		_ = conns.Close()
 		return nil, nil, err
 	}
+	// References are declared LAST, in their own pass, because a reference names
+	// a target type that may be declared further down the file (or served by the
+	// objects: section) — and requiring the target to already exist would make a
+	// legal document depend on the order its entries happen to be written in.
+	if err := d.declareReferences(reg); err != nil {
+		_ = conns.Close()
+		return nil, nil, err
+	}
 	return reg, conns, nil
+}
+
+// declareReferences applies every providers: entry's references: block to the
+// built registry, after every type has been registered.
+//
+// Fields are declared in sorted order so a document with two bad references
+// always fails on the same one, and the build is reproducible.
+func (d *Document) declareReferences(reg *provider.Registry) error {
+	for _, p := range d.Providers {
+		if len(p.References) == 0 {
+			continue
+		}
+		fields := make([]string, 0, len(p.References))
+		for field := range p.References {
+			fields = append(fields, field)
+		}
+		sort.Strings(fields)
+		for _, field := range fields {
+			if err := reg.DeclareReference(p.ObjectType, field, p.References[field]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // registerProvider builds one declared provider and registers it under its

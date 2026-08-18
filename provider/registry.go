@@ -21,6 +21,12 @@ type typeEntry struct {
 	provider ObjectProvider
 	cache    CacheBackend
 	config   CacheConfig
+	// references maps a metadata field this type's provider serves to the
+	// object-type its values identify — the declared references of reference.go,
+	// held here so "what does dataset.current_brands point at?" is a registry
+	// lookup rather than a re-read of the document that wired it. Written only
+	// through DeclareReference, under the registry mutex.
+	references map[string]string
 }
 
 // Registry maps an object-type to its ObjectProvider plus a per-type metadata
