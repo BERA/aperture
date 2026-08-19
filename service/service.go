@@ -254,17 +254,100 @@ type EnumerateQuery struct {
 	Action string
 	// Pattern is the identity pattern bounding the search.
 	Pattern string
+	// Fields are OPTIONAL object-metadata predicates narrowing the result: an
+	// allowed object is returned only when its metadata satisfies every one of
+	// them. Nil or empty (the default) filters nothing.
+	//
+	// The facade passes the map to the engine UNCHANGED — it does not parse,
+	// coerce, or normalise a value. That is deliberate: the predicate's meaning
+	// is provider.Filter's Fields contract (AND across keys, absent never
+	// matches, membership for a collection field, typed equality otherwise) and
+	// it is evaluated in exactly one place, provider.MatchFields. A surface that
+	// re-interpreted a value on the way in — parsing "5" into a number, say —
+	// would make an enumeration select objects a Check then denies.
+	//
+	// The struct tags are the MCP surface's, which reflects its tool schema
+	// straight off this type (mcp.EnumerateIn is an alias for it). `omitempty`
+	// is load-bearing there: without it the reflected schema marks the predicate
+	// REQUIRED and an agent could not ask an unfiltered question at all. The
+	// name is kept in the struct's existing PascalCase so one object does not
+	// mix two spellings.
+	Fields map[string]any `json:"Fields,omitempty" jsonschema:"Optional object-metadata predicates narrowing the result. ANDed; a field the object does not carry never matches; a list-valued field matches by membership; everything else by typed equality, so \"5\" never matches 5. Omit to filter nothing."`
+	// References are OPTIONAL reference edges restricting the result to the
+	// identities a holder object's DECLARED reference field contains — "the
+	// brands in dataset X". Nil or empty (the default) restricts nothing.
+	//
+	// It is a DEREFERENCE, not a predicate, which is why it is not spelled
+	// through Fields: a brand carries no field naming its datasets, so no
+	// predicate on brand can express the question. Several edges AND, an edge
+	// composes with Fields, and both precede Limit.
+	//
+	// The facade carries the edges to the engine UNCHANGED — it does not parse a
+	// holder identity, infer a holder type, or check that a field is declared.
+	// Every one of those is a decision with a disclosure consequence (see
+	// engine/reference.go), and a surface that made it separately would be a
+	// second place for the answer to differ.
+	//
+	// The struct tags are the MCP surface's, which reflects its tool schema
+	// straight off this type. `omitempty` is load-bearing there: without it the
+	// reflected schema marks the edges REQUIRED and an agent could not ask an
+	// unrestricted question at all.
+	References []ReferenceEdge `json:"References,omitempty" jsonschema:"Optional reference edges restricting the result to the identities a holder object's declared reference field contains, e.g. the brands in dataset X. Several edges are ANDed and they compose with Fields. A holder the principal may not see yields an empty result, not an error. Omit to restrict nothing."`
 	// Limit caps the number of returned object ids; <= 0 means the default.
 	Limit int
 }
 
+// ReferenceEdge is one reference edge in surface-neutral form: which holder
+// object, and which of its declared reference fields to dereference. It mirrors
+// engine.ReferenceEdge so the engine type stays an engine-internal concern, and
+// it is three plain strings — an edge NAMES a field, it never carries a value,
+// so none of the metadata value model applies to it.
+type ReferenceEdge struct {
+	// HolderType is the object-type that DECLARES the reference ("dataset").
+	// OPTIONAL: empty means "whatever HolderID's terminal segment type is". When
+	// it IS given it must agree with HolderID; the engine, not this type, is
+	// where that is enforced.
+	HolderType string `json:"HolderType,omitempty" jsonschema:"Object-type that declares the reference, e.g. 'dataset'. Optional: omit it and the type is taken from HolderID's last segment. When given it must agree with HolderID."`
+	// HolderID is the holder object's canonical identity
+	// ("account:acme/dataset:7"). Mandatory.
+	HolderID string `json:"HolderID" jsonschema:"Canonical identity of the holder object, e.g. 'account:acme/dataset:7'."`
+	// Field is the metadata field on HolderType that a references: declaration
+	// binds to a target object-type ("current_brands"). Mandatory, and it must
+	// be DECLARED — an undeclared field is a coded error, never an empty edge.
+	Field string `json:"Field" jsonschema:"Declared reference field on the holder to dereference, e.g. 'current_brands'."`
+}
+
+// String renders an edge as "account:acme/dataset:7.current_brands" — the same
+// spelling the CLI's --via flag accepts.
+func (r ReferenceEdge) String() string { return r.HolderID + "." + r.Field }
+
+// references converts the surface-neutral edges to the engine's, field for
+// field. A nil or empty slice stays nil, so an omitted edge list is
+// indistinguishable from none at every layer.
+func (q EnumerateQuery) references() []engine.ReferenceEdge {
+	if len(q.References) == 0 {
+		return nil
+	}
+	out := make([]engine.ReferenceEdge, len(q.References))
+	for i, e := range q.References {
+		out[i] = engine.ReferenceEdge{
+			HolderType: e.HolderType,
+			HolderID:   e.HolderID,
+			Field:      e.Field,
+		}
+	}
+	return out
+}
+
 func (q EnumerateQuery) request() engine.EnumerateRequest {
 	return engine.EnumerateRequest{
-		Account:   q.Account,
-		Principal: q.Principal,
-		Action:    q.Action,
-		Pattern:   q.Pattern,
-		Limit:     q.Limit,
+		Account:    q.Account,
+		Principal:  q.Principal,
+		Action:     q.Action,
+		Pattern:    q.Pattern,
+		Fields:     q.Fields,
+		References: q.references(),
+		Limit:      q.Limit,
 	}
 }
 

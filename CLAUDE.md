@@ -27,6 +27,15 @@ bulk-batched.
   package renders its AST to an expr-lang expression and compiles it in-process.
 - **Storage**: hand-written SQL, `modernc.org/sqlite` (pure-Go) + an
   in-memory impl behind one `Storage` interface. No ORM / sqlc / migration tool.
+- **SQL providers** (`sqlprovider/`, a *host* data source — not Aperture's own
+  storage) depend on a two-method `Querier` and link **no** driver. The seed
+  package does, in exactly one place: a blank import of
+  `github.com/jackc/pgx/v5/stdlib` in `seed/connection.go`, used through
+  `database/sql`, Postgres only. pgx over `lib/pq` on a correctness argument —
+  `lib/pq` returns `[]byte` for `numeric` and `uuid`, which the value model
+  cannot tell from `jsonb` — at a measured cost of +3,589,088 bytes for the
+  driver alone (+4,246,608, +14.8%, for the epic as landed). Both pure Go, so
+  `CGO_ENABLED=0` holds.
 - **RPC/HTTP**: `net/http` ServeMux + Twirp (`internal/server/`, proto at
   `internal/wire/rpc/service.proto`), with an admin UI shell served from
   `internal/server/static/`.
@@ -91,8 +100,15 @@ non-skippable CI failure. The rule itself is documented in
 | The metadata value model (`provider/metadata.go`: legal shapes, depth cap, size cap) | `skills/metadata-values.md` and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/metadata_test.go` |
 | The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | `skills/metadata-values.md` ("Dates") and `docs/src/concepts/providers.md` | `TestEverySkillHasFrontmatter` (doc presence); model behaviour by `provider/date_test.go` |
 | A loader's spelling of the value model (a CSV column suffix — `:int`, `:list<T>`, `:json`, `:date`, `:datetime` — or a seed key such as `objects:` / `field_types:`) | `skills/metadata-values.md` ("How each loader spells the model"), the loader's package doc, `docs/src/concepts/providers.md`, and `docs/src/concepts/seed.md` for a seed key | reviewed; no registry gate |
+| The SQL driver-value mapping table (`metadataValue`'s type switch **or** `mappedDriverTypes` in `sqlprovider/values.go`) | the other half of the pair in the same file, the `sqlprovider` package doc ("Driver values become metadata"), `skills/sql-provider.md`, `skills/metadata-values.md` ("`sqlprovider`"), and `docs/src/concepts/providers.md` | `TestDriverValueMappingTableMatchesTheTypeSwitch` — parses `sqlprovider/values.go` with `go/ast` and diffs the type switch against `mappedDriverTypes`; adding a case to one and not the other is build-red |
+| The seed `connections:` / `kind: sql` schema (a `Connection` or `Provider` YAML key in `seed/`) or one of its defaults (`DefaultQueryTimeout` / `DefaultMaxOpenConns` / `DefaultMaxIdleConns` / `DefaultConnMaxLifetime` in `seed/connection.go`) | the field's doc comment, the defaults table in `skills/sql-provider.md`, and "Database-backed providers" in `docs/src/concepts/seed.md` | reviewed; no registry gate — behaviour by `seed/connection_test.go` (defaults, pool sharing, the `dsn:` refusal, `BuildRegistry`'s refusal of `connections:`) |
+| The SQL provider's statement contract (the four casting rules, what `Fetch` binds, the id column, `Querier`, `sqlprovider.Config`) | the `sqlprovider` package doc, `skills/sql-provider.md`, `docs/src/concepts/providers.md` ("Worked example: `sqlprovider`"), and the `APERTURE_SQL_PROVIDER_*` fixups in `errors/codes.go` | `TestEverySkillHasFrontmatter` (doc presence); behaviour by `sqlprovider/*_test.go` — the casting rules themselves are un-gatable, which is exactly why they must be written down |
 | How the rule editor displays a date (anything in `internal/server/static/js/rules.js` or `rules-serializer.js` that renders a stored date, a resolved bound, or the reference instant) | "Reading a saved rule back" + "The date diagnostics" in `skills/ui-shell.md` | `TestRuleEditorNeverFormatsADateThroughADateObject` — scans the served JS and fails on `new Date` / `toLocale*String` / `Intl.DateTimeFormat` and friends |
 | The rule what-if preview's response fields (`EvaluateRuleResponse` in `service.proto`, `service.RulePreview`) | `skills/ui-shell.md` ("The date diagnostics"), `skills/api-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/library/service-facade.md` — **and `make proto`** | reviewed; no registry gate |
+| The enumerate filter input (`engine.EnumerateRequest.Fields` / `engine.MetadataFetcher`) | ALL of: `service.EnumerateQuery` + its `request()` converter (keep the `json:"...,omitempty"` + `jsonschema` tags — `mcp.EnumerateIn` aliases the struct and drops the REQUIRED marking through `omitempty`); `EnumerateRequest.fields` in `service.proto` **and `make proto`**; `internal/wire/rpc/fields.go` (`FieldsFromWire`/`FieldsToWire`); `internal/server/twirp.go` (`enumerateQuery`, single **and** batch); `internal/cli/fields.go` + the `enumerate` command description; then `skills/api-surface.md`, `skills/decision-api.md`, `mcp/skills/mcp-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/cli/decisions.md` — **and `make docs-gen`** (the CLI flags/description are a generated page) | reviewed; no registry gate — behaviour by `engine/enumerate_fields_test.go`, `service/enumerate_fields_test.go`, `internal/wire/rpc/fields_test.go` (incl. `TestFieldsRoundTrip_LargeIntegerLosesPrecision`), `internal/server/enumerate_fields_test.go`, `internal/cli/{fields,enumerate_filter}_test.go`, `mcp/enumerate_fields_test.go`; `TestEnumerateHelpStatesThePrecedence` pins the help text |
+| The `Filter.Fields` matching semantics (`provider/match.go` `MatchFields` / `ValuesEqual`) | `docs/src/concepts/providers.md` ("The `Filter.Fields` contract") **and** every restatement of it on the enumerate filter: `skills/api-surface.md`, `skills/decision-api.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/cli/decisions.md` | reviewed; no registry gate — one definition, one implementation: a provider that filters differently authorizes differently |
+| The `references:` schema (`seed.Provider.References`, `Registry.DeclareReference` / `ReferenceTarget` / `ResolveReference*` in `provider/reference.go`, or what a declaration may carry) | the field's doc comment, `skills/object-references.md` ("Declaring a reference"), `docs/src/concepts/seed.md` ("Declaring a reference"), and `docs/src/concepts/providers.md` ("Declared references") — a **new descriptor kind** (e.g. a `type:` key) needs its "three closed doors" rationale rewritten, not appended to | reviewed; no registry gate — behaviour by `provider/reference_test.go`, `seed/reference_test.go` (incl. `TestReferenceWiringIsNotModelState`) |
+| The via-reference enumerate input (`engine.EnumerateRequest.References` / `engine.ReferenceEdge` / `engine.ReferenceSource` / `WithReferences`) | ALL of: `service.EnumerateQuery.References` + `service.ReferenceEdge` + the `references()` converter (keep the `json:"...,omitempty"` + `jsonschema` tags — `mcp.EnumerateIn` aliases the struct and `omitempty` is what keeps the edges OPTIONAL); `EnumerateRequest.references` + `message ReferenceEdge` in `service.proto` **and `make proto`**; `internal/server/twirp.go` (`enumerateQuery` + `referenceEdges`, single **and** batch); `internal/cli/references.go` + the `enumerate` command description; then `skills/object-references.md`, `skills/api-surface.md`, `skills/decision-api.md`, `mcp/skills/mcp-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/cli/decisions.md` — **and `make docs-gen`** (the CLI flags/description are a generated page) | reviewed; no registry gate — behaviour by `engine/enumerate_reference_test.go` (incl. `TestTheFourQuestions`), `service/`, `internal/server/`, `internal/cli/`, `mcp/enumerate_references_test.go`. **The empty-vs-`NOT_FOUND` split is asserted PER SURFACE on purpose:** relaxing it in one place is a silent disclosure channel, so a change there must move all five test files together |
 
 The Go↔JS rows matter more than they look: **CI is node-free**, so
 `rules-serializer.test.js` never runs in the pipeline.
@@ -122,6 +138,10 @@ audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage gate in
   `rules-serializer.js` from disk; fails (never skips) if it is missing.
 - `TestEditorASTContractCoversEveryOperator` — every operator in `opSpecs` has a
   byte-stable AST JSON case, so coverage cannot fall behind the registry.
+- `TestDriverValueMappingTableMatchesTheTypeSwitch` — the driver-value mapping in
+  `sqlprovider/values.go` is one table in two places (`metadataValue`'s type
+  switch and `mappedDriverTypes`); the test parses the file with `go/ast` and
+  fails if they disagree.
 - `TestCollectionOperatorTablesAgree` — `collOps` (`rules/shape.go`) stays in
   lockstep with `opSpecs` (`rules/ast.go`).
 - `TestDateOperatorTablesAgree` — `dateOps` (`rules/date.go`) stays in lockstep
@@ -138,6 +158,11 @@ Gated, NOT in `make test` (a loaded runner would flake them):
   fixtures.
 - `node internal/server/static/js/rules-serializer.test.js` — CI is node-free, so
   this is a manual development aid; the Go contract tests above are the real gate.
+- `APERTURE_PG_INTEGRATION=1 APERTURE_PG_DSN=<dsn> go test -run TestPostgresIntegration ./seed/`
+  — the only test that talks to a real Postgres (CI has no service containers).
+  It skips when ungated and **fails** when gated with an empty `APERTURE_PG_DSN`,
+  so asking for it and silently not getting it cannot happen. Never put a DSN in
+  a file; pass it in the environment.
 
 ## What NOT to do
 

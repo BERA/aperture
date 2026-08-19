@@ -19,8 +19,9 @@ this page is a map, not a re-explanation.
 | `identity/` | Principal and object identities and specificity-ranked patterns. | [Identity patterns & specificity](../concepts/identity.md) |
 | `model/` | The RBAC domain model: object types, permissions, roles, groups, grants. | [RBAC domain model](../concepts/model.md) |
 | `scope/` | Pluggable scope-strategy resolvers (implicit / inclusive / exclusive) + a registry. | [Scopes & scope strategies](../concepts/scopes.md) |
-| `provider/` | The object-provider registry + per-type metadata cache. | [Providers](../concepts/providers.md) |
+| `provider/` | The object-provider registry + per-type metadata cache, and the declared object references held on it. | [Providers](../concepts/providers.md), [Declared references](../concepts/providers.md#declared-references) |
 | `csvprovider/` | A concrete `ObjectProvider` backed by a CSV file — the reference implementation. | [Providers](../concepts/providers.md) |
+| `sqlprovider/` | A concrete `ObjectProvider` backed by a relational database, over a two-method `Querier` seam. Links no driver. | [Providers](../concepts/providers.md#worked-example-sqlprovider) |
 | `auth/` | Authentication adapters (dev / OIDC / parsec) that turn a bearer into a principal. | [Authentication](../concepts/auth.md) |
 | `authz/` | The authorization gate that surfaces call to guard mutations. | [The authz gate](../concepts/authz.md) |
 | `audit/` | The decision/mutation audit log. | [Audit trail](../concepts/audit.md) |

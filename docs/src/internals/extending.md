@@ -107,8 +107,8 @@ alongside `scope/resolvers_test.go`; an unregistered key surfaces
 ## Adding an object provider
 
 **Concept:** [Providers](../concepts/providers.md). **Files:** a new package (see
-`csvprovider/` as the reference impl), then register it on a
-`provider.Registry`.
+`csvprovider/` for a file-backed reference impl and `sqlprovider/` for a
+database-backed one), then register it on a `provider.Registry`.
 
 A provider is the host's pull source for one object-type. Implement
 `provider.ObjectProvider`:
@@ -135,6 +135,17 @@ Register it under its object-type key on a `provider.Registry`
 cache. A `*provider.Registry` also satisfies `scope.ObjectLister`, so it wires
 directly into the scope resolvers above. Mirror `csvprovider/csvprovider_test.go`
 for coverage.
+
+Two rules a new provider inherits rather than invents. `Query` must evaluate
+`Filter.Fields` exactly as `provider.MatchFields` does — call the helper unless
+you have a reason not to, because a provider that filters differently authorizes
+differently. And every value it produces must satisfy the
+[metadata value model](../concepts/providers.md#the-metadata-value-model);
+validate at load with `provider.ValidateMetadata` so a bad shape fails where the
+data enters instead of on the `Check` hot path. `sqlprovider` shows what that
+costs when the source is untyped: its whole driver-value mapping exists to turn
+whatever `database/sql` scanned into a value the model admits, and the cases it
+cannot decide are pushed back onto the developer's `SELECT` list as casts.
 
 ---
 

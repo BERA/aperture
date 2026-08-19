@@ -120,6 +120,129 @@ bin/aperture enumerate alice read 'account:acme/project:atlas/document:*' \
   --seed ./model-with-providers.yaml --limit 100
 ```
 
+### Narrowing by object metadata
+
+`--field` and `--fields-json` filter the listing by the objects' **metadata** —
+"which of the datasets I may list carry brand Y?". They apply on top of the
+access decision, so they can only ever *remove* objects from the list; an object
+a `check` would deny is never returned however the predicate is written.
+
+The predicate is **typed**: a field matches only when its value equals the wanted
+value *and* is of the same kind, so the string `"5"` never matches the number
+`5`. A shell flag only carries a string, and guessing which strings are "really"
+numbers would make `enumerate` return objects `check` then denies — so there are
+two flags rather than one, and each says what it sends:
+
+| Flag | Sends | Notes |
+|---|---|---|
+| `--field key=value` | **always a string** | Repeatable. Everything after the first `=` is the value, so `--field expr=a=b` wants `"a=b"`. |
+| `--fields-json '{…}'` | a JSON object — real numbers, bools, lists | Use it when the metadata value genuinely is not a string. |
+
+**Both may be given.** `--fields-json` is merged **first** and `--field` entries
+then **override it by key**, so a stored JSON body can be reused with one value
+swapped from the shell.
+
+```bash
+# a string field
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --field tier=premium
+
+# a list field, matched by MEMBERSHIP — "datasets carrying brand Y"
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --field brands=brand:Y
+
+# seats is a NUMBER, so it needs the JSON spelling; --field seats=5 matches nothing
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --fields-json '{"seats":5,"active":true}'
+
+# merged: seats from JSON, tier overridden from the shell
+bin/aperture enumerate alice list 'account:acme/**' --seed ./model.yaml \
+  --fields-json '{"seats":5,"tier":"basic"}' --field tier=premium
+```
+
+The rules the listing obeys:
+
+- **Predicates are ANDed** — every one must hold.
+- **A list-valued field matches by membership**; a whole list in
+  `--fields-json` is a container compared by equality.
+- **A field the object does not carry never matches** — not even against
+  `null`.
+- **Filtering happens before `--limit`.** `--field tier=premium --limit 10` gives
+  the first ten *premium* objects, not the premium ones among the first ten
+  candidates.
+
+A malformed predicate is a usage error (`APERTURE_INVALID_INPUT`) naming the
+offending text — a `--field` with no `=`, an empty key, a `--fields-json` that is
+not JSON or is JSON but not an object. It is never silently skipped: a dropped
+predicate would *widen* the result, and a filter that silently widens is a filter
+that authorizes. Parsing happens before the store is opened, so a usage error
+never boots a decision stack.
+
+Filtering needs an object source for the type, exactly as enumeration itself
+does. A model that declares none reports `APERTURE_PROVIDER_UNREGISTERED` rather
+than printing nothing — an empty list would read as "no access". (Because the
+predicate is applied per candidate, you only see that error once the principal is
+allowed at least one object under the pattern.)
+
+### Restricting to what a reference names
+
+`--via` asks the **other** direction. `--field` asks "which datasets contain
+brand Y?"; `--via` asks "which brands does dataset X list?".
+
+```bash
+bin/aperture enumerate alice read 'account:acme/brand:*' --seed ./model.yaml \
+  --via account:acme/dataset:x.current_brands
+```
+
+It restricts the listing to the identities held in a **declared reference field**
+on one holder object — a `references:` block in the seed document
+([Declaring a reference](../concepts/seed.md#declaring-a-reference)) is what makes
+the field dereferenceable.
+
+**The two are not interchangeable, and the asymmetry is the reason `--via`
+exists.** The dataset holds `current_brands`, so a predicate on dataset expresses
+"which datasets contain brand Y?" — that is `--field`. A brand holds **no** field
+naming its datasets, so no predicate on brand can express "which brands belong to
+dataset X?" at all. `--field` is a filter; `--via` is a dereference.
+
+The spelling is `<holder-identity>.<field>`, split on the **last** `.` — a `.` is
+legal inside an identity component (`dataset:2026.q1`) while a reference field is
+a single metadata key, so the final dot is the only unambiguous boundary. The
+holder's *type* is deliberately not spelled: it is the identity's last segment
+type, which the engine derives itself, so the two cannot disagree.
+
+The rules the restriction obeys:
+
+- **Repeatable, and edges are ANDed.** Two `--via` flags give "the brands in
+  dataset x *and* in campaign spring".
+- **It composes with `--field`**, and both apply **before `--limit`**.
+- **It only subtracts.** Restriction runs on candidates that still go through the
+  access decision, so `--via` can never surface an object `check` would deny.
+- **Exactly one hop.** The brands a dataset names are not themselves
+  dereferenced, however many references `brand` declares.
+
+**A holder you may not read prints nothing and exits 0.** That is deliberate, not
+a bug: "you may not see dataset X" and "dataset X lists nothing you may see" must
+not be tellable apart, or `--via` becomes a way to probe for objects you were
+never allowed to know about. The same goes for a holder in **another account** —
+empty whether or not it exists — and for a principal who is not a member of
+`--account`.
+
+An **absent** holder is `APERTURE_NOT_FOUND` only when it is inside `--account`
+*and* the principal is a member of it. That is the ergonomics a typo deserves,
+confined to someone already inside the account.
+
+A wiring fault stays loud rather than printing nothing: a field with no
+`references:` declaration is `APERTURE_PROVIDER_REFERENCE_INVALID`, and a holder
+type with no provider is `APERTURE_PROVIDER_UNREGISTERED`. A malformed `--via` —
+no `.`, an empty holder, an empty field — is `APERTURE_INVALID_INPUT` naming the
+offending text, rejected before the store is opened.
+
+If a `--via` returns nothing you expected, check the **server log** first: a
+referenced identity the provider no longer serves is skipped with a warning
+naming it, and the commonest cause is an identity composed in the wrong shape
+(`brand:1` where the deployment yields `account:acme/brand:1`).
+
 Full flags: [`enumerate`](../reference/cli.md#aperture-enumerate).
 
 ## `identifiers` — a type's valid instance ids

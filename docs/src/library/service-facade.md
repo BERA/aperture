@@ -57,13 +57,160 @@ type Result struct {
 }
 
 type EnumerateQuery struct {
-	Account   string
-	Principal string
-	Action    string
-	Pattern   string
-	Limit     int
+	Account    string
+	Principal  string
+	Action     string
+	Pattern    string
+	Fields     map[string]any // optional object-metadata predicates; nil filters nothing
+	References []ReferenceEdge // optional reference edges; nil restricts nothing
+	Limit      int
+}
+
+type ReferenceEdge struct {
+	HolderType string // optional; empty means HolderID's terminal segment type
+	HolderID   string // "account:acme/dataset:7"
+	Field      string // a DECLARED reference field on the holder
 }
 ```
+
+### `EnumerateQuery.Fields` — the object-metadata filter
+
+`Fields` narrows an enumeration by object metadata: an object the principal is
+allowed to act on is returned only when its metadata satisfies **every**
+predicate. Nil or empty — the default — filters nothing and does not consult a
+metadata source at all, so existing callers are unaffected.
+
+The facade passes the map to the engine **unchanged**. It parses nothing, coerces
+nothing, and normalises nothing, and it never rewrites the caller's map. That is
+deliberate: the predicate's meaning is
+[`provider.Filter`'s `Fields` contract](../concepts/providers.md#the-filterfields-contract),
+evaluated in exactly one place (`provider.MatchFields`). A surface that
+re-interpreted a value on the way in — parsing `"5"` into a number, say — would
+make an enumeration select objects a `Check` then denies.
+
+```go
+ids, err := svc.Enumerate(ctx, service.EnumerateQuery{
+	Account:   "acme",
+	Principal: "alice",
+	Action:    "read",
+	Pattern:   "account:acme/**",
+	Fields:    map[string]any{"tier": "premium", "brands": "brand:Y"},
+	Limit:     10,
+})
+```
+
+The semantics a caller must know:
+
+- **AND across keys.** Every predicate must hold.
+- **Collections match by membership.** A list-valued *metadata* field matches
+  when it contains the wanted value; a list-valued *want* is a container compared
+  by equality.
+- **An absent field never matches** — not even against a `nil` want.
+- **Comparison is typed.** `int(5)` and `float64(5)` are one value; `"5"` is not
+  `5`.
+- **The filter runs before `Limit`.** Candidates are decided, then filtered, then
+  truncated — so "the first 10 objects tagged `brand:Y`" searches every
+  candidate. Truncating first would return a silently wrong answer.
+- **The filter only subtracts.** It applies to candidates that already survived
+  deny-overrides, so no predicate can surface an object `Check` would deny.
+
+Failure is asymmetric on purpose, because a short answer reads as "no access":
+
+| Situation | Result |
+|---|---|
+| No metadata source wired, or no provider for the candidate's object-type | `APERTURE_PROVIDER_UNREGISTERED` — never a silently empty list. Because the predicate runs per candidate, this only surfaces when the enumeration has at least one **allowed** candidate; an empty allowed set returns empty regardless of wiring. |
+| The provider has no row for the object (`APERTURE_NOT_FOUND` from `Fetch`) | The object is **excluded** — every field is absent, and absent never matches. |
+| Any other provider failure | Surfaced verbatim. |
+
+Wire the source alongside the scope lister — it is the same registry:
+
+```go
+eng := engine.New(store,
+	engine.WithScopeResolution(nil, engine.ScopeDeps{Lister: reg, Rules: rulesEngine}),
+	engine.WithMetadata(reg))
+```
+
+Two notes for anyone refactoring this field:
+
+- **Over Twirp**, `Fields` rides as `map<string, google.protobuf.Value>`, which
+  carries every number as a **double**. An integer beyond **2^53** loses
+  precision in transit and must be sent (and stored) as a string; a non-finite
+  number (NaN, ±Inf) is rejected as `APERTURE_INVALID_INPUT`. See the
+  [RPC reference](../surfaces/rpc-reference.md#enumeraterequestfields--the-object-metadata-filter).
+- **`Fields` carries `json` and `jsonschema` struct tags** — the only tagged
+  field on any `service` type. The MCP surface aliases this struct
+  (`mcp.EnumerateIn`) and reflects its tool schema off it, so the `omitempty` is
+  load-bearing: without it the reflected schema marks the predicate *required*
+  and an agent cannot ask an unfiltered question at all.
+
+### `EnumerateQuery.References` — the reference edges
+
+`References` restricts an enumeration to the identities a holder object's
+**declared reference field** contains — "the brands in dataset X". Nil or empty
+— the default — restricts nothing.
+
+```go
+ids, err := svc.Enumerate(ctx, service.EnumerateQuery{
+	Account:   "acme",
+	Principal: "alice",
+	Action:    "read",
+	Pattern:   "account:acme/brand:*",
+	References: []service.ReferenceEdge{{
+		HolderID: "account:acme/dataset:x",
+		Field:    "current_brands",
+	}},
+})
+```
+
+It is a **dereference, not a predicate**, which is why it is not spelled through
+`Fields`: a brand carries no field naming its datasets, so no predicate on brand
+can express the question. `Fields` answers the mirror image ("which datasets
+contain brand Y?") because *that* side holds the field. The declaration side is
+[Declared references](../concepts/providers.md#declared-references).
+
+The facade carries the edges to the engine **unchanged** — it does not parse a
+holder identity, infer a holder type, or check that a field is declared. Every
+one of those is a decision with a disclosure consequence, and a surface that made
+it separately would be a second place for the answer to differ.
+
+- **`HolderType` is optional.** Empty means "whatever `HolderID`'s terminal
+  segment type is"; when given it must agree with `HolderID`, and the engine —
+  not this type — enforces that.
+- **Several edges AND**, an edge **composes with `Fields`**, and both precede
+  `Limit`.
+- **Exactly one hop.** The identities an edge yields are never themselves
+  dereferenced.
+- The restriction is computed **once per enumeration**, against the same grants
+  and subject set the candidates are decided with — so `EnumerateAs` checks the
+  holder with the **impersonated** authority, not the operator's.
+
+The failure modes are asymmetric on purpose, and the asymmetry *is* the security
+model:
+
+| Situation | Result |
+|---|---|
+| The principal may not read the holder | **Empty result, no error.** "You may not see dataset X" and "dataset X contains nothing you may see" must be indistinguishable, or the edge is an oracle for objects the caller was never allowed to know about. |
+| The holder is absent, **inside** `Account`, and the caller is a member | `APERTURE_NOT_FOUND` — the ergonomics a typo deserves, confined to a caller already inside the account. |
+| The holder is **outside** `Account` | **Empty**, whether or not it exists. This is the disclosure boundary. |
+| The caller is not a member of `Account` | **Empty**, always — membership is decided before the holder is looked up. |
+| A referenced identity no longer exists | **Skipped**, with a warning log and a `dangling_reference` note; never a failed decision. |
+| The field is not a declared reference | `APERTURE_PROVIDER_REFERENCE_INVALID` — loud, never an empty list that would read as "no access". |
+| The holder's type has no provider, or the engine has no reference source | `APERTURE_PROVIDER_UNREGISTERED` — likewise loud. |
+
+Wire the source alongside the metadata source — it is the same registry again:
+
+```go
+eng := engine.New(store,
+	engine.WithScopeResolution(nil, engine.ScopeDeps{Lister: reg, Rules: rulesEngine}),
+	engine.WithMetadata(reg),
+	engine.WithReferences(reg),
+	engine.WithLogger(logger)) // where a dangling reference is reported
+```
+
+`References` carries the same `json` / `jsonschema` tags `Fields` does, for the
+same MCP-reflection reason: `omitempty` on the slice keeps the edges *optional*,
+while `HolderID` and `Field` are required properties of an edge and `HolderType`
+is not.
 
 ## Fail-closed rendering
 

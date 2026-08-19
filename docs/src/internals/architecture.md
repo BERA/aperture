@@ -50,7 +50,7 @@ flowchart TD
     subgraph Domain["Decision domain (root packages)"]
         Rules["rules/"]
         Scope["scope/"]
-        Provider["provider/ · csvprovider/"]
+        Provider["provider/ · csvprovider/ · sqlprovider/"]
         Identity["identity/"]
         Model["model/"]
         Filter["filter/"]

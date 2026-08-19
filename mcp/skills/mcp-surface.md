@@ -13,7 +13,11 @@ mutators (Put*/Delete*, Bestow/Revoke, impersonation) are not surfaced, and a
 test enumerates the registered tools to assert none carries a mutating verb.
 
 Serve it with `aperture mcp` (stdio) — the transport an MCP client uses when it
-spawns Aperture as a subprocess.
+spawns Aperture as a subprocess. It builds the SAME decision stack `serve` and
+the one-shot CLI commands build (`internal/cli.buildDecisionStack`): the rules
+engine, the object lister, and the object-metadata source. An agent therefore
+gets the same verdict as every other surface — and a filtered
+`aperture_enumerate` works at all.
 
 ## Tools
 
@@ -24,8 +28,25 @@ spawns Aperture as a subprocess.
 - `aperture_check_batch` — many questions in one round-trip, results aligned with
   the input queries; one bad query never fails the batch.
 - `aperture_enumerate` — the object ids under a pattern a principal may act on
-  (the inverse of check); every id is one check would allow.
-- `aperture_enumerate_batch` — bulk enumerate, aligned with queries.
+  (the inverse of check); every id is one check would allow. Takes an OPTIONAL
+  `Fields` object of metadata predicates: ANDed, a field the object does not
+  carry never matches, a list-valued field matches by membership, everything else
+  is typed equality (`"5"` never matches `5`). It only ever removes ids from the
+  allowed set, and it is applied BEFORE `Limit`, so `Limit` counts matches. The
+  schema is reflected off `service.EnumerateQuery`, where `Fields` carries
+  `omitempty` so an unfiltered enumerate stays representable. Also takes an
+  OPTIONAL `References` list of reference edges (`HolderID` + `Field`, and an
+  optional `HolderType`) restricting the result to what a holder object's
+  DECLARED reference field names — "which brands belong to dataset X?". That is a
+  DEREFERENCE, not a filter: `Fields` answers the mirror image ("which datasets
+  contain brand Y?") because that side holds the field. Edges are ANDed, compose
+  with `Fields`, apply before `Limit`, and take exactly one hop. A holder the
+  principal may not see is an EMPTY list and NOT an error — do not report it as a
+  permission failure; an undeclared field is a loud
+  `APERTURE_PROVIDER_REFERENCE_INVALID`, which means the deployment is not wired
+  for that question rather than that access was denied.
+- `aperture_enumerate_batch` — bulk enumerate, aligned with queries; each query
+  carries its own `Fields` and `References`.
 - `aperture_explain` — the full decision trace: subject set, every grant
   considered with its per-grant outcome, the deciding grants, the verdict.
 - `aperture_explain_batch` — bulk explain, aligned with queries.

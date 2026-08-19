@@ -3,6 +3,8 @@ syntax = "proto3";
 package aperture;
 option go_package = "github.com/frankbardon/aperture/internal/wire/rpc";
 
+import "google/protobuf/struct.proto";
+
 // ApertureService is Aperture's full access-control RPC: the decision API
 // (Check / Enumerate / Explain, single and bulk) plus the model mutations
 // (CRUD for the RBAC entities, grants, delegation, and impersonation). It is
@@ -207,6 +209,59 @@ message EnumerateRequest {
   string action = 3;
   string pattern = 4;
   int32 limit = 5;
+  // fields are OPTIONAL object-metadata predicates narrowing the result: an
+  // allowed object is returned only when its metadata satisfies every one of
+  // them. Omitting the map is exactly a nil map in Go — it filters nothing, so
+  // an existing client is unaffected.
+  //
+  // The meaning is provider.Filter's Fields contract verbatim: AND across keys,
+  // a field ABSENT from an object never matches (not even against a null want),
+  // a COLLECTION field matches by MEMBERSHIP, everything else by EQUALITY, and
+  // comparison is TYPED. google.protobuf.Value is used rather than a JSON string
+  // precisely because it preserves the string/number/bool/list distinction the
+  // typed comparison rests on: a Value string "5" does NOT match a numeric 5 in
+  // metadata, while a Value number 5 matches an integer 5 (numbers compare
+  // across Go numeric types by value). A list Value is a CONTAINER want and
+  // therefore compares by equality, not membership.
+  //
+  // CAVEAT: google.protobuf.Value carries a number as a double, so an integer
+  // beyond 2^53 loses precision in transit. Send a key that large as a string
+  // and store it as a string.
+  map<string, google.protobuf.Value> fields = 6;
+  // references are OPTIONAL reference edges restricting the result to the
+  // identities a holder object's DECLARED reference field contains — "the
+  // brands in dataset X". Omitting them is exactly a nil slice in Go: nothing
+  // is restricted, so an existing client is unaffected.
+  //
+  // Several edges AND, an edge composes with fields, and both are applied
+  // BEFORE limit. Exactly one hop is taken.
+  //
+  // SECURITY: a holder the principal may not see yields an EMPTY result and no
+  // error — "you may not see dataset X" and "dataset X contains nothing you may
+  // see" are deliberately indistinguishable. An ABSENT holder is NotFound
+  // (APERTURE_NOT_FOUND) only when it lies inside the request's account and the
+  // caller is a member of it; outside the account, or for a non-member, the
+  // answer is empty and never NotFound.
+  repeated ReferenceEdge references = 7;
+}
+
+// ReferenceEdge restricts an enumeration to the identities ONE holder object's
+// declared reference field contains. It is three plain strings: no value model
+// is involved, because an edge names a field — it does not carry one.
+message ReferenceEdge {
+  // holder_type is the object-type that DECLARES the reference ("dataset").
+  // OPTIONAL: empty means "whatever holder_id's terminal segment type is". When
+  // it IS given it must AGREE with holder_id, so this three-string spelling can
+  // never drift from the identity it carries.
+  string holder_type = 1;
+  // holder_id is the holder object's canonical identity
+  // ("account:acme/dataset:7"). Required.
+  string holder_id = 2;
+  // field is the metadata field on holder_type that a references: declaration
+  // binds to a target object-type ("current_brands"). Required, and it must be
+  // DECLARED — an undeclared field is an error, never an empty edge that would
+  // read as "no access".
+  string field = 3;
 }
 
 message EnumerateResponse {

@@ -58,13 +58,13 @@ const (
 // stable order (sorted by id/name) so a round-trip is byte-stable and
 // human-diffable.
 //
-// Three sections are runtime WIRING rather than model state, and are the seed
-// FILE's own source of truth: Providers, Objects, and FieldTypes. BuildRegistry
-// turns them into a live *provider.Registry; Apply writes none of them to
-// storage, and because Export reads the model back OUT of storage, none is ever
-// reproduced by an export. Live host domain-object metadata is deliberately not
-// exportable state — that is the provider cache, derived and disposable, never
-// source of truth.
+// Four sections are runtime WIRING rather than model state, and are the seed
+// FILE's own source of truth: Connections, Providers, Objects, and FieldTypes.
+// BuildRegistry turns them into a live *provider.Registry; Apply writes none of
+// them to storage, and because Export reads the model back OUT of storage, none
+// is ever reproduced by an export. Live host domain-object metadata is
+// deliberately not exportable state — that is the provider cache, derived and
+// disposable, never source of truth.
 type Document struct {
 	Accounts    []Account    `yaml:"accounts" json:"accounts"`
 	Memberships []Membership `yaml:"memberships" json:"memberships"`
@@ -76,9 +76,14 @@ type Document struct {
 	Grants      []Grant      `yaml:"grants" json:"grants"`
 	Templates   []Template   `yaml:"templates" json:"templates"`
 	Rules       []Rule       `yaml:"rules" json:"rules"`
-	Providers   []Provider   `yaml:"providers,omitempty" json:"providers,omitempty"`
-	Objects     []Object     `yaml:"objects,omitempty" json:"objects,omitempty"`
-	FieldTypes  []FieldType  `yaml:"field_types,omitempty" json:"field_types,omitempty"`
+	// Connections maps a connection NAME to its declaration. It is a map rather
+	// than a list because the name is the identity a provider entry's
+	// connection: refers to, and a map cannot declare the same name twice. One
+	// pool is opened per entry and shared by every provider entry naming it.
+	Connections map[string]Connection `yaml:"connections,omitempty" json:"connections,omitempty"`
+	Providers   []Provider            `yaml:"providers,omitempty" json:"providers,omitempty"`
+	Objects     []Object              `yaml:"objects,omitempty" json:"objects,omitempty"`
+	FieldTypes  []FieldType           `yaml:"field_types,omitempty" json:"field_types,omitempty"`
 }
 
 // Account mirrors model.Account in declarative form.
@@ -216,6 +221,13 @@ func Parse(data []byte, format Format) (*Document, error) {
 		}
 	default:
 		return nil, aerr.Newf(aerr.APERTURE_INVALID_INPUT, "seed: unknown format %q", format)
+	}
+	// A literal dsn: is refused HERE, at decode, and not at BuildRegistry: the
+	// harm is that a password was written into a committed file, so the document
+	// must not be loadable — not by Apply, not by an export round-trip, not by a
+	// tool that only wanted to read the object types.
+	if err := doc.rejectLiteralDSN(); err != nil {
+		return nil, err
 	}
 	return &doc, nil
 }

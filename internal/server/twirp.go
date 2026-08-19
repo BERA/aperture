@@ -115,10 +115,63 @@ func (h *twirpHandler) CheckBatch(ctx context.Context, req *rpc.CheckBatchReques
 	return &rpc.CheckBatchResponse{Results: out}, nil
 }
 
+// enumerateQuery translates one wire enumerate request onto the facade query,
+// decoding the metadata predicates on the way. The decode is the ONLY
+// interpretation the surface performs: Value -> the Go shapes the value model
+// admits, with no coercion between them (see rpc.FieldsFromWire). An omitted
+// map arrives as a nil map, which is exactly an unfiltered enumeration.
+//
+// Reference edges need no decode at all — three strings map straight across
+// (referenceEdges) — and get no validation here either, for the reason stated
+// there.
+func enumerateQuery(q *rpc.EnumerateRequest) (service.EnumerateQuery, error) {
+	fields, err := rpc.FieldsFromWire(q.GetFields())
+	if err != nil {
+		return service.EnumerateQuery{}, err
+	}
+	return service.EnumerateQuery{
+		Account:    q.Account,
+		Principal:  q.Principal,
+		Action:     q.Action,
+		Pattern:    q.Pattern,
+		Fields:     fields,
+		References: referenceEdges(q.GetReferences()),
+		Limit:      int(q.Limit),
+	}, nil
+}
+
+// referenceEdges carries the wire's reference edges onto the facade's, three
+// strings at a time. Nothing here validates them: whether the holder identity
+// parses, whether a declared holder type agrees with it, and whether the field
+// is a declared reference are all decisions with a DISCLOSURE consequence
+// (engine/reference.go draws the empty-vs-NOT_FOUND boundary), and a surface
+// that answered any of them separately would be a second place for the answer
+// to differ.
+//
+// An omitted repeated field arrives as an empty slice and leaves as a nil one,
+// so "no edges on the wire" is indistinguishable from "no edges in Go" — an
+// unrestricted enumeration, exactly as before this field existed.
+func referenceEdges(in []*rpc.ReferenceEdge) []service.ReferenceEdge {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]service.ReferenceEdge, 0, len(in))
+	for _, e := range in {
+		out = append(out, service.ReferenceEdge{
+			HolderType: e.GetHolderType(),
+			HolderID:   e.GetHolderId(),
+			Field:      e.GetField(),
+		})
+	}
+	return out
+}
+
 func (h *twirpHandler) Enumerate(ctx context.Context, req *rpc.EnumerateRequest) (*rpc.EnumerateResponse, error) {
-	ids, err := h.svc.Enumerate(ctx, service.EnumerateQuery{
-		Account: req.Account, Principal: req.Principal, Action: req.Action, Pattern: req.Pattern, Limit: int(req.Limit),
-	})
+	q, err := enumerateQuery(req)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	ids, err := h.svc.Enumerate(ctx, q)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -127,16 +180,32 @@ func (h *twirpHandler) Enumerate(ctx context.Context, req *rpc.EnumerateRequest)
 
 func (h *twirpHandler) EnumerateBatch(ctx context.Context, req *rpc.EnumerateBatchRequest) (*rpc.EnumerateBatchResponse, error) {
 	qs := make([]service.EnumerateQuery, len(req.Queries))
+	// A malformed predicate is an input-validation failure for THAT query alone,
+	// so it rides in the item's error slot exactly as an engine validation error
+	// does. One bad query never fails the batch (BatchResult's contract), and a
+	// query that never ran must not be silently reported as "no objects".
+	bad := make([]error, len(req.Queries))
 	for i, q := range req.Queries {
-		qs[i] = service.EnumerateQuery{Account: q.Account, Principal: q.Principal, Action: q.Action, Pattern: q.Pattern, Limit: int(q.Limit)}
+		query, err := enumerateQuery(q)
+		if err != nil {
+			bad[i] = err
+			continue
+		}
+		qs[i] = query
 	}
 	results := h.svc.EnumerateBatch(ctx, qs)
 	out := make([]*rpc.BatchEnumeration, len(results))
 	for i, r := range results {
 		be := &rpc.BatchEnumeration{}
-		if r.Err != nil {
-			be.ErrorCode = string(aerr.CodeOf(r.Err))
-			be.ErrorMessage = r.Err.Error()
+		err := r.Err
+		if i < len(bad) && bad[i] != nil {
+			// The decode failed, so this item's engine result describes a
+			// zero-valued query, not the caller's. Report the decode error.
+			err = bad[i]
+		}
+		if err != nil {
+			be.ErrorCode = string(aerr.CodeOf(err))
+			be.ErrorMessage = err.Error()
 		} else {
 			be.ObjectIds = r.Result
 		}
@@ -1095,14 +1164,24 @@ func mapErr(err error) error {
 // codeToTwirp maps an Aperture code to a Twirp error code (and thus an HTTP
 // status): InvalidArgument→400, Unauthenticated→401, PermissionDenied→403,
 // NotFound→404, Unimplemented→501, Internal→500.
+//
+// APERTURE_PROVIDER_REFERENCE_INVALID is deliberately a 400 rather than the
+// default 500. The only way it reaches a client is an enumerate reference edge
+// naming a field no references: declaration binds, which is the caller's own
+// input — the same class of mistake as a --via with no '.', which is already an
+// APERTURE_INVALID_INPUT. Retrying the request unchanged can never succeed, so a
+// 5xx would tell a retrying client and a paging alert rule exactly the wrong
+// thing. Its sibling APERTURE_PROVIDER_REFERENCE_MISMATCH stays a 500: that one
+// says the HOST'S OWN data does not point where its declaration claims, which no
+// change to the request can fix.
 func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 	switch code {
 	case aerr.APERTURE_INVALID_INPUT, aerr.APERTURE_IDENTITY_INVALID,
 		aerr.APERTURE_ACTION_UNDECLARED, aerr.APERTURE_SCOPE_INVALID,
 		aerr.APERTURE_SCOPE_UNKNOWN_STRATEGY, aerr.APERTURE_RULE_INVALID,
 		aerr.APERTURE_RULE_UNKNOWN_VARIABLE, aerr.APERTURE_RULE_TYPE_ERROR,
-		aerr.APERTURE_PROVIDER_INVALID, aerr.APERTURE_TEMPLATE_INVALID,
-		aerr.APERTURE_TEMPLATE_PARAM:
+		aerr.APERTURE_PROVIDER_INVALID, aerr.APERTURE_PROVIDER_REFERENCE_INVALID,
+		aerr.APERTURE_TEMPLATE_INVALID, aerr.APERTURE_TEMPLATE_PARAM:
 		return twirp.InvalidArgument
 	case aerr.APERTURE_NOT_FOUND, aerr.APERTURE_RULE_NOT_FOUND,
 		aerr.APERTURE_PROVIDER_UNREGISTERED:

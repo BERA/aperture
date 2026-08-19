@@ -72,14 +72,84 @@ const (
 	// registration time, before any object metadata can be fetched.
 	APERTURE_PROVIDER_INVALID Code = "APERTURE_PROVIDER_INVALID"
 	// APERTURE_PROVIDER_UNREGISTERED — metadata for an object-type was requested
-	// (fetch, enumerate, or invalidate) but no ObjectProvider is registered for
-	// that type. The object-type is the identity's terminal segment type.
+	// (fetch, enumerate, invalidate, or an Enumerate metadata-field predicate)
+	// but no ObjectProvider is registered for that type — or, for the predicate,
+	// the engine was built with no metadata source at all (engine.WithMetadata).
+	// The object-type is the identity's terminal segment type. A filtered
+	// enumeration reports this rather than returning an empty list, because an
+	// empty list reads as "no access" and would hide the misconfiguration.
 	APERTURE_PROVIDER_UNREGISTERED Code = "APERTURE_PROVIDER_UNREGISTERED"
 	// APERTURE_PROVIDER_FETCH — a host ObjectProvider's Fetch/List/Query returned
 	// a plain (uncoded) error. The cause is wrapped verbatim; provider errors that
 	// already carry an APERTURE_* code (e.g. APERTURE_NOT_FOUND for an
 	// absent object) pass through unwrapped instead.
 	APERTURE_PROVIDER_FETCH Code = "APERTURE_PROVIDER_FETCH"
+	// APERTURE_PROVIDER_REFERENCE_INVALID — a declared object reference is not
+	// usable: an empty object-type, field, or target; a target object-type with
+	// no registered provider; a field declared twice on one type; or a request to
+	// resolve a field no reference declares. A reference is an application-level
+	// foreign key with no database constraint behind it, so the declaration is
+	// checked where it is made — at registry build — rather than being discovered
+	// by the first decision that followed it.
+	APERTURE_PROVIDER_REFERENCE_INVALID Code = "APERTURE_PROVIDER_REFERENCE_INVALID"
+	// APERTURE_PROVIDER_REFERENCE_MISMATCH — the VALUE of a declared reference
+	// field does not point where the declaration says: it is neither an identity
+	// string nor a list of them, it does not parse as a canonical identity, or
+	// its terminal segment type is not the declared target ("team:7" in a field
+	// declared to hold brands). It is an error rather than a skipped element on
+	// purpose — an enumeration that silently dropped the value would read as "no
+	// access" and hide the fault.
+	APERTURE_PROVIDER_REFERENCE_MISMATCH Code = "APERTURE_PROVIDER_REFERENCE_MISMATCH"
+	// APERTURE_SQL_PROVIDER_QUERY — a SQL-backed ObjectProvider's statement did
+	// not run: a connection, permission, syntax, placeholder-arity, or timeout
+	// failure reported by the host's database. The driver's error is wrapped
+	// verbatim. This is an OPERATIONAL failure, deliberately distinct from
+	// APERTURE_NOT_FOUND (the object is absent) — the Registry must be able to
+	// tell "there is no such object" from "the database is unreachable", because
+	// the two mean opposite things for a decision.
+	APERTURE_SQL_PROVIDER_QUERY Code = "APERTURE_SQL_PROVIDER_QUERY"
+	// APERTURE_SQL_PROVIDER_AMBIGUOUS — a SQL-backed ObjectProvider's "get one"
+	// statement returned more than one row for a single object identity. The
+	// first row is never silently taken: which row won would depend on an
+	// unspecified order, so an object's metadata — and therefore the decision
+	// made from it — would vary between two otherwise identical Checks.
+	APERTURE_SQL_PROVIDER_AMBIGUOUS Code = "APERTURE_SQL_PROVIDER_AMBIGUOUS"
+	// APERTURE_SQL_PROVIDER_SCAN — a row the host's database returned could not
+	// be turned into object metadata: an unnamed or duplicated result column, a
+	// scan failure, a driver value of a Go type the provider does not map, a
+	// []byte column that is not valid JSON, or a timestamp the canonical date
+	// value model cannot represent. The statement ran; its shape or its values
+	// are the problem, and the fix is a cast in the SELECT list.
+	APERTURE_SQL_PROVIDER_SCAN Code = "APERTURE_SQL_PROVIDER_SCAN"
+	// APERTURE_SQL_PROVIDER_ROW_IDENTITY — a row returned by a SQL-backed
+	// ObjectProvider's "get all" statement did not yield a usable object
+	// identity: the result set had no id column, the row's id was NULL, empty,
+	// or not textual, it did not parse as an identity, or its terminal segment
+	// type is not the object-type that provider serves. The identity is
+	// composed by the developer inside the statement ('brand:' || b.id AS id),
+	// so Aperture cannot repair it — and admitting the row would enumerate one
+	// object-type's rows under another's and cache metadata under identities no
+	// Fetch of that provider could ever return.
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY Code = "APERTURE_SQL_PROVIDER_ROW_IDENTITY"
+	// APERTURE_SQL_PROVIDER_DSN_LITERAL — a declarative connection carries a
+	// literal dsn: instead of naming an environment variable with dsn_env:. A
+	// seed file is a committed artifact, so a DSN written into one is a password
+	// written into version control, and that is only ever noticed afterwards.
+	// The key is refused at PARSE time, before anything is opened, so the
+	// document cannot be loaded by accident on the way to being fixed.
+	APERTURE_SQL_PROVIDER_DSN_LITERAL Code = "APERTURE_SQL_PROVIDER_DSN_LITERAL"
+	// APERTURE_SQL_PROVIDER_CONNECTION — a declared database connection could
+	// not be resolved into a live pool, or a provider entry referenced one that
+	// does not exist: an unset or empty DSN environment variable, an unparseable
+	// pool setting, an unknown connection name, or a driver that refused to open
+	// the handle. It is raised while the registry is being BUILT, never lazily on
+	// the first query, because a connection that only fails under a decision
+	// fails as a denial.
+	//
+	// A DSN is redacted out of anything this error carries: the whole point of
+	// forbidding a literal dsn: is to keep the password out of committed and
+	// logged text, and an error message is logged text.
+	APERTURE_SQL_PROVIDER_CONNECTION Code = "APERTURE_SQL_PROVIDER_CONNECTION"
 	// APERTURE_METADATA_INVALID — an object's metadata violates the shared
 	// metadata value model: a value that is neither a scalar, a []any of
 	// scalars, nor a map[string]any one level deeper; an array holding an object
@@ -279,6 +349,7 @@ var Registry = map[Code]Metadata{
 		Fixups: []string{
 			"Register an ObjectProvider for the object type before fetching its metadata.",
 			"Confirm the object identity's terminal segment type matches a registered provider key.",
+			"Filtering an enumeration by metadata fields? Build the engine with engine.WithMetadata(registry) — the same provider registry the scope lister uses — or drop the field predicates.",
 		},
 	},
 	APERTURE_PROVIDER_FETCH: {
@@ -286,6 +357,74 @@ var Registry = map[Code]Metadata{
 		Fixups: []string{
 			"Inspect the wrapped cause for the underlying provider failure.",
 			"Return APERTURE_NOT_FOUND from the provider for an object that does not exist.",
+		},
+	},
+	APERTURE_PROVIDER_REFERENCE_INVALID: {
+		Message: "a declared object reference is not usable",
+		Fixups: []string{
+			"Register a provider for the target object-type: a references: entry may only point at a type this registry serves.",
+			"Declare each field at most once per object-type; several fields may point at the same target, but one field has one target.",
+			"Declare the reference on the HOLDING side — the type whose provider actually returns the field — because that is the only side with a value to resolve.",
+			"Resolving a field means declaring it first: reg.DeclareReference(\"dataset\", \"current_brands\", \"brand\"), or a references: entry in the provider's seed block.",
+		},
+	},
+	APERTURE_PROVIDER_REFERENCE_MISMATCH: {
+		Message: "a reference field's value does not identify an object of its declared target type",
+		Fixups: []string{
+			"Store FULL canonical identities in a reference field ('brand:1', 'account:acme/brand:1'), not bare primary keys — compose them where the data is loaded, e.g. SELECT 'brand:' || b.id.",
+			"Make the field a string or a list of strings; a number, a map, or a list holding anything but strings cannot be an identity.",
+			"Check the declared target against the values the field actually carries: an identity whose terminal segment type is not the declared type is rejected rather than skipped.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_QUERY: {
+		Message: "SQL object provider could not run its statement",
+		Fixups: []string{
+			"Inspect the wrapped driver error for the underlying database failure.",
+			"Check the statement's placeholder count: a fetch statement binds exactly one parameter, the identity's terminal segment value.",
+			"Use the placeholder syntax your engine speaks — Aperture passes placeholders through untouched and never rewrites $1 to ?.",
+			"Confirm the database is reachable and the connection's role can read the table; raise Config.Timeout if the statement is legitimately slow.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_AMBIGUOUS: {
+		Message: "SQL object provider's fetch statement returned more than one row for one identity",
+		Fixups: []string{
+			"Filter the fetch statement on a unique or primary key so one identity selects at most one row.",
+			"A join that fans out is the usual cause; aggregate or de-duplicate the fanned-out side instead of adding LIMIT 1, which would make the metadata depend on an unspecified row order.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_SCAN: {
+		Message: "SQL object provider could not read a row into object metadata",
+		Fixups: []string{
+			"Give every selected expression a name, and alias duplicates: each result column becomes a metadata field keyed by its column name.",
+			"Cast or serialise a column whose Go type the provider does not map (the driver value's type is named in the error, alongside the types that are mapped).",
+			"A []byte column is decoded as JSON, never as a string: wrap an array in to_jsonb(...), and cast a numeric, uuid, or bytea to ::text, ::float8, or encode(...) in the statement.",
+			"A list-valued field only arrives as a list when the statement casts it — SELECT to_jsonb(tags) AS tags, not SELECT tags, which yields the raw array literal as a string that silently matches nothing.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY: {
+		Message: "SQL object provider could not turn a row's id column into an object identity of its type",
+		Fixups: []string{
+			"Compose the full identity in the get-all statement's id column — SELECT 'brand:' || b.id AS id — because a bare primary key is not an identity and Aperture supplies no template.",
+			"Name the identity column id, or set the provider's id column to the alias the statement actually uses.",
+			"Make the id column textual and never NULL: cast a numeric or uuid key with ::text before concatenating it.",
+			"Check that the identity's terminal segment type is the object-type this provider is registered under; a 'brand:1' row served by the 'dataset' provider is rejected rather than cached.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_DSN_LITERAL: {
+		Message: "a declarative database connection carries a literal dsn instead of dsn_env",
+		Fixups: []string{
+			"Replace the connection's dsn: key with dsn_env: naming the environment variable that holds the DSN.",
+			"Export the DSN in the process environment (or a .env file the deployment loads) rather than writing it into the seed file.",
+			"Rotate the credential if a literal DSN was ever committed — the seed file is a version-controlled artifact.",
+		},
+	},
+	APERTURE_SQL_PROVIDER_CONNECTION: {
+		Message: "a declared database connection could not be resolved into a live pool",
+		Fixups: []string{
+			"Set the environment variable named by the connection's dsn_env: to a non-empty DSN before starting the process.",
+			"Check that every kind: sql provider entry's connection: matches a name declared in the top-level connections: block.",
+			"Give pool settings valid values: conn_max_lifetime and query_timeout are Go durations (\"30m\", \"5s\"), and query_timeout must be positive — there is no 'no timeout' setting.",
+			"Verify the DSN's host, port, database, and credentials by connecting with psql; the driver's message is redacted here because a DSN parse failure commonly echoes the password.",
 		},
 	},
 	APERTURE_METADATA_INVALID: {
@@ -419,6 +558,14 @@ var AllCodes = []Code{
 	APERTURE_PROVIDER_INVALID,
 	APERTURE_PROVIDER_UNREGISTERED,
 	APERTURE_PROVIDER_FETCH,
+	APERTURE_PROVIDER_REFERENCE_INVALID,
+	APERTURE_PROVIDER_REFERENCE_MISMATCH,
+	APERTURE_SQL_PROVIDER_QUERY,
+	APERTURE_SQL_PROVIDER_AMBIGUOUS,
+	APERTURE_SQL_PROVIDER_SCAN,
+	APERTURE_SQL_PROVIDER_ROW_IDENTITY,
+	APERTURE_SQL_PROVIDER_DSN_LITERAL,
+	APERTURE_SQL_PROVIDER_CONNECTION,
 	APERTURE_METADATA_INVALID,
 	APERTURE_RULE_INVALID,
 	APERTURE_RULE_UNKNOWN_VARIABLE,

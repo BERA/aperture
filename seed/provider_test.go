@@ -57,9 +57,11 @@ func TestBuildRegistry_EmptyWhenNoProviders(t *testing.T) {
 func TestBuildRegistry_Errors(t *testing.T) {
 	cases := map[string]Provider{
 		"missing object_type": {Kind: "csv", Path: "x.csv"},
-		"unknown kind":        {ObjectType: "brand", Kind: "sql", Path: "x"},
-		"csv missing path":    {ObjectType: "brand", Kind: "csv"},
-		"bad ttl":             {ObjectType: "brand", Kind: "csv", Path: "x.csv", TTL: "notaduration"},
+		// "sql" is a KNOWN kind now (see connection_test.go); "mysql" is not, and
+		// this case is about the unknown-kind branch, so it names one.
+		"unknown kind":     {ObjectType: "brand", Kind: "mysql", Path: "x"},
+		"csv missing path": {ObjectType: "brand", Kind: "csv"},
+		"bad ttl":          {ObjectType: "brand", Kind: "csv", Path: "x.csv", TTL: "notaduration"},
 	}
 	for name, p := range cases {
 		t.Run(name, func(t *testing.T) {

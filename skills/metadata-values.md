@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the seed document's inline objects section, its optional field_types: date declarations, and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the sqlprovider driver-value mapping table whose spelling is a cast in the SELECT list rather than a column suffix, the seed document's inline objects section, its optional field_types: date declarations, and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -275,6 +275,61 @@ including a date, which reaches it as the plain string scalar it is — is
 and the JSON kind or the decoder's message; a date rejection carries the column,
 the line, the `reason`, and the layout `expected`. Neither ever carries the cell.
 
+### `sqlprovider`
+
+The SQL loader's spelling of the model is **a cast in the `SELECT` list**. That
+is the contrast with `csvprovider`, and it is the whole design: there is no
+`:int` / `:list<T>` / `:date` suffix to learn and no per-column type declaration
+in YAML, because the developer is already writing a statement and two spellings
+for one intent drift apart. A column becomes whatever Go type `database/sql`
+scanned it into, through a **closed** mapping table:
+
+| Scanned Go type | Value |
+|---|---|
+| `nil` (SQL NULL) | the field is **omitted** — the same absent-vs-zero rule as an empty CSV cell |
+| `bool` / `int64` / `float64` / `string` | the **scalar**, as-is |
+| `[]byte` | JSON-decoded — an **array** or an **object**, and the only way either arrives |
+| `time.Time` | `.UTC()`, then a **string scalar** in `2006-01-02T15:04:05Z`, through the same `provider.ParseDateValue` every other loader calls |
+| anything else | `APERTURE_SQL_PROVIDER_SCAN` naming the column, the row's identity, and the Go type |
+
+So the statement is where the model is reached:
+
+| Want | Write | Because |
+|---|---|---|
+| an **array** | `to_jsonb(tags) AS tags` | no driver produces a `[]any` for a SQL array — measured. `SELECT tags` yields the raw literal `"{a,b}"`, a valid **string** that silently fails every membership predicate, and nothing in the loader can tell it from a string a host meant to store |
+| a **day-granular date** | `hired_on::text AS hired_on` | a database `date` and a `timestamp` are the same Go type, so granularity is not inferable; every `time.Time` becomes the **datetime** form |
+| a **number** from `numeric` | `amount::float8 AS amount` | a `numeric` arrives as a `string` (pgx), not a number |
+| an **identifier** from `numeric`/`uuid` | `sku::text AS sku` | same reason, opposite intent |
+| the object's **identity** | `'brand:' \|\| b.id AS id` | the id column is the identity, not a field; it is composed by the developer and removed before the rest becomes metadata |
+
+Four rules the value model does not impose, but the SQL encoding must:
+
+- **A `[]byte` is JSON, unconditionally** — there is no fall back to a string. A
+  fallback would let one column change *type* depending on its contents (a
+  `numeric` of `1.50` decoding as the float `1.5` while a `uuid` stayed a
+  string). A decode failure is a hard `APERTURE_SQL_PROVIDER_SCAN` naming the
+  column and the row. Consequently a **`bytea` does not work**: encode it in the
+  statement or leave it out. A JSON `null` omits its field, exactly as SQL NULL
+  does.
+- **Numbers inside a JSON column normalise exactly as scalar columns do** — an
+  exact integer that fits `int64` becomes an `int64`, everything else a
+  `float64`, at every depth. That is `csvprovider`'s rule verbatim, so a host
+  migrating a CSV to a table gets the same decisions, and
+  `object.limits.seats == object.seats` is not a silent `false`.
+- **A `time.Time` is converted to UTC first.** A `timestamptz` comes back in the
+  *process's* local zone in both candidate drivers, so the same row read on two
+  hosts would otherwise be two strings and, near midnight, two calendar days.
+- **The column name is the field key**, so an unnamed expression or two columns
+  with the same name is `APERTURE_SQL_PROVIDER_SCAN`, never a field dropped or
+  overwritten by whichever came last.
+
+The mapping table is gated: `TestDriverValueMappingTableMatchesTheTypeSwitch`
+parses `sqlprovider/values.go` with `go/ast` and fails if the type switch and
+`mappedDriverTypes` disagree. Every mapped row then goes through
+`provider.ValidateMetadata` like every other loader's output — the loader never
+re-implements the rules. See `skills/sql-provider.md` for the wiring, the
+connection defaults, and the errors.
+
 ### The seed document's `objects:` section
 
 YAML nests natively, so the seed file spells the model **directly** — no encoding
@@ -476,6 +531,15 @@ Two properties are load-bearing:
 - **A want that is itself a container compares by equality at both ends**, since
   no element of a legal array (scalars only) could ever equal an array or object.
 
+The same rule governs the **enumerate metadata filter**
+(`engine.EnumerateRequest.Fields`, and its `service.EnumerateQuery.Fields` /
+`--field` / `--fields-json` / Twirp `fields` / MCP `Fields` spellings): it calls
+`provider.MatchFields` too, so a shape that behaves one way inside a provider's
+`Query` behaves identically when the engine filters an enumeration. Two rules are
+the enumeration's own rather than the value model's — the predicate runs only on
+candidates that already survived deny-overrides, and it runs **before** the
+enumeration's `Limit`. See `skills/decision-api.md`.
+
 `provider.ValuesEqual` is the exported leaf comparison. It **reimplements**
 expr-lang's equality rather than importing it, because `provider/` is a strict
 leaf; `csvprovider/membership_equivalence_test.go` runs both over the same
@@ -526,10 +590,11 @@ Changing the value model means changing all of these in the same PR:
 |---|---|
 | The legal shapes, the caps, or their defaults | this doc + `docs/src/concepts/providers.md` |
 | The date value model (`provider/date.go`: the canonical forms, the accept/reject set, `DateReason`) | the "Dates" section above + `docs/src/concepts/providers.md` |
-| The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md` |
+| The `Filter.Fields` rule (`MatchFields`, `MatchField`, `ValuesEqual`) | the `Filter` doc comment in `provider/provider.go` — it is the contract every provider implements — plus this doc and `docs/src/concepts/providers.md`, **and** every restatement of it on the enumerate filter (`skills/api-surface.md`, `skills/decision-api.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/cli/decisions.md`) |
 | `APERTURE_METADATA_INVALID` | `errors/codes.go` (`AllCodes` + `Registry`), then `make docs-gen` |
-| A loader's coercion (`csvprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
+| A loader's coercion (`csvprovider`, `sqlprovider`, seed) | the loader must call `provider.Validate*`, not re-implement the rules |
 | A loader's **encoding** (the CSV header grammar, a seed key) | "How each loader spells the model" above + the loader's package doc + `docs/src/concepts/providers.md` |
+| The **SQL driver-value mapping** (`metadataValue`'s type switch or `mappedDriverTypes` in `sqlprovider/values.go`) | the "`sqlprovider`" section above + `skills/sql-provider.md` + the `sqlprovider` package doc + `docs/src/concepts/providers.md` — gated by `TestDriverValueMappingTableMatchesTheTypeSwitch`, which parses the source with `go/ast` |
 | The seed `field_types:` section (its spelling, its vocabulary, what it applies to) | "The seed document's `field_types:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and its two type words must stay identical to the CSV `:date`/`:datetime` suffixes, which is the whole reason it exists |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
 | The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |

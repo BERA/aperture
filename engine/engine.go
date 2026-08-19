@@ -40,6 +40,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -292,6 +293,18 @@ type Engine struct {
 	store             model.Storage
 	coverer           coverer
 	enforceMembership bool
+	// metadata is the object-metadata source Enumerate's Fields predicate reads
+	// through (WithMetadata). Nil by default and consulted ONLY by a request that
+	// carries Fields, so the unfiltered decision path never touches it.
+	metadata MetadataFetcher
+	// references is the declared-reference source Enumerate's reference edges are
+	// dereferenced through (WithReferences). Nil by default and consulted ONLY by
+	// a request that carries References.
+	references ReferenceSource
+	// logger receives the operational warnings a decision can raise without
+	// failing — today only a dangling object reference. Nil means slog.Default();
+	// it is never consulted by a decision that has nothing to report.
+	logger *slog.Logger
 	// now is the engine's clock, injected so impersonation time-box expiry is
 	// deterministic in tests. It defaults to time.Now and is only consulted on the
 	// impersonated decision path (CheckAs/EnumerateAs/ExplainAs); the
