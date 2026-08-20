@@ -248,6 +248,19 @@ const (
 	// other decision. The gate fails closed — when the required tier cannot be
 	// proven, the mutation is refused.
 	APERTURE_AUTHZ_DENIED Code = "APERTURE_AUTHZ_DENIED"
+	// APERTURE_ENTITY_UNMANAGED — a lifecycle write (create, update, or delete)
+	// targeted an entity kind this deployment does not manage. The
+	// APERTURE_MANAGE_ACCOUNTS / APERTURE_MANAGE_PRINCIPALS /
+	// APERTURE_MANAGE_MEMBERSHIPS switches are deployment POSTURE, not
+	// authorization: they say whether Aperture owns the kind's lifecycle at all,
+	// so the refusal lands the same way for every caller — a full system-admin
+	// included. It is deliberately distinct from APERTURE_AUTHZ_DENIED, because an
+	// operator who cannot tell the two apart goes hunting through the grant table
+	// for something a startup flag decided. The whole lifecycle is covered, not
+	// creation alone (Aperture's entity writes are upserts), which is why the
+	// message says "manage" rather than "create". Reads are unaffected, and the
+	// decision path — Check / Enumerate / Explain — never consults the switches.
+	APERTURE_ENTITY_UNMANAGED Code = "APERTURE_ENTITY_UNMANAGED"
 )
 
 // Metadata describes an Aperture code: the canonical human-readable Message and
@@ -538,6 +551,15 @@ var Registry = map[Code]Metadata{
 			"Account-admin authority is confined to its own account; obtain authority in the account the mutation targets, or hold a broader (e.g. **) grant.",
 		},
 	},
+	APERTURE_ENTITY_UNMANAGED: {
+		Message: "this deployment does not manage the entity kind the write targeted",
+		Fixups: []string{
+			"Set the switch for the kind named in the message — APERTURE_MANAGE_ACCOUNTS, APERTURE_MANAGE_PRINCIPALS, or APERTURE_MANAGE_MEMBERSHIPS — to true (the default), then RESTART aperture: the switches are read once at startup and never re-read.",
+			"The three switches are independent; turning one on does not affect the others, so enable only the kind you meant to hand back to Aperture.",
+			"Leaving a kind unmanaged is usually deliberate — those records are mastered by an upstream system. Make the change there and let it flow in, rather than flipping the switch.",
+			"This is not a permission problem: no grant, role, or admin tier lifts it, and it refuses a system-admin exactly as it refuses anyone else.",
+		},
+	},
 }
 
 // AllCodes is the registry every gate walks. Append new codes here; the
@@ -581,6 +603,7 @@ var AllCodes = []Code{
 	APERTURE_TEMPLATE_INVALID,
 	APERTURE_TEMPLATE_PARAM,
 	APERTURE_AUTHZ_DENIED,
+	APERTURE_ENTITY_UNMANAGED,
 }
 
 // Message returns the canonical message for a code, or empty when the code has

@@ -86,6 +86,69 @@ func (s *Service) authorize(ctx context.Context, actor Actor, m authz.Mutation, 
 	return s.gate.Authorize(ctx, actor.gateActor(), m, targetAccount)
 }
 
+// ---- Entity-management gate (deployment posture, NOT authorization) ----
+
+// managedKind names one gated entity kind three ways at once: the noun a refusal
+// puts in front of a human, the environment variable that controls it, and the
+// ManagedEntities field it reads. They live in one value so a call site names a
+// single kind — gating on accounts while telling the operator to go and set the
+// principals switch is not a mistake the compiler could otherwise catch.
+type managedKind struct {
+	noun   string
+	plural string
+	env    string
+	of     func(ManagedEntities) Managed
+}
+
+var (
+	kindAccount    = managedKind{"account", "accounts", EnvManageAccounts, func(m ManagedEntities) Managed { return m.Accounts }}
+	kindPrincipal  = managedKind{"principal", "principals", EnvManagePrincipals, func(m ManagedEntities) Managed { return m.Principals }}
+	kindMembership = managedKind{"membership", "memberships", EnvManageMemberships, func(m ManagedEntities) Managed { return m.Memberships }}
+)
+
+// requireManaged refuses a lifecycle write to an entity kind this deployment does
+// not manage, with APERTURE_ENTITY_UNMANAGED naming the kind.
+//
+// It runs BEFORE s.authorize in every gated mutator, and that order is
+// load-bearing rather than incidental. Authorization answers "may THIS ACTOR do
+// this?"; the switch answers "does this deployment manage this entity AT ALL?".
+// Those are different questions, and only one of them was asked. Gating after
+// authorize would hand a full system-admin — an actor authorization denies
+// nothing — a permission error for something permission never decided, and send
+// whoever is debugging it into the grant table after a fact that a startup flag
+// settled. Refusing first keeps deployment posture and access control legible as
+// two separate answers, which is the whole point of not spelling this as an
+// authz.Mutation tier.
+//
+// The order does mean an unauthenticated caller learns the kind is unmanaged
+// before authentication is checked. That is deliberate and discloses nothing:
+// the posture is identical for every caller, is published on purpose (the
+// capabilities surface exists to answer exactly this), and the message carries
+// only the entity KIND — never an account, principal, or membership id.
+//
+// It covers Put and Delete alike. Aperture's entity writes are upserts with no
+// create-only variant, so "refuse creates but allow edits" would need a
+// read-before-write and the TOCTOU window that comes with it; the switch locks
+// the whole lifecycle instead, and the wording says "manage" so the refusal does
+// not read as a promise that edits are still available.
+//
+// Nothing here is on the decision path: Check, Enumerate, and Explain never call
+// it, and reads of the entities themselves stay open.
+func (s *Service) requireManaged(k managedKind) error {
+	if k.of(s.managed).Enabled() {
+		return nil
+	}
+	return aerr.WithContext(aerr.APERTURE_ENTITY_UNMANAGED,
+		"service: this deployment does not manage "+k.plural+
+			"; creating, updating, and deleting a "+k.noun+" are all refused",
+		map[string]any{
+			"entity":  k.noun,
+			"env":     k.env,
+			"posture": k.of(s.managed).String(),
+			"fix":     "set " + k.env + "=true and restart aperture; it is read once at startup",
+		})
+}
+
 // stampPut sets UpdatedAt to now and CreatedAt to now when unset, honouring the
 // model contract that the service layer stamps entity timestamps.
 func (s *Service) stamp(created, updated *time.Time) {
@@ -181,6 +244,9 @@ func (s *Service) PutPrincipal(ctx context.Context, actor Actor, p model.Princip
 		return err
 	}
 	defer func() { s.recordMutation(ctx, actor, "PutPrincipal", "principal:"+p.ID, err) }()
+	if err = s.requireManaged(kindPrincipal); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationPutPrincipal, ""); err != nil {
 		return err
 	}
@@ -238,6 +304,9 @@ func (s *Service) DeletePrincipal(ctx context.Context, actor Actor, id string) (
 		return err
 	}
 	defer func() { s.recordMutation(ctx, actor, "DeletePrincipal", "principal:"+id, err) }()
+	if err = s.requireManaged(kindPrincipal); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationDeletePrincipal, ""); err != nil {
 		return err
 	}
@@ -329,6 +398,9 @@ func (s *Service) PutAccount(ctx context.Context, actor Actor, a model.Account) 
 		return err
 	}
 	defer func() { s.recordMutation(ctx, actor, "PutAccount", "account:"+a.ID, err) }()
+	if err = s.requireManaged(kindAccount); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationPutAccount, ""); err != nil {
 		return err
 	}
@@ -374,6 +446,9 @@ func (s *Service) DeleteAccount(ctx context.Context, actor Actor, id string) (er
 		return err
 	}
 	defer func() { s.recordMutation(ctx, actor, "DeleteAccount", "account:"+id, err) }()
+	if err = s.requireManaged(kindAccount); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationDeleteAccount, ""); err != nil {
 		return err
 	}
@@ -389,6 +464,9 @@ func (s *Service) PutMembership(ctx context.Context, actor Actor, m model.Member
 	defer func() {
 		s.recordMutation(ctx, actor, "PutMembership", "membership:"+m.PrincipalID+"@"+m.AccountID, err)
 	}()
+	if err = s.requireManaged(kindMembership); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationPutMembership, m.AccountID); err != nil {
 		return err
 	}
@@ -403,6 +481,9 @@ func (s *Service) DeleteMembership(ctx context.Context, actor Actor, principalID
 	defer func() {
 		s.recordMutation(ctx, actor, "DeleteMembership", "membership:"+principalID+"@"+accountID, err)
 	}()
+	if err = s.requireManaged(kindMembership); err != nil {
+		return err
+	}
 	if err = s.authorize(ctx, actor, authz.MutationDeleteMembership, accountID); err != nil {
 		return err
 	}

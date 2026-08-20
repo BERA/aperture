@@ -1174,6 +1174,17 @@ func mapErr(err error) error {
 // thing. Its sibling APERTURE_PROVIDER_REFERENCE_MISMATCH stays a 500: that one
 // says the HOST'S OWN data does not point where its declaration claims, which no
 // change to the request can fix.
+//
+// APERTURE_ENTITY_UNMANAGED is FailedPrecondition (412), and each of the obvious
+// alternatives says something false. A 500 (the default) would page an on-call
+// for a deployment behaving exactly as configured. A 403 would repeat the
+// conflation the gate exists to avoid — the facade refuses this BEFORE
+// authorization runs precisely so posture and permission stay distinguishable,
+// and undoing that at the transport is no better than never having split them. A
+// 501 would claim the server lacks the capability, when it has it and the
+// operator switched it off. 412 says what happened: the request is well-formed
+// and the caller may be fully privileged, but the deployment is not in a state
+// that accepts it, and retrying unchanged never will be.
 func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 	switch code {
 	case aerr.APERTURE_INVALID_INPUT, aerr.APERTURE_IDENTITY_INVALID,
@@ -1192,6 +1203,8 @@ func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 		aerr.APERTURE_DELEGATION_NOT_DELEGATABLE, aerr.APERTURE_IMPERSONATION_DENIED,
 		aerr.APERTURE_IMPERSONATION_EXPIRED:
 		return twirp.PermissionDenied
+	case aerr.APERTURE_ENTITY_UNMANAGED:
+		return twirp.FailedPrecondition
 	case aerr.APERTURE_UNIMPLEMENTED:
 		return twirp.Unimplemented
 	default:
