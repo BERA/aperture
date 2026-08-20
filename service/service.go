@@ -117,6 +117,12 @@ type Service struct {
 	// default) makes ObjectIdentifiers report APERTURE_UNIMPLEMENTED. Wired with
 	// WithProviders.
 	providers *provider.Registry
+	// managed is the deployment's boot-time entity-management posture: which of
+	// accounts / principals / memberships this Aperture owns the lifecycle of.
+	// Read once at construction and never mutated. Its zero value means every
+	// kind is managed, so a facade built without WithManagedEntities behaves
+	// exactly as before the option existed. Wired with WithManagedEntities.
+	managed ManagedEntities
 }
 
 // Option configures a Service at construction. Options compose; the mutation
@@ -167,6 +173,23 @@ func WithRuleSource(base rules.RuleSource, fetcher rules.MetadataFetcher) Option
 func WithProviders(reg *provider.Registry) Option {
 	return func(s *Service) { s.providers = reg }
 }
+
+// WithManagedEntities declares which entity kinds this deployment manages —
+// which of accounts, principals, and memberships Aperture owns the lifecycle of.
+// It is boot-time posture, not a permission: it is fixed for the process's
+// lifetime, and it is orthogonal to the authority gate WithGate installs.
+//
+// Omitting the option leaves every kind managed, which is Aperture's historical
+// behaviour, so existing callers are unaffected.
+func WithManagedEntities(m ManagedEntities) Option {
+	return func(s *Service) { s.managed = m }
+}
+
+// ManagedEntities reports the deployment posture the facade was constructed
+// with. It is a read of immutable boot-time configuration, which is what lets a
+// surface tell a caller which entity kinds are writable without attempting a
+// write.
+func (s *Service) ManagedEntities() ManagedEntities { return s.managed }
 
 // WithClock overrides the facade clock used to stamp entity timestamps on
 // writes. It exists for deterministic tests; production uses time.Now.
