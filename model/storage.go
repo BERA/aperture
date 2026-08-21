@@ -25,8 +25,17 @@ import "context"
 //
 // All methods are safe for concurrent use by multiple goroutines.
 type Storage interface {
-	// Setup creates or migrates the backend's schema. It is idempotent and must
-	// be called once before any other method.
+	// Setup CREATES the backend's schema when it is absent, and must be called
+	// once before any other method. It is idempotent: against a database that
+	// already carries the current schema it creates nothing and changes nothing.
+	//
+	// It does NOT migrate. Aperture ships no migration tool, no schema
+	// versioning, and no user_version pragma, so a schema change is a hard break
+	// and an old database does not upgrade. A backend that can recognise a
+	// database written by an older build refuses it here with
+	// APERTURE_STORAGE_SCHEMA_INCOMPATIBLE — at startup, rather than misreading
+	// it at the first query — and the remedy is to move the old database aside
+	// and re-seed a fresh one. See docs/src/concepts/storage.md.
 	Setup(ctx context.Context) error
 	// Close releases backend resources. It is safe to call once.
 	Close() error

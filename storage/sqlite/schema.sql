@@ -153,6 +153,13 @@ CREATE TABLE IF NOT EXISTS apt_permissions (
     id             TEXT PRIMARY KEY,
     object_type    TEXT NOT NULL,
     apt_action     TEXT NOT NULL,
+    -- scope_strategy carries NO foreign key, and could not. It is not an id at
+    -- all: it is an opaque scope reference in the scope package's own small
+    -- grammar -- "", "literal", "inclusive;ids=a,b", "inclusive;rule=quarantine"
+    -- (scope.ParseSpec). The strategy key resolves against an in-process
+    -- registry of resolvers, not a table, and hosts register their own. The rule
+    -- name that MAY appear inside one is a parameter buried in the string, not
+    -- the column's value. There is nothing for a key to point at.
     scope_strategy TEXT NOT NULL DEFAULT '',
     delegatable    INTEGER NOT NULL DEFAULT 0,  -- 0/1: may this permission be bestowed (E3-S2)
     description    TEXT NOT NULL DEFAULT '',
@@ -297,6 +304,14 @@ CREATE TABLE IF NOT EXISTS apt_rules (
 -- A record made under impersonation carries both the real actor (actor) and the
 -- borrowed target (effective_subject + impersonation_mode). The details column
 -- is an optional JSON blob for event-specific context.
+--
+-- apt_audit_log carries NO FOREIGN KEYS AT ALL, and that is the point rather
+-- than an omission. actor, effective_subject, account and target name entities
+-- an audit record must OUTLIVE: the trail's whole purpose is to record what was
+-- done to a principal or an account that has since been deleted. A key on any
+-- of them would either refuse the delete (RESTRICT, making the trail a reason
+-- you cannot remove a user) or erase the evidence (CASCADE). Both defeat an
+-- append-only trail, so the columns hold plain identifier strings.
 CREATE TABLE IF NOT EXISTS apt_audit_log (
     id                 TEXT PRIMARY KEY,
     occurred_at        INTEGER NOT NULL,

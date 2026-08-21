@@ -25,13 +25,19 @@ bulk-batched.
 - **Rules** use the `github.com/expr-lang/expr` evaluator **directly** (pure-Go,
   the same engine Pulse wraps) — Aperture has no dependency on Pulse. The rules
   package renders its AST to an expr-lang expression and compiles it in-process.
-- **Storage**: hand-written SQL, `modernc.org/sqlite` (pure-Go) + an
-  in-memory impl behind one `Storage` interface. No ORM / sqlc / migration tool.
+- **Storage**: hand-written SQL, `modernc.org/sqlite` (pure-Go) +
+  `storage/postgres` (pgx, a full peer — not a variant) + an in-memory impl
+  behind one `Storage` interface. No ORM / sqlc / migration tool / schema
+  versioning: `Setup` **creates**, never migrates, and a schema change is a hard
+  break. See `skills/storage-schema.md`.
 - **SQL providers** (`sqlprovider/`, a *host* data source — not Aperture's own
-  storage) depend on a two-method `Querier` and link **no** driver. The seed
-  package does, in exactly one place: a blank import of
-  `github.com/jackc/pgx/v5/stdlib` in `seed/connection.go`, used through
-  `database/sql`, Postgres only. pgx over `lib/pq` on a correctness argument —
+  storage) depend on a two-method `Querier` and link **no** driver. Two packages
+  do, each with a blank import of `github.com/jackc/pgx/v5/stdlib` used through
+  `database/sql`, Postgres only: `seed/connection.go` (host-provider
+  connections) and `storage/postgres/postgres.go` (Aperture's own backend). The
+  two share no connection handling and there is **no import edge between `seed/`
+  and `storage/`** in either direction — do not create one. pgx over `lib/pq` on
+  a correctness argument —
   `lib/pq` returns `[]byte` for `numeric` and `uuid`, which the value model
   cannot tell from `jsonb` — at a measured cost of +3,589,088 bytes for the
   driver alone (+4,246,608, +14.8%, for the epic as landed). Both pure Go, so
@@ -60,8 +66,27 @@ make lint    # vet + staticcheck (degrades to vet-only when not installed)
 - Each code has a `Registry` entry with a `Message` and either at least one
   `Fixup` or `FixupNotApplicable=true`. Gated by `TestCodesHaveFixups`.
 - Construct via `errors.New` / `Newf` / `Wrap` / `Wrapf`; recover the code with
-  `errors.CodeOf`. Any error already carrying an `APERTURE_*` code passes through
-  verbatim — the wrappers never re-stamp it.
+  `errors.CodeOf`.
+- **`Wrap`/`Wrapf` DO re-stamp.** They are not pass-through. `errors/coded_error.go`
+  builds a fresh `CodedError` with whatever code it is handed, and `CodeOf` uses
+  `errors.As`, which reports the **outermost** code — so wrapping an already-coded
+  error in a different code observably replaces the code a caller reads.
+- Pass-through is a **call-site idiom**, and you must write it yourself whenever
+  the error you are wrapping might already be coded:
+
+  ```go
+  if aerr.CodeOf(err) != "" { return err }        // it already says something better
+  return aerr.Wrap(aerr.APERTURE_X, "...", err)   // only classify what nothing else did
+  ```
+
+  Live examples: `internal/cli/buildStore`'s `bootError`, `delegation.authorize`,
+  `provider/registry.go`, `storage/sqlite/sqlite.go`.
+- Forgetting the guard is not cosmetic: it buries a specific, actionable code
+  (`APERTURE_STORAGE_CONSTRAINT`, `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE`,
+  `APERTURE_CONFIG_INVALID`) and its registry fixups under a generic one, and the
+  operator loses the remedy. Two surfaces were doing exactly that; both are fixed,
+  and a same-code re-stamp is invisible to `CodeOf`, so tests assert **chain
+  depth** — exactly one Aperture-coded error in the chain — not just the code.
 
 ### Library-first
 
@@ -109,6 +134,11 @@ non-skippable CI failure. The rule itself is documented in
 | The `Filter.Fields` matching semantics (`provider/match.go` `MatchFields` / `ValuesEqual`) | `docs/src/concepts/providers.md` ("The `Filter.Fields` contract") **and** every restatement of it on the enumerate filter: `skills/api-surface.md`, `skills/decision-api.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/cli/decisions.md` | reviewed; no registry gate — one definition, one implementation: a provider that filters differently authorizes differently |
 | The `references:` schema (`seed.Provider.References`, `Registry.DeclareReference` / `ReferenceTarget` / `ResolveReference*` in `provider/reference.go`, or what a declaration may carry) | the field's doc comment, `skills/object-references.md` ("Declaring a reference"), `docs/src/concepts/seed.md` ("Declaring a reference"), and `docs/src/concepts/providers.md` ("Declared references") — a **new descriptor kind** (e.g. a `type:` key) needs its "three closed doors" rationale rewritten, not appended to | reviewed; no registry gate — behaviour by `provider/reference_test.go`, `seed/reference_test.go` (incl. `TestReferenceWiringIsNotModelState`) |
 | The via-reference enumerate input (`engine.EnumerateRequest.References` / `engine.ReferenceEdge` / `engine.ReferenceSource` / `WithReferences`) | ALL of: `service.EnumerateQuery.References` + `service.ReferenceEdge` + the `references()` converter (keep the `json:"...,omitempty"` + `jsonschema` tags — `mcp.EnumerateIn` aliases the struct and `omitempty` is what keeps the edges OPTIONAL); `EnumerateRequest.references` + `message ReferenceEdge` in `service.proto` **and `make proto`**; `internal/server/twirp.go` (`enumerateQuery` + `referenceEdges`, single **and** batch); `internal/cli/references.go` + the `enumerate` command description; then `skills/object-references.md`, `skills/api-surface.md`, `skills/decision-api.md`, `mcp/skills/mcp-surface.md`, `docs/src/surfaces/rpc-reference.md`, `docs/src/surfaces/mcp.md`, `docs/src/library/decision-api.md`, `docs/src/library/service-facade.md`, `docs/src/cli/decisions.md` — **and `make docs-gen`** (the CLI flags/description are a generated page) | reviewed; no registry gate — behaviour by `engine/enumerate_reference_test.go` (incl. `TestTheFourQuestions`), `service/`, `internal/server/`, `internal/cli/`, `mcp/enumerate_references_test.go`. **The empty-vs-`NOT_FOUND` split is asserted PER SURFACE on purpose:** relaxing it in one place is a silent disclosure channel, so a change there must move all five test files together |
+| The persisted timestamp encoding (`storage/storagetime`: the int64-nanosecond unit, the `0` unset sentinel, the representable window, `Encode`/`Decode`/`Validate`) | the "Time" header section in **both** `storage/sqlite/schema.sql` and `storage/postgres/schema.sql`, `skills/storage-schema.md`, and `docs/src/concepts/storage.md` | `TestStorageTimeIsTheOnlyTimeIntegerConversion` (no `Unix*` conversion under `storage/` outside `storagetime`) + `storage/storagetest` per backend; the prose itself is reviewed |
+| A stamped model entity (a new `CreatedAt`/`UpdatedAt` pair on a `model.Storage` entity) | `stampedEntities()` in `storage/storagetest/storagetest.go` — it is the suite's definition of "every stamped entity", so an entity missing from it has its timestamp cases **silently skipped** — plus the entity list in `skills/storage-schema.md` | reviewed; no registry gate — this is the one that fails by passing |
+| The foreign-key edge set or any edge's `ON DELETE` / `ON UPDATE` action | **both** `storage/sqlite/schema.sql` and `storage/postgres/schema.sql` (including the comment stating the reason), the edge table in `skills/storage-schema.md`, `docs/src/concepts/storage.md`, and — if the edge cannot be expressed in SQL — `storage/sqlite/integrity.go`, `storage/postgres/integrity.go` and `storage/memory` **with the refusal wording verbatim**, since `storagetest` asserts the text | `TestDialectSchemasDeclareTheSameForeignKeys` (changing one dialect only is build-red), `storage/sqlite/foreign_keys_test.go` (actions read back via `PRAGMA foreign_key_list`), `storage/storagetest` per backend |
+| `physicalTypes` / `refusedTypes` (`internal/schemagate/schema_parity_test.go`) | the affected `schema.sql` header's divergence section and "The two dialects" in `skills/storage-schema.md` — editing this table changes what "the dialects agree" **means**, so it is a contract change, not a refactor | `TestEveryDialectHasATypeMapping`, `TestTheTypeMappingRefusesTheNarrowingSpellings` |
+| `codeToTwirp` (`internal/server/twirp.go`) — adding a code, or moving one between Twirp codes | the code→status table in `docs/src/surfaces/rpc-overview.md`, plus its "why not 500" prose when the mapping is not the default | reviewed; no registry gate — the absence of this row is why the table was already stale for `APERTURE_ENTITY_UNMANAGED` |
 
 The Go↔JS rows matter more than they look: **CI is node-free**, so
 `rules-serializer.test.js` never runs in the pipeline.
@@ -150,6 +180,29 @@ audit, mcp), each story adds a `skills/<feature>.md` doc and a coverage gate in
   JS (`rules.js`, `rules-serializer.js`) constructs no JS `Date` and calls no
   locale date formatter, so a stored UTC date is never restated in the viewer's
   zone. Comments are stripped first, so documenting the hazard is still allowed.
+- `TestSchemaUsesNoReservedIdentifiers` (`internal/schemagate`) — the `apt_`
+  database-identifier convention, per dialect. Parses each `schema.sql` with a
+  real SQL tokenizer (never greps) and **fails**, never skips, if a file moved.
+- `TestEveryDialectSchemaIsGoverned` — globs `storage/*/schema.sql` and fails in
+  **both** directions, so a new backend's schema cannot arrive ungoverned and a
+  registered path that vanished is caught.
+- `TestDialectSchemasDeclareTheSameTables` /
+  `TestDialectSchemasDeclareTheSameColumns` /
+  `TestDialectSchemasDeclareTheSameForeignKeys` — the two hand-written schema
+  files describe the same database: same tables, same columns per table, same
+  foreign-key edges including each edge's `ON DELETE` / `ON UPDATE`. Symmetric —
+  there is no reference dialect the other must match.
+- `TestEveryDialectHasATypeMapping` / `TestTheTypeMappingRefusesTheNarrowingSpellings`
+  — the dialects' legitimate type divergences are an **explicit** mapping
+  (`physicalTypes` / `refusedTypes`), not a blanket exemption: an unmapped
+  spelling fails, and Postgres `INTEGER` / `BOOLEAN` / `JSONB` / `TIMESTAMP*` are
+  refused by name with a reason.
+- `TestStorageTimeIsTheOnlyTimeIntegerConversion` — a `go/ast` scan over every
+  non-test file under `storage/`, banning `Unix*` conversions outside
+  `storage/storagetime`.
+- `TestConformanceSuiteHasNoPrecisionKnob` / `TestConformanceSuiteIsBackendBlind`
+  — `storage/storagetest` carries no tolerance/truncation knob and no
+  backend-conditional assertion.
 
 Gated, NOT in `make test` (a loaded runner would flake them):
 
@@ -159,10 +212,18 @@ Gated, NOT in `make test` (a loaded runner would flake them):
 - `node internal/server/static/js/rules-serializer.test.js` — CI is node-free, so
   this is a manual development aid; the Go contract tests above are the real gate.
 - `APERTURE_PG_INTEGRATION=1 APERTURE_PG_DSN=<dsn> go test -run TestPostgresIntegration ./seed/`
-  — the only test that talks to a real Postgres (CI has no service containers).
-  It skips when ungated and **fails** when gated with an empty `APERTURE_PG_DSN`,
-  so asking for it and silently not getting it cannot happen. Never put a DSN in
-  a file; pass it in the environment.
+  — the host-provider (`connections:` / `kind: sql`) run against a real Postgres
+  (CI has no service containers). It skips when ungated and **fails** when gated
+  with an empty `APERTURE_PG_DSN`, so asking for it and silently not getting it
+  cannot happen. Never put a DSN in a file; pass it in the environment.
+- `APERTURE_PG_INTEGRATION=1 APERTURE_PG_DSN=<dsn> go test -run TestPostgresLive ./storage/postgres/`
+  — the **only** proof that Aperture's own Postgres backend behaves: the whole
+  `storage/storagetest` conformance suite against a real server, unqualified and
+  schema-pinned, plus concurrency, hostile schema names, and a residue check.
+  Same gate contract (skip ungated, fail on an empty DSN); an unrecognised value
+  of `APERTURE_PG_INTEGRATION` also fails rather than skipping. `make test`
+  cannot prove this backend behaves — only that it has not fallen behind its
+  twin (the parity gates above).
 
 ## What NOT to do
 
