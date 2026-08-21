@@ -38,6 +38,15 @@ const (
 	// APERTURE_STORAGE — the underlying Storage implementation returned an error
 	// (query, write, or schema setup).
 	APERTURE_STORAGE Code = "APERTURE_STORAGE"
+	// APERTURE_STORAGE_SCHEMA_INCOMPATIBLE — an existing database was written by a
+	// build of Aperture whose schema this build cannot read, and Setup refused it
+	// at startup rather than let a read misinterpret the rows later. Aperture has
+	// no migration tool and no schema versioning by design: a schema break is a
+	// hard break, and the only remedy is a new database. Distinct from
+	// APERTURE_STORAGE because nothing failed — the storage engine answered every
+	// query correctly; it is the SHAPE of what it answered with that is wrong,
+	// and the fix is an operator action, not a retry.
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE Code = "APERTURE_STORAGE_SCHEMA_INCOMPATIBLE"
 	// APERTURE_CONFIG_INVALID — configuration (env vars or YAML) was read but is
 	// malformed or internally inconsistent.
 	APERTURE_CONFIG_INVALID Code = "APERTURE_CONFIG_INVALID"
@@ -316,6 +325,14 @@ var Registry = map[Code]Metadata{
 			"Inspect the wrapped cause for the underlying storage failure.",
 		},
 	},
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE: {
+		Message: "the existing database was written by an incompatible build and cannot be upgraded",
+		Fixups: []string{
+			"Recreate the database: move or delete the old file, start Aperture so Setup builds the schema fresh, then re-seed it.",
+			"Point the store at a new, empty database if you need to keep the old file for reference.",
+			"Do not expect an in-place upgrade: Aperture ships no migration tool and no schema versioning, so a schema break is a hard break by design.",
+		},
+	},
 	APERTURE_CONFIG_INVALID: {
 		Message: "configuration is invalid",
 		Fixups: []string{
@@ -571,6 +588,7 @@ var AllCodes = []Code{
 	APERTURE_IDENTITY_INVALID,
 	APERTURE_NOT_FOUND,
 	APERTURE_STORAGE,
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE,
 	APERTURE_CONFIG_INVALID,
 	APERTURE_ACTION_UNDECLARED,
 	APERTURE_SCOPE_INVALID,

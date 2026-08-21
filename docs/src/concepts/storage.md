@@ -102,6 +102,30 @@ db, _ := sqlite.Open("aperture.db") // durable file
 _ = db.Setup(ctx)                   // once, before any other call
 ```
 
+### A schema break is a hard break
+
+Aperture ships **no migration tool, no schema versioning, and no `user_version`
+pragma**. `Setup` applies an embedded schema of `CREATE ... IF NOT EXISTS`
+statements: on a database that already has Aperture's tables it creates nothing
+and changes nothing.
+
+That idempotence is also why it cannot upgrade. SQLite is *dynamically typed*, so
+a table an older build created keeps its old column types and its old values even
+where the current schema declares something different — the engine raises no
+objection, and the mistake would surface much later, as a scan error or a wrong
+timestamp, far from its cause.
+
+So the SQLite backend's `Setup` **inspects an existing database first and refuses
+one it cannot read**, returning `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE` naming the
+offending column and the remedy. It checks both the declared column types and the
+values actually stored (SQLite lets those disagree), plus retired column names. A
+fresh database and an up-to-date one both proceed normally.
+
+The remedy is always the same: move or delete the old database, let `Setup`
+create a fresh one, and re-seed it. Export first with the
+[seed/portability](seed.md) tooling if you need the contents. The guard is
+SQLite-only — no database predating it can exist for any other backend.
+
 ## Related
 
 - [The decision engine](../library/decision-api.md) — the hot-path reader of
@@ -110,4 +134,5 @@ _ = db.Setup(ctx)                   // once, before any other call
 - [Seed & portability](seed.md) — the declarative loader/exporter over `Storage`.
 - [Audit trail](audit.md) — the append-only trail this interface carries.
 - [Error codes](../reference/error-codes.md) — `APERTURE_STORAGE`,
-  `APERTURE_NOT_FOUND`, `APERTURE_ACTION_UNDECLARED`.
+  `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE`, `APERTURE_NOT_FOUND`,
+  `APERTURE_ACTION_UNDECLARED`.

@@ -76,7 +76,18 @@ func OpenMemory() (*Store, error) {
 }
 
 // Setup creates the schema. It is idempotent (every statement is IF NOT EXISTS).
+//
+// Because it is idempotent it is also non-upgrading: on a database that already
+// carries Aperture's tables it creates nothing, and SQLite's dynamic typing
+// means an older build's text timestamps would sit unremarked in columns this
+// schema declares INTEGER. So Setup first inspects an existing database and
+// REFUSES one it cannot read, with APERTURE_STORAGE_SCHEMA_INCOMPATIBLE. That
+// is a detector, not a migrator — see schema_guard.go for why a schema break is
+// a hard break here, and why the declared column type alone is not proof.
 func (s *Store) Setup(ctx context.Context) error {
+	if err := guardSchemaShape(ctx, s.exec); err != nil {
+		return err
+	}
 	if _, err := s.exec.ExecContext(ctx, schema); err != nil {
 		return aerr.Wrap(aerr.APERTURE_STORAGE, "apply schema", err)
 	}
