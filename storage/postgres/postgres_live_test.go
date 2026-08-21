@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -17,15 +16,11 @@ import (
 
 // The Postgres backend's live tests. They talk to a real server, so they are
 // GATED and must stay gated: CI runs with no service containers, and `make test`
-// has to pass with no database present. The gate is the house one, shared with
-// seed/postgres_integration_test.go so one DSN runs both:
+// has to pass with no database present.
 //
-//	APERTURE_PG_INTEGRATION=1 \
-//	APERTURE_PG_DSN='postgres://aperture@127.0.0.1:5432/aperture?sslmode=disable' \
-//	go test -run TestPostgresLive ./storage/postgres/
-//
-// Ungated it SKIPS. Gated with an empty DSN it FAILS — asking for the live run
-// and silently not getting one is the outcome a gate must never produce.
+// The gate itself — the environment variables, the skip/fail contract, and the
+// proof that both hold — lives in gate_test.go. Every test here reaches it
+// through requirePostgres, and gate_test.go fails the build if one does not.
 //
 // These tests exist because the three central claims of this backend's Setup
 // cannot be established by reading documentation. That two concurrent Setups
@@ -33,22 +28,6 @@ import (
 // transaction isolation interacting correctly; that a role without CREATE gets a
 // coded error is a claim about a SQLSTATE a fake driver would simply be told to
 // produce. Only a server can settle either.
-const (
-	pgGateEnv = "APERTURE_PG_INTEGRATION"
-	pgDSNEnv  = "APERTURE_PG_DSN"
-)
-
-func requirePostgres(t *testing.T) string {
-	t.Helper()
-	if os.Getenv(pgGateEnv) != "1" {
-		t.Skipf("skipping: set %s=1 and %s=<dsn> to run the live Postgres tests", pgGateEnv, pgDSNEnv)
-	}
-	dsn := os.Getenv(pgDSNEnv)
-	if dsn == "" {
-		t.Fatalf("%s=1 but %s is empty: the gate is on and there is no database to run against", pgGateEnv, pgDSNEnv)
-	}
-	return dsn
-}
 
 // withSearchPath returns dsn with the connection's search_path pinned to name.
 // pgx passes any connection-string key it does not recognise to the server as a

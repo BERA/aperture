@@ -30,17 +30,24 @@ clean:
 # every test here passes with no database present. The SQL provider's unit tests
 # use a hand-rolled database/sql driver returning canned rows.
 #
-# The one test that needs a live Postgres is GATED and skips by default. Run it
-# explicitly against a scratch database (it creates and drops its own table):
+# The tests that need a live Postgres are GATED and skip by default. They share
+# ONE gate, so a single exported DSN runs both against a scratch database (each
+# creates and drops the schemas and tables it uses):
 #
-#   APERTURE_PG_INTEGRATION=1 \
-#   APERTURE_PG_DSN='postgres://user:pass@localhost:5432/db?sslmode=disable' \
+#   export APERTURE_PG_INTEGRATION=1
+#   export APERTURE_PG_DSN='postgres://user:pass@localhost:5432/db?sslmode=disable'
 #   $(GO) test -run TestPostgresIntegration ./seed/
+#   $(GO) test -run TestPostgresLive ./storage/postgres/
 #
-# The gate is deliberately fail-loud in one direction: with
-# APERTURE_PG_INTEGRATION=1 and no APERTURE_PG_DSN the test FAILS rather than
-# skips, so asking for the integration run and silently not getting one cannot
-# happen. Never put a DSN in a file — pass it in the environment.
+# The second is the storage backend's conformance run: the WHOLE storagetest
+# contract against a real server, once unqualified and once pinned to a
+# configured schema. CI has no service containers, so it is the only evidence
+# storage/postgres behaves like storage/sqlite.
+#
+# The gate is deliberately fail-loud: with APERTURE_PG_INTEGRATION on and no
+# APERTURE_PG_DSN the tests FAIL rather than skip, so asking for the run and
+# silently not getting one cannot happen. Never put a DSN in a file — pass it in
+# the environment.
 test:
 	$(GO) test ./...
 
