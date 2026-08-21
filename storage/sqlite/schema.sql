@@ -46,10 +46,14 @@
 --     backend -- see storage/sqlite/integrity.go. "No foreign key" does not mean
 --     "no integrity"; it means SQL could not express this one.
 --   * ON DELETE CASCADE appears on exactly THREE edges -- the ones where an
---     entity owns its own join rows and the Go code already cascades by hand in
---     a transaction: apt_principal_roles.principal_id, apt_role_permissions.
---     role_id, apt_group_members.group_id. There the join row has no meaning
---     without its owner, so deleting the owner deletes it.
+--     entity owns its own join rows: apt_principal_roles.principal_id,
+--     apt_role_permissions.role_id, apt_group_members.group_id. There the join
+--     row has no meaning without its owner, so deleting the owner deletes it.
+--     The schema is the ONLY thing that performs this cleanup. The Go delete
+--     methods used to repeat it by hand in the same transaction, and the two
+--     halves covered for each other -- breaking either one alone left the
+--     conformance suite green, so neither was proven. The hand-written half is
+--     gone; do not put it back.
 --   * ON DELETE RESTRICT everywhere else (the other six edges). Deleting a
 --     permission a grant still cites, a role a principal still holds, or a
 --     principal that is still in a group is refused with
@@ -185,9 +189,10 @@ CREATE TABLE IF NOT EXISTS apt_principal_roles (
     role_id      TEXT NOT NULL,
     seq          INTEGER NOT NULL,       -- preserves caller-supplied order
     PRIMARY KEY (principal_id, role_id),
-    -- CASCADE on the OWNER (the principal owns its own role list; DeletePrincipal
-    -- already clears these rows by hand inside its transaction), RESTRICT on the
-    -- role, which is a shared entity a principal merely points at.
+    -- CASCADE on the OWNER (the principal owns its own role list, and this key
+    -- is the only thing that clears it -- DeletePrincipal writes no DELETE of
+    -- its own), RESTRICT on the role, which is a shared entity a principal
+    -- merely points at.
     FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (role_id) REFERENCES apt_roles (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
@@ -205,8 +210,9 @@ CREATE TABLE IF NOT EXISTS apt_role_permissions (
     permission_id TEXT NOT NULL,
     seq           INTEGER NOT NULL,
     PRIMARY KEY (role_id, permission_id),
-    -- CASCADE on the OWNER (DeleteRole already clears these rows by hand),
-    -- RESTRICT on the permission, which many roles may cite.
+    -- CASCADE on the OWNER, and the only thing that clears the bundle --
+    -- DeleteRole writes no DELETE of its own. RESTRICT on the permission,
+    -- which many roles may cite.
     FOREIGN KEY (role_id) REFERENCES apt_roles (id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (permission_id) REFERENCES apt_permissions (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
@@ -224,8 +230,9 @@ CREATE TABLE IF NOT EXISTS apt_group_members (
     principal_id TEXT NOT NULL,
     seq          INTEGER NOT NULL,
     PRIMARY KEY (group_id, principal_id),
-    -- CASCADE on the OWNER (DeleteGroup already clears these rows by hand),
-    -- RESTRICT on the principal, which exists independently of any group.
+    -- CASCADE on the OWNER, and the only thing that clears the member rows --
+    -- DeleteGroup writes no DELETE of its own. RESTRICT on the principal,
+    -- which exists independently of any group.
     FOREIGN KEY (group_id) REFERENCES apt_groups (id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );

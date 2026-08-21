@@ -611,9 +611,10 @@ func (s *Store) DeletePrincipal(ctx context.Context, id string) error {
 		if err := s.checkSubjectUncited(ctx, tx, "delete principal", model.SubjectPrincipal, id); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, s.q(
-			`DELETE FROM apt_schema.apt_principal_roles WHERE principal_id = $1`), id)
-		return err
+		// apt_principal_roles.principal_id is ON DELETE CASCADE, so the role
+		// assignments went with the row above. There is no hand-written cleanup
+		// here on purpose -- see the note on DeleteGroup.
+		return nil
 	})
 }
 
@@ -736,9 +737,9 @@ func (s *Store) DeleteRole(ctx context.Context, id string) error {
 		if err := s.checkSubjectUncited(ctx, tx, "delete role", model.SubjectRole, id); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, s.q(
-			`DELETE FROM apt_schema.apt_role_permissions WHERE role_id = $1`), id)
-		return err
+		// apt_role_permissions.role_id is ON DELETE CASCADE, so the permission
+		// bundle went with the row above. See the note on DeleteGroup.
+		return nil
 	})
 }
 
@@ -842,9 +843,17 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 		if err := s.checkSubjectUncited(ctx, tx, "delete group", model.SubjectGroup, id); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, s.q(
-			`DELETE FROM apt_schema.apt_group_members WHERE group_id = $1`), id)
-		return err
+		// apt_group_members.group_id is ON DELETE CASCADE, so the member rows went
+		// with the row above.
+		//
+		// This used to be a hand-written DELETE alongside the key, and the two
+		// covered for each other: breaking EITHER half alone left the conformance
+		// suite green, so neither was actually proven. The Go half came out once
+		// the schema half was demonstrated to carry the behaviour on its own. If
+		// you add the DELETE back you re-create that blind spot -- the cascade is
+		// the schema's job, and storagetest's
+		// ReferentialCascadeRemovesTheJoinRowsWithTheirOwner is what holds it to it.
+		return nil
 	})
 }
 

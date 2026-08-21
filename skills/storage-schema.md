@@ -139,6 +139,16 @@ constraint beside the `PRIMARY KEY`, identically in both dialects.
 - **CASCADE only on an owner.** The three cascading edges are the ones where an
   entity owns its own join rows: a principal's role list, a role's permission
   list, a group's member list. The join row has no meaning without its owner.
+  **The key is the only implementation of that cleanup in the SQL backends** —
+  `DeletePrincipal`, `DeleteRole` and `DeleteGroup` write no join-table `DELETE`
+  of their own. They used to, and the two halves covered for each other:
+  breaking *either* alone left the conformance suite green, so neither was
+  actually proven. Removing the Go half is what makes
+  `ReferentialCascadeRemovesTheJoinRowsWithTheirOwner` a real gate — relaxing any
+  one of the three edges to RESTRICT now turns its own named subtest red, in both
+  dialects. Re-adding a hand-written `DELETE` restores the blind spot.
+  `storage/memory` is the exception and must keep its hand-written cascades: it
+  has no schema, so there is nothing else to carry them.
 - **RESTRICT everywhere else.** Deleting a permission a grant still cites, a role
   a principal still holds, or a principal still in a group is refused with
   `APERTURE_STORAGE_CONSTRAINT`. **That refusal is the feature**: before these
