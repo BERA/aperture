@@ -99,6 +99,189 @@ func validateStamps(created, updated time.Time) error {
 	return storagetime.Validate(updated)
 }
 
+// ---- Referential integrity ----
+//
+// The SQLite backend gets referential integrity from the schema: nine foreign
+// keys, six ON DELETE RESTRICT and three ON DELETE CASCADE (see the
+// "Referential integrity" header in storage/sqlite/schema.sql). This backend has
+// no schema, so it enforces the SAME nine edges by hand, in both directions:
+//
+//	apt_memberships.principal_id  -> apt_principals(id)      RESTRICT
+//	apt_permissions.object_type   -> apt_object_types(name)  RESTRICT
+//	apt_principal_roles.role_id   -> apt_roles(id)           RESTRICT
+//	apt_role_permissions.permission_id -> apt_permissions(id) RESTRICT
+//	apt_group_members.principal_id -> apt_principals(id)     RESTRICT
+//	apt_grants.permission_id      -> apt_permissions(id)     RESTRICT
+//	apt_principal_roles.principal_id -> apt_principals(id)   CASCADE
+//	apt_role_permissions.role_id  -> apt_roles(id)           CASCADE
+//	apt_group_members.group_id    -> apt_groups(id)          CASCADE
+//
+// A write naming a parent that does not exist is refused; a delete with a live
+// child is refused (RESTRICT) or takes the child with it (CASCADE). The refusal
+// is APERTURE_STORAGE_CONSTRAINT, the same code SQLite's driver error maps to in
+// wrapStorage, under the same "<op>: ..." message shape — storage/storagetest
+// allows no backend-conditional assertions, so a caller must not be able to tell
+// which backend refused it.
+//
+// THE THREE CASCADE EDGES. In SQLite those three join tables are real tables and
+// the cascade deletes rows. Here the same three relationships are stored INSIDE
+// the owning record — a principal's role list is model.Principal.RoleIDs, a
+// role's permission list is model.Role.PermissionIDs, a group's member list is
+// model.Group.MemberPrincipalIDs — so removing the owner from its map removes
+// the join rows in the same statement, atomically, with no window in which a
+// half-deleted owner is visible. That is what makes the cascade real rather than
+// implied: after DeletePrincipal("alice") there is no lingering alice->role
+// assignment anywhere for a later check to find, exactly as in SQLite, and the
+// role she held becomes deletable.
+//
+// ORDERING. Every check below runs BEFORE any map is touched, while s.mu is
+// held. A refused operation therefore mutates nothing, and no check can ever
+// read a partially applied delete — the two hazards the SQL backends get from
+// running inside a transaction.
+//
+// TWO EDGES ARE NOT HERE, deliberately: apt_memberships.account_id and
+// apt_grants.account_id. Both columns legitimately carry model.AccountWildcard
+// ("*"), which ValidateAccount refuses to create as an account row, so neither
+// SQL nor Go may treat them as a plain reference; they are E2-S3's, in every
+// backend at once. The polymorphic (subject_kind, subject_id) check is E2-S3's
+// too.
+
+// constraint renders a referential refusal with the code and shape the SQLite
+// backend produces for the same violation: APERTURE_STORAGE_CONSTRAINT, message
+// prefixed by the same operation name wrapStorage would have used. The detail
+// names the schema edge, so a reader can find the constraint that objected.
+func constraint(op, format string, args ...any) error {
+	return aerr.Newf(aerr.APERTURE_STORAGE_CONSTRAINT, op+": "+format, args...)
+}
+
+// keepLowest folds a candidate id into a running minimum. The child-lookup
+// helpers below scan maps, whose iteration order is random; reporting the
+// lowest-sorted offender makes a refusal message deterministic across runs.
+func keepLowest(best string, found bool, candidate string) (string, bool) {
+	if !found || candidate < best {
+		return candidate, true
+	}
+	return best, true
+}
+
+// -- parent-side lookups (a write may not name a parent that does not exist) --
+
+func (s *Store) hasPrincipalLocked(id string) bool {
+	_, ok := s.principals[id]
+	return ok
+}
+
+func (s *Store) hasRoleLocked(id string) bool {
+	_, ok := s.roles[id]
+	return ok
+}
+
+func (s *Store) hasPermissionLocked(id string) bool {
+	_, ok := s.permissions[id]
+	return ok
+}
+
+// -- child-side lookups (a RESTRICT parent may not be deleted while cited) --
+
+// membershipOfPrincipalLocked reports an account the principal is still a member
+// of (apt_memberships.principal_id).
+func (s *Store) membershipOfPrincipalLocked(principalID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for k := range s.memberships {
+		if k.principalID == principalID {
+			best, found = keepLowest(best, found, k.accountID)
+		}
+	}
+	return best, found
+}
+
+// groupWithMemberLocked reports a group the principal is still a member of
+// (apt_group_members.principal_id).
+func (s *Store) groupWithMemberLocked(principalID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, g := range s.groups {
+		for _, m := range g.MemberPrincipalIDs {
+			if m == principalID {
+				best, found = keepLowest(best, found, id)
+				break
+			}
+		}
+	}
+	return best, found
+}
+
+// principalWithRoleLocked reports a principal that still holds the role
+// (apt_principal_roles.role_id).
+func (s *Store) principalWithRoleLocked(roleID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, p := range s.principals {
+		for _, r := range p.RoleIDs {
+			if r == roleID {
+				best, found = keepLowest(best, found, id)
+				break
+			}
+		}
+	}
+	return best, found
+}
+
+// roleWithPermissionLocked reports a role that still bundles the permission
+// (apt_role_permissions.permission_id).
+func (s *Store) roleWithPermissionLocked(permissionID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, r := range s.roles {
+		for _, p := range r.PermissionIDs {
+			if p == permissionID {
+				best, found = keepLowest(best, found, id)
+				break
+			}
+		}
+	}
+	return best, found
+}
+
+// grantWithPermissionLocked reports a grant that still cites the permission
+// (apt_grants.permission_id).
+func (s *Store) grantWithPermissionLocked(permissionID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, g := range s.grants {
+		if g.PermissionID == permissionID {
+			best, found = keepLowest(best, found, id)
+		}
+	}
+	return best, found
+}
+
+// permissionOfObjectTypeLocked reports a permission still hanging off the object
+// type (apt_permissions.object_type).
+func (s *Store) permissionOfObjectTypeLocked(name string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, p := range s.permissions {
+		if p.ObjectType == name {
+			best, found = keepLowest(best, found, id)
+		}
+	}
+	return best, found
+}
+
 // ---- Account ----
 
 func (s *Store) PutAccount(_ context.Context, a model.Account) error {
@@ -155,6 +338,15 @@ func (s *Store) PutMembership(_ context.Context, m model.Membership) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_memberships.principal_id -> apt_principals(id).
+	//
+	// account_id is NOT checked here: it may carry model.AccountWildcard, which is
+	// not an account row. That edge is E2-S3's.
+	if !s.hasPrincipalLocked(m.PrincipalID) {
+		return constraint("put membership",
+			"apt_memberships.principal_id references apt_principals(id): principal %q does not exist",
+			m.PrincipalID)
+	}
 	s.memberships[membershipKey{m.PrincipalID, m.AccountID}] = m
 	return nil
 }
@@ -255,6 +447,14 @@ func (s *Store) DeleteObjectType(_ context.Context, name string) error {
 	if _, ok := s.objectTypes[name]; !ok {
 		return notFound("object type", name)
 	}
+	// apt_permissions.object_type -> apt_object_types(name), ON DELETE RESTRICT.
+	// The object type is what makes a permission's action verb legal, so a
+	// permission may not outlive it.
+	if permID, ok := s.permissionOfObjectTypeLocked(name); ok {
+		return constraint("delete object type",
+			"apt_permissions.object_type references apt_object_types(name): permission %q still hangs off object type %q",
+			permID, name)
+	}
 	delete(s.objectTypes, name)
 	return nil
 }
@@ -264,6 +464,14 @@ func (s *Store) DeleteObjectType(_ context.Context, name string) error {
 func (s *Store) PutPermission(_ context.Context, p model.Permission) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_permissions.object_type -> apt_object_types(name), write direction.
+	//
+	// This is the one edge whose write side is NOT_FOUND rather than
+	// APERTURE_STORAGE_CONSTRAINT, in BOTH backends: the object type has to be
+	// read anyway to validate the permission's action verb against it, so
+	// sqlite.PutPermission fails on GetObjectType long before the foreign key
+	// could object. Reporting a constraint here would be the divergence, not the
+	// parity.
 	ot, ok := s.objectTypes[p.ObjectType]
 	if !ok {
 		return notFound("object type", p.ObjectType)
@@ -304,6 +512,21 @@ func (s *Store) DeletePermission(_ context.Context, id string) error {
 	if _, ok := s.permissions[id]; !ok {
 		return notFound("permission", id)
 	}
+	// apt_role_permissions.permission_id -> apt_permissions(id), ON DELETE
+	// RESTRICT: many roles may cite one permission, and none of them owns it.
+	if roleID, ok := s.roleWithPermissionLocked(id); ok {
+		return constraint("delete permission",
+			"apt_role_permissions.permission_id references apt_permissions(id): role %q still bundles permission %q",
+			roleID, id)
+	}
+	// apt_grants.permission_id -> apt_permissions(id), ON DELETE RESTRICT: a
+	// grant is authority, and authority citing a deleted permission is authority
+	// nobody can read or revoke.
+	if grantID, ok := s.grantWithPermissionLocked(id); ok {
+		return constraint("delete permission",
+			"apt_grants.permission_id references apt_permissions(id): grant %q still cites permission %q",
+			grantID, id)
+	}
 	delete(s.permissions, id)
 	return nil
 }
@@ -319,6 +542,17 @@ func (s *Store) PutPrincipal(_ context.Context, p model.Principal) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_principal_roles.role_id -> apt_roles(id): every role assignment this
+	// principal carries is a join row, and a join row may not name a role that
+	// does not exist. Checked for the WHOLE list before anything is stored, so a
+	// principal is never written with half its assignments.
+	for _, roleID := range p.RoleIDs {
+		if !s.hasRoleLocked(roleID) {
+			return constraint("put principal",
+				"apt_principal_roles.role_id references apt_roles(id): role %q does not exist",
+				roleID)
+		}
+	}
 	p.RoleIDs = cloneStrings(p.RoleIDs)
 	s.principals[p.ID] = p
 	return nil
@@ -352,6 +586,24 @@ func (s *Store) DeletePrincipal(_ context.Context, id string) error {
 	if _, ok := s.principals[id]; !ok {
 		return notFound("principal", id)
 	}
+	// apt_memberships.principal_id -> apt_principals(id), ON DELETE RESTRICT: a
+	// principal outlives its memberships, so it may not go while an edge stands.
+	if accountID, ok := s.membershipOfPrincipalLocked(id); ok {
+		return constraint("delete principal",
+			"apt_memberships.principal_id references apt_principals(id): principal %q is still a member of account %q",
+			id, accountID)
+	}
+	// apt_group_members.principal_id -> apt_principals(id), ON DELETE RESTRICT: a
+	// principal exists independently of any group, so the group must let go first.
+	if groupID, ok := s.groupWithMemberLocked(id); ok {
+		return constraint("delete principal",
+			"apt_group_members.principal_id references apt_principals(id): principal %q is still a member of group %q",
+			id, groupID)
+	}
+	// apt_principal_roles.principal_id -> apt_principals(id), ON DELETE CASCADE:
+	// the principal OWNS its role assignments, so they go with it. Here they live
+	// in the record itself (p.RoleIDs), so this one delete removes both, leaving
+	// nothing for a later check to trip over — the role she held is now deletable.
 	delete(s.principals, id)
 	return nil
 }
@@ -367,6 +619,15 @@ func (s *Store) PutRole(_ context.Context, r model.Role) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_role_permissions.permission_id -> apt_permissions(id): a role's bundle
+	// is join rows, and none of them may name a permission that does not exist.
+	for _, permID := range r.PermissionIDs {
+		if !s.hasPermissionLocked(permID) {
+			return constraint("put role",
+				"apt_role_permissions.permission_id references apt_permissions(id): permission %q does not exist",
+				permID)
+		}
+	}
 	r.PermissionIDs = cloneStrings(r.PermissionIDs)
 	s.roles[r.ID] = r
 	return nil
@@ -400,6 +661,18 @@ func (s *Store) DeleteRole(_ context.Context, id string) error {
 	if _, ok := s.roles[id]; !ok {
 		return notFound("role", id)
 	}
+	// apt_principal_roles.role_id -> apt_roles(id), ON DELETE RESTRICT: a role is
+	// a shared entity a principal merely points at, so an assigned role stays.
+	if principalID, ok := s.principalWithRoleLocked(id); ok {
+		return constraint("delete role",
+			"apt_principal_roles.role_id references apt_roles(id): principal %q still holds role %q",
+			principalID, id)
+	}
+	// apt_role_permissions.role_id -> apt_roles(id), ON DELETE CASCADE: the role
+	// OWNS its permission bundle (r.PermissionIDs here), so it goes with the role
+	// in the same delete. The permissions themselves are untouched — only the
+	// bundle rows were the role's — and each becomes deletable once nothing else
+	// cites it.
 	delete(s.roles, id)
 	return nil
 }
@@ -415,6 +688,16 @@ func (s *Store) PutGroup(_ context.Context, g model.Group) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_group_members.principal_id -> apt_principals(id): every member row must
+	// name a principal that exists. The whole list is checked before the group is
+	// stored, so a group is never written with a phantom member in it.
+	for _, principalID := range g.MemberPrincipalIDs {
+		if !s.hasPrincipalLocked(principalID) {
+			return constraint("put group",
+				"apt_group_members.principal_id references apt_principals(id): principal %q does not exist",
+				principalID)
+		}
+	}
 	g.MemberPrincipalIDs = cloneStrings(g.MemberPrincipalIDs)
 	s.groups[g.ID] = g
 	return nil
@@ -448,6 +731,11 @@ func (s *Store) DeleteGroup(_ context.Context, id string) error {
 	if _, ok := s.groups[id]; !ok {
 		return notFound("group", id)
 	}
+	// apt_group_members.group_id -> apt_groups(id), ON DELETE CASCADE: a member
+	// row has no meaning without its group, so the group takes its membership
+	// list (g.MemberPrincipalIDs) with it. Nothing points AT a group, so this
+	// delete has no RESTRICT edge to check — and the principals that were members
+	// survive, each becoming deletable once no other group or membership holds it.
 	delete(s.groups, id)
 	return nil
 }
@@ -463,6 +751,17 @@ func (s *Store) PutGrant(_ context.Context, g model.Grant) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_grants.permission_id -> apt_permissions(id).
+	//
+	// The grant's other two references are deliberately unchecked here: account_id
+	// may carry model.AccountWildcard, and (subject_kind, subject_id) is
+	// polymorphic — a principal or a group depending on the kind. Both are E2-S3's,
+	// in every backend at once.
+	if !s.hasPermissionLocked(g.PermissionID) {
+		return constraint("put grant",
+			"apt_grants.permission_id references apt_permissions(id): permission %q does not exist",
+			g.PermissionID)
+	}
 	s.grants[g.ID] = g
 	return nil
 }

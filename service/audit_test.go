@@ -29,6 +29,13 @@ func newAuditedMutator(t *testing.T, sampler audit.Sampler) (*Service, *memory.S
 	// over ** (covers every tier anchor) in account acme.
 	mustPut(t, store.PutObjectType(ctx, model.ObjectType{Name: "system", Actions: []string{authz.AdminAction}}))
 	mustPut(t, store.PutPermission(ctx, model.Permission{ID: "p-admin", ObjectType: "system", Action: authz.AdminAction}))
+	// The permissions the template and bulk-grant fixtures cite. They have to
+	// exist before a grant may name them: apt_grants.permission_id is an enforced
+	// reference in every backend, so a fixture that skipped them would be writing
+	// a grant that authorizes nothing anyone could read or revoke.
+	mustPut(t, store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read", "write"}}))
+	mustPut(t, store.PutPermission(ctx, model.Permission{ID: "p-read", ObjectType: "document", Action: "read"}))
+	mustPut(t, store.PutPermission(ctx, model.Permission{ID: "p-write", ObjectType: "document", Action: "write"}))
 	mustPut(t, store.PutPrincipal(ctx, model.Principal{ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice"}))
 	// mallory is a real principal with no admin authority — her gated mutations
 	// fail closed as AUTHZ_DENIED (not NOT_FOUND), which the audit must record.

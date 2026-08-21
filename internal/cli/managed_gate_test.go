@@ -34,6 +34,12 @@ accounts:
 principals:
   - {id: root, kind: user, identity: "user:root", display_name: Root}
   - {id: alice, kind: user, identity: "user:alice", display_name: Alice}
+  # dana belongs to no account on purpose: she is the principal the lifecycle
+  # test deletes. root and alice are both members of acme, and
+  # apt_memberships.principal_id is an enforced reference in every backend, so
+  # deleting either would be refused for a reason that has nothing to do with the
+  # posture switch this file is about.
+  - {id: dana, kind: user, identity: "user:dana", display_name: Dana}
 memberships:
   - {principal: root, account: acme}
   - {principal: alice, account: acme}
@@ -111,7 +117,12 @@ func gatedCLICalls(t *testing.T, who string) map[string][]cliCall {
 		"principal": {
 			{"put principal", call("put", "--json",
 				gateJSON(t, model.Principal{ID: "carol", Kind: model.PrincipalUser, Identity: "user:carol"}), "principal")},
-			{"delete principal", call("delete", "principal", "alice")},
+			// dana, not alice: every CLI invocation here builds a fresh store from
+			// the seed, so the target must be a seeded principal — and alice is a
+			// member of acme, which apt_memberships.principal_id refuses to orphan.
+			// dana is seeded into no account precisely so this delete tests the
+			// posture switch and nothing else.
+			{"delete principal", call("delete", "principal", "dana")},
 		},
 		"membership": {
 			{"put membership", call("put", "--json",
