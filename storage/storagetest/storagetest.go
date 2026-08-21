@@ -88,6 +88,75 @@ func seedDocumentType(t *testing.T, s model.Storage) {
 	}
 }
 
+// ---- referential fixtures ----
+//
+// Aperture's storage is RELATIONAL, and the relationships are real: a membership
+// names a principal, a role assignment names a role, a grant names a permission,
+// a group member names a principal. A backend that enforces those relationships
+// refuses a child row whose parent was never written — correctly, because a
+// grant citing a permission that does not exist is authority nobody can read or
+// revoke.
+//
+// The cases below used to write children into an empty store, which only ever
+// worked because nothing was checking. The helpers here write the parents first.
+// They ASSERT NOTHING: they are setup, every case keeps exactly the assertions it
+// had, and none of this is conditional on which backend is running — a backend
+// that does not enforce the relationships is simply unaffected by the parents
+// being there. Enforcement itself is asserted by its own cases, not here.
+//
+// All of them are upserts, so calling one twice in a store is harmless.
+
+// seedPrincipals writes the principals a membership, group member or grant
+// subject in the case below refers to.
+func seedPrincipals(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		p := model.Principal{ID: id, Kind: model.PrincipalUser, Identity: "user:" + id}
+		if err := s.PutPrincipal(ctx(), p); err != nil {
+			t.Fatalf("seed principal %s: %v", id, err)
+		}
+	}
+}
+
+// seedRoles writes the roles a principal's role assignments refer to.
+func seedRoles(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if err := s.PutRole(ctx(), model.Role{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed role %s: %v", id, err)
+		}
+	}
+}
+
+// seedPermissions writes the permissions a grant or a role's permission bundle
+// refers to, along with the object type they hang off — a permission's action
+// verb is only legal because its object type declares it, so the two are seeded
+// together or neither is.
+func seedPermissions(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	seedDocumentType(t, s)
+	for _, id := range ids {
+		p := model.Permission{ID: id, ObjectType: "document", Action: "read"}
+		if err := s.PutPermission(ctx(), p); err != nil {
+			t.Fatalf("seed permission %s: %v", id, err)
+		}
+	}
+}
+
+// seedStampedEntityReferents writes the parents stampedEntities() refers to. The
+// stamped-entity table runs every entity against ONE store in a fixed order, and
+// the Membership entry names principal "alice" while the Grant entry names
+// permission "p-read" — neither of which the table itself ever creates (the
+// Principal entry writes "alice" but runs after Membership, and no entry writes
+// "p-read" at all). Seeding them up front is what lets the table stay a flat
+// list of independent entries rather than an ordered one.
+func seedStampedEntityReferents(t *testing.T, s model.Storage) {
+	t.Helper()
+	seedDocumentType(t, s)
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
+}
+
 func testAccountCRUD(t *testing.T, s model.Storage) {
 	a := model.Account{ID: "acme", Name: "Acme Corp", Description: "the demo tenant"}
 	if err := s.PutAccount(ctx(), a); err != nil {
@@ -138,6 +207,7 @@ func testMembershipCRUDAndQueries(t *testing.T, s model.Storage) {
 			t.Fatalf("put membership %s@%s: %v", principalID, accountID, err)
 		}
 	}
+	seedPrincipals(t, s, "alice", "bob")
 	// alice spans two accounts; bob is only in acme.
 	put("alice", "acme")
 	put("alice", "other")
@@ -330,6 +400,7 @@ func testPermissionUnknownObjectType(t *testing.T, s model.Storage) {
 }
 
 func testPrincipalCRUD(t *testing.T, s model.Storage) {
+	seedRoles(t, s, "r-admin", "r-editor")
 	p := model.Principal{
 		ID:          "alice",
 		Kind:        model.PrincipalUser,
@@ -363,6 +434,7 @@ func testPrincipalCRUD(t *testing.T, s model.Storage) {
 }
 
 func testRoleCRUD(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p1", "p2")
 	r := model.Role{ID: "r-admin", Name: "Administrator", Description: "all", PermissionIDs: []string{"p1", "p2"}}
 	if err := s.PutRole(ctx(), r); err != nil {
 		t.Fatalf("put: %v", err)
@@ -390,6 +462,7 @@ func testRoleCRUD(t *testing.T, s model.Storage) {
 }
 
 func testGroupCRUD(t *testing.T, s model.Storage) {
+	seedPrincipals(t, s, "alice", "bob")
 	g := model.Group{ID: "eng", Name: "Engineering", MemberPrincipalIDs: []string{"alice", "bob"}}
 	if err := s.PutGroup(ctx(), g); err != nil {
 		t.Fatalf("put: %v", err)
@@ -408,6 +481,7 @@ func testGroupCRUD(t *testing.T, s model.Storage) {
 }
 
 func testGrantCRUDAndUpsert(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p-read")
 	g := model.Grant{
 		ID:           "g1",
 		AccountID:    "acme",
@@ -470,6 +544,7 @@ func testListGrantsAccountScoped(t *testing.T, s model.Storage) {
 			t.Fatalf("seed grant %s: %v", id, err)
 		}
 	}
+	seedPermissions(t, s, "p-read")
 	seed("g-acme-1", "acme")
 	seed("g-acme-2", "acme")
 	seed("g-other-1", "other")
@@ -514,6 +589,7 @@ func seedGrant(t *testing.T, s model.Storage, id, account string) {
 // model.AllAccounts ("") returns grants across every account — including the
 // wildcard "*" rows inline — while a concrete account id stays account-scoped.
 func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p-read")
 	seedGrant(t, s, "g-acme-1", "acme")
 	seedGrant(t, s, "g-acme-2", "acme")
 	seedGrant(t, s, "g-other-1", "other")
@@ -567,6 +643,7 @@ func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
 // ordered set without gaps or overlap, and an offset past the end is empty.
 func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 	const n = 7
+	seedPermissions(t, s, "p-read")
 	for i := 0; i < n; i++ {
 		// Zero-padded ids so lexical id order is stable and predictable.
 		seedGrant(t, s, "g-"+itoa2(i), "acme")
@@ -613,6 +690,7 @@ func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 // non-positive limit falls back to the default page size.
 func testListGrantsPageMaxPageSize(t *testing.T, s model.Storage) {
 	total := model.MaxGrantPageSize + 5
+	seedPermissions(t, s, "p-read")
 	for i := 0; i < total; i++ {
 		seedGrant(t, s, "g-"+itoa2(i), "acme")
 	}
@@ -666,6 +744,7 @@ func testGrantsForSubjects(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	seedPermissions(t, s, "p-read")
 	put("g-alice", "acme", model.Subject{Kind: model.SubjectPrincipal, ID: "alice"})
 	put("g-eng", "acme", model.Subject{Kind: model.SubjectGroup, ID: "eng"})
 	put("g-admin", "acme", model.Subject{Kind: model.SubjectRole, ID: "admin"})
@@ -723,6 +802,7 @@ func testGrantsForSubjectsWildcardAccount(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	seedPermissions(t, s, "p-read")
 	put("g-acme", "acme", "account:acme/**")   // account-specific
 	put("g-star", model.AccountWildcard, "**") // spans every account
 
@@ -761,6 +841,7 @@ func testGroupsForPrincipal(t *testing.T, s model.Storage) {
 			t.Fatalf("put group %s: %v", id, err)
 		}
 	}
+	seedPrincipals(t, s, "alice", "bob", "carol")
 	put("eng", "alice", "bob")
 	put("ops", "bob")
 	put("sales", "carol")
@@ -1037,7 +1118,7 @@ func sameInstant(t *testing.T, field string, got, want time.Time) {
 // failure this catches is a NOT NULL column defaulting to 0 and decoding as the
 // Unix epoch, which would turn "never stamped" into "stamped in 1970".
 func testTimestampUnsetRoundTrip(t *testing.T, s model.Storage) {
-	seedDocumentType(t, s)
+	seedStampedEntityReferents(t, s)
 	for _, e := range stampedEntities() {
 		t.Run(e.name, func(t *testing.T) {
 			// Both unset.
@@ -1082,7 +1163,7 @@ func testTimestampUnsetRoundTrip(t *testing.T, s model.Storage) {
 // entity, on every backend. Without it a contributor could swap in a
 // microsecond-resolution column and the suite would stay green.
 func testTimestampSubMicrosecondPrecision(t *testing.T, s model.Storage) {
-	seedDocumentType(t, s)
+	seedStampedEntityReferents(t, s)
 	for _, e := range stampedEntities() {
 		t.Run(e.name, func(t *testing.T) {
 			if err := e.put(s, subMicroCreated, subMicroUpdated); err != nil {
@@ -1102,7 +1183,7 @@ func testTimestampSubMicrosecondPrecision(t *testing.T, s model.Storage) {
 // are storable, not merely "close enough". The endpoints are the two instants a
 // clamping or overflowing encoder is most likely to mangle.
 func testTimestampRangeBoundaries(t *testing.T, s model.Storage) {
-	seedDocumentType(t, s)
+	seedStampedEntityReferents(t, s)
 	for _, e := range stampedEntities() {
 		t.Run(e.name, func(t *testing.T) {
 			if err := e.put(s, storableMin, storableMax); err != nil {
@@ -1125,6 +1206,12 @@ func testTimestampRangeBoundaries(t *testing.T, s model.Storage) {
 // that keeps a time.Time in memory must refuse the same instants a backend that
 // encodes to an integer refuses, or the two have silently diverged.
 func testTimestampOutOfRangeRefused(t *testing.T, s model.Storage) {
+	// Only the object type, NOT the full referent set: this case asserts that a
+	// refused write leaves NOTHING behind, so seeding an entity it names — the
+	// principal "alice", say — would make that assertion vacuous. Nothing here is
+	// ever written successfully, so no parent row is needed; the object type is
+	// present only so PutPermission reaches validation instead of stopping at
+	// NOT_FOUND on the type.
 	seedDocumentType(t, s)
 	beforeMin := storableMin.Add(-time.Nanosecond)
 	afterMax := storableMax.Add(time.Nanosecond)
@@ -1651,6 +1738,7 @@ func normalizeJSON(t *testing.T, raw []byte) []byte {
 // ---- Transactional apply ----
 
 func testAtomicCommit(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p-read")
 	mkGrant := func(id string) model.Grant {
 		return model.Grant{
 			ID: id, AccountID: "acme",
@@ -1693,6 +1781,7 @@ func testAtomicCommit(t *testing.T, s model.Storage) {
 // BOTH backends. It covers two failure modes: a write error mid-batch, and an
 // explicit error returned by fn after a successful write.
 func testAtomicRollback(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p-read")
 	keep := model.Grant{
 		ID: "g-keep", AccountID: "acme",
 		Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},

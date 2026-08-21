@@ -16,6 +16,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,10 @@ import (
 	"github.com/frankbardon/aperture/model"
 	"github.com/frankbardon/aperture/storage/storagetime"
 
-	_ "modernc.org/sqlite"
+	// Aliased: this package is itself named sqlite, and an unqualified
+	// `sqlite.Error` in a file called sqlite.go reads as self-reference.
+	sqlitedrv "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed schema.sql
@@ -58,8 +62,19 @@ var _ model.Storage = (*Store)(nil)
 // "file:aperture.db?_pragma=busy_timeout(5000)". The connection pool is capped
 // at one connection so writes serialize cleanly under SQLite's single-writer
 // model.
+//
+// FOREIGN KEY ENFORCEMENT IS NOT NEGOTIABLE HERE. SQLite honours the foreign
+// keys in schema.sql only while PRAGMA foreign_keys is ON, and that pragma
+// defaults OFF and is scoped PER CONNECTION — so a caller-supplied DSN is, on
+// its own, an invitation to run Aperture against a database that silently
+// enforces nothing. Open therefore REWRITES the DSN: it drops any
+// _pragma=foreign_keys(...) the caller wrote, whatever value it asked for, and
+// appends its own. A DSN that explicitly disables the pragma does not produce an
+// unenforced Store; it produces an enforced one. Setup then verifies the
+// connection is actually enforcing and refuses it if not, so the guarantee does
+// not rest on DSN rewriting alone.
 func Open(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", forceForeignKeys(dsn))
 	if err != nil {
 		return nil, aerr.Wrap(aerr.APERTURE_STORAGE, "open sqlite database", err)
 	}
@@ -67,6 +82,69 @@ func Open(dsn string) (*Store, error) {
 	// locked" contention and keeps an in-memory DB on a single underlying handle.
 	db.SetMaxOpenConns(1)
 	return &Store{pool: db, exec: db}, nil
+}
+
+// foreignKeysParam is the driver query parameter that turns foreign-key
+// enforcement on for every connection modernc.org/sqlite opens. The driver runs
+// each _pragma value as a PRAGMA statement at connection setup, which is exactly
+// the granularity the pragma needs: it is per-connection state, and the pool may
+// open a fresh connection at any time.
+const foreignKeysParam = "_pragma=foreign_keys(1)"
+
+// forceForeignKeys returns dsn with foreign-key enforcement guaranteed on: every
+// _pragma the caller supplied for foreign_keys is REMOVED and foreignKeysParam is
+// appended. Removing rather than merely appending is deliberate — it makes the
+// result independent of how the driver orders repeated parameters, so the
+// guarantee is a property of the string rather than of a driver behaviour that
+// could change under us.
+//
+// Everything else in the DSN is preserved verbatim, in order: the parameters are
+// split and rejoined textually rather than round-tripped through url.Values,
+// which would re-order and re-encode a caller's busy_timeout, journal_mode, vfs
+// or _txlock settings on the way through.
+func forceForeignKeys(dsn string) string {
+	base, query, hadQuery := strings.Cut(dsn, "?")
+	// The driver only reads a query string when '?' is at index >= 1, so an empty
+	// base would make the parameter invisible. "file:" with an empty path is
+	// SQLite's own spelling of the same (temporary) database and keeps it visible.
+	if base == "" {
+		base = "file:"
+	}
+	params := make([]string, 0, 4)
+	if hadQuery {
+		for _, p := range strings.Split(query, "&") {
+			if isForeignKeysPragma(p) {
+				continue
+			}
+			params = append(params, p)
+		}
+	}
+	params = append(params, foreignKeysParam)
+	return base + "?" + strings.Join(params, "&")
+}
+
+// isForeignKeysPragma reports whether one DSN query parameter is a _pragma
+// setting foreign_keys, in any of the spellings SQLite accepts:
+// foreign_keys(0), foreign_keys=off, "foreign_keys = FALSE". It matches the
+// pragma NAME, never the value, because every value — on or off — is overridden.
+func isForeignKeysPragma(param string) bool {
+	// The driver reads the parameter under the exact key "_pragma".
+	const key = "_pragma="
+	if !strings.HasPrefix(param, key) {
+		return false
+	}
+	v, err := url.QueryUnescape(param[len(key):])
+	if err != nil {
+		v = param[len(key):]
+	}
+	v = strings.ToLower(strings.TrimSpace(v))
+	const name = "foreign_keys"
+	if !strings.HasPrefix(v, name) {
+		return false
+	}
+	// Only a whole-word match: foreign_key_check is a different pragma.
+	rest := strings.TrimSpace(v[len(name):])
+	return rest == "" || strings.HasPrefix(rest, "(") || strings.HasPrefix(rest, "=")
 }
 
 // OpenMemory opens a private in-memory SQLite database. Useful for tests and
@@ -84,12 +162,43 @@ func OpenMemory() (*Store, error) {
 // REFUSES one it cannot read, with APERTURE_STORAGE_SCHEMA_INCOMPATIBLE. That
 // is a detector, not a migrator — see schema_guard.go for why a schema break is
 // a hard break here, and why the declared column type alone is not proof.
+//
+// Setup also VERIFIES foreign-key enforcement before it creates anything. Open
+// forces the pragma into the DSN, but a Store can reach Setup on a connection
+// Open never rewrote — a hand-built *sql.DB in a future constructor, a driver
+// that changes how it applies query parameters — and an unenforced connection
+// looks exactly like an enforced one until the first orphan appears. Checking is
+// one PRAGMA read, and the alternative is a database whose foreign keys are
+// decoration.
 func (s *Store) Setup(ctx context.Context) error {
+	if err := verifyForeignKeysEnforced(ctx, s.exec); err != nil {
+		return err
+	}
 	if err := guardSchemaShape(ctx, s.exec); err != nil {
 		return err
 	}
 	if _, err := s.exec.ExecContext(ctx, schema); err != nil {
 		return aerr.Wrap(aerr.APERTURE_STORAGE, "apply schema", err)
+	}
+	return nil
+}
+
+// verifyForeignKeysEnforced refuses a connection that is not enforcing foreign
+// keys. The refusal is APERTURE_STORAGE_CONSTRAINT: the failure is that
+// Aperture's constraints cannot be enforced at all, which is the same subject as
+// a single violated one, and the fix is the same operator's.
+func verifyForeignKeysEnforced(ctx context.Context, exec sqlExec) error {
+	var on int
+	if err := exec.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&on); err != nil {
+		return aerr.Wrap(aerr.APERTURE_STORAGE, "read the foreign_keys pragma", err)
+	}
+	if on == 0 {
+		return aerr.New(aerr.APERTURE_STORAGE_CONSTRAINT,
+			"this SQLite connection is not enforcing foreign keys (PRAGMA foreign_keys is OFF), "+
+				"so the schema's referential integrity would be decoration: a delete could orphan "+
+				"memberships, role assignments and grants without any error — "+
+				"open the store with sqlite.Open, which forces _pragma=foreign_keys(1) into the DSN, "+
+				"rather than handing the Store a connection built elsewhere")
 	}
 	return nil
 }
@@ -145,8 +254,34 @@ func encodeBool(b bool) int64 {
 	return 0
 }
 
+// wrapStorage is the single place a raw driver error becomes an Aperture-coded
+// one, so the constraint mapping below covers every statement this package runs
+// without each call site remembering it.
 func wrapStorage(op string, err error) error {
+	if isConstraintViolation(err) {
+		return aerr.Wrap(aerr.APERTURE_STORAGE_CONSTRAINT, op, err)
+	}
 	return aerr.Wrap(aerr.APERTURE_STORAGE, op, err)
+}
+
+// isConstraintViolation reports whether a driver error is SQLite refusing a
+// write because it would break a declared constraint — a foreign key above all,
+// but a primary-key, uniqueness, NOT NULL or CHECK violation just as much. All
+// of them mean the same thing to a caller: the database rejected the write on
+// its own terms, nothing is broken, and no retry will help.
+//
+// The test is on the PRIMARY result code (the low byte), not on the message.
+// SQLite's extended codes distinguish which constraint objected —
+// SQLITE_CONSTRAINT_FOREIGNKEY for a direct violation, SQLITE_CONSTRAINT_TRIGGER
+// when the same violation arrives via a REPLACE's implicit delete — and matching
+// the family catches both without enumerating them. The extended code is
+// preserved in the wrapped cause for anyone who needs the distinction.
+func isConstraintViolation(err error) bool {
+	var serr *sqlitedrv.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+	return serr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 }
 
 func notFound(kind, id string) error {
@@ -167,9 +302,19 @@ func (s *Store) PutAccount(ctx context.Context, a model.Account) error {
 	if err != nil {
 		return err
 	}
+	// ON CONFLICT DO UPDATE, not INSERT OR REPLACE: an account is a PARENT row
+	// (memberships and grants point at it), and REPLACE would delete the existing
+	// row before re-inserting it, which fires the children's ON DELETE actions.
+	// Re-saving an account with members would be refused by their RESTRICT edge.
+	// See the "Referential integrity" note in schema.sql.
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_accounts (id, name, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
+		INSERT INTO apt_accounts (id, name, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			name = excluded.name,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
 		a.ID, a.Name, a.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put account", err)
@@ -345,9 +490,17 @@ func (s *Store) PutObjectType(ctx context.Context, ot model.ObjectType) error {
 	if err != nil {
 		return err
 	}
+	// Upsert in place rather than REPLACE: apt_permissions.object_type points here
+	// under RESTRICT, so deleting-and-reinserting the row would refuse any object
+	// type that already has permissions. See PutAccount for the full reasoning.
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
+		INSERT INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (name) DO UPDATE SET
+			apt_actions = excluded.apt_actions,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
 		ot.Name, string(actions), ot.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put object type", err)
@@ -424,9 +577,19 @@ func (s *Store) PutPermission(ctx context.Context, p model.Permission) error {
 	if err != nil {
 		return err
 	}
+	// Upsert in place rather than REPLACE: role assignments and grants point at a
+	// permission under RESTRICT. See PutAccount for the full reasoning.
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			object_type = excluded.object_type,
+			apt_action = excluded.apt_action,
+			scope_strategy = excluded.scope_strategy,
+			delegatable = excluded.delegatable,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
 		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put permission", err)
@@ -494,9 +657,20 @@ func (s *Store) PutPrincipal(ctx context.Context, p model.Principal) error {
 		return err
 	}
 	return s.inTx(ctx, "put principal", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE. REPLACE would delete the principal
+		// row first, which CASCADEs its role assignments away (harmless — they are
+		// rewritten two statements below) but also trips the RESTRICT edges from
+		// apt_memberships and apt_group_members, so re-saving a principal who is
+		// in an account or a group would be refused. See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
+			INSERT INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				kind = excluded.kind,
+				apt_identity = excluded.apt_identity,
+				display_name = excluded.display_name,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
 			p.ID, string(p.Kind), p.Identity, p.DisplayName, created, updated); err != nil {
 			return err
 		}
@@ -603,9 +777,17 @@ func (s *Store) PutRole(ctx context.Context, r model.Role) error {
 		return err
 	}
 	return s.inTx(ctx, "put role", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE: apt_principal_roles.role_id points
+		// here under RESTRICT, so re-saving an assigned role would be refused.
+		// See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_roles (id, name, description, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)`,
+			INSERT INTO apt_roles (id, name, description, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				name = excluded.name,
+				description = excluded.description,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
 			r.ID, r.Name, r.Description, created, updated); err != nil {
 			return err
 		}
@@ -710,9 +892,18 @@ func (s *Store) PutGroup(ctx context.Context, g model.Group) error {
 		return err
 	}
 	return s.inTx(ctx, "put group", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE: a group owns its member rows under
+		// CASCADE, and REPLACE would delete them out from under the rewrite below
+		// on a path that only LOOKS harmless. Consistency with the other four
+		// entity upserts is worth more than the coincidence. See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_groups (id, name, description, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)`,
+			INSERT INTO apt_groups (id, name, description, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				name = excluded.name,
+				description = excluded.description,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
 			g.ID, g.Name, g.Description, created, updated); err != nil {
 			return err
 		}

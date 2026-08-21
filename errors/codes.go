@@ -47,6 +47,24 @@ const (
 	// query correctly; it is the SHAPE of what it answered with that is wrong,
 	// and the fix is an operator action, not a retry.
 	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE Code = "APERTURE_STORAGE_SCHEMA_INCOMPATIBLE"
+	// APERTURE_STORAGE_CONSTRAINT — the database refused a write because it would
+	// break a declared constraint, or the connection is not in a position to
+	// enforce those constraints at all.
+	//
+	// In practice that is a foreign key: deleting an account that still has
+	// members, a permission a grant still cites, or a principal that is still in a
+	// group. Before Aperture's schema carried real foreign keys those deletes
+	// SUCCEEDED and left the child rows behind, pointing at nothing — a grant
+	// naming a permission that no longer exists is not a tidy leftover, it is
+	// authority nobody can read or revoke. The refusal is the feature, and it is
+	// deliberately distinct from APERTURE_STORAGE: nothing failed, no retry helps,
+	// and the caller's next move is to delete the children first (or not to
+	// delete the parent).
+	//
+	// The same code covers a SQLite connection whose foreign_keys pragma is off,
+	// which Setup refuses up front: constraints that cannot be enforced are the
+	// same problem as a constraint that was, one step earlier.
+	APERTURE_STORAGE_CONSTRAINT Code = "APERTURE_STORAGE_CONSTRAINT"
 	// APERTURE_CONFIG_INVALID — configuration (env vars or YAML) was read but is
 	// malformed or internally inconsistent.
 	APERTURE_CONFIG_INVALID Code = "APERTURE_CONFIG_INVALID"
@@ -333,6 +351,15 @@ var Registry = map[Code]Metadata{
 			"Do not expect an in-place upgrade: Aperture ships no migration tool and no schema versioning, so a schema break is a hard break by design.",
 		},
 	},
+	APERTURE_STORAGE_CONSTRAINT: {
+		Message: "the database refused the write because it would break referential integrity",
+		Fixups: []string{
+			"Delete the rows that reference the record first: a principal's memberships and group memberships, a permission's role assignments and grants, a role's principal assignments, an object type's permissions.",
+			"Creating a record? Create what it references first — a permission needs its object type, a membership and a group member need their principal, a grant and a role assignment need their permission.",
+			"Ids are immutable in Aperture: to change one, create the new record, move the children, then delete the old one — an UPDATE that moved a key is refused rather than silently re-parenting.",
+			"Seeing this from Setup rather than a write? The connection is not enforcing foreign keys. Open the store with sqlite.Open, which forces _pragma=foreign_keys(1) into the DSN whatever the caller passed.",
+		},
+	},
 	APERTURE_CONFIG_INVALID: {
 		Message: "configuration is invalid",
 		Fixups: []string{
@@ -589,6 +616,7 @@ var AllCodes = []Code{
 	APERTURE_NOT_FOUND,
 	APERTURE_STORAGE,
 	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE,
+	APERTURE_STORAGE_CONSTRAINT,
 	APERTURE_CONFIG_INVALID,
 	APERTURE_ACTION_UNDECLARED,
 	APERTURE_SCOPE_INVALID,
