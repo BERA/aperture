@@ -165,12 +165,21 @@
                   <div class="a-toolbar__spacer"></div>
                   <button class="a-btn a-btn--secondary" @click="addFilter()">Add filter</button>
                   <button class="a-btn a-btn--secondary" @click="load()">Reload</button>
-                  <button
-                    class="a-btn a-btn--primary"
-                    x-show="canEdit"
-                    @click="openCreate()"
-                    x-text="'New ' + currentType.singular"
-                  ></button>
+                  <!-- Two independent gates, rendered differently on purpose
+                       (see "locked controls" in crud.js): a non-admin gets no
+                       button at all (x-show on the wrapper), while an entity
+                       kind this DEPLOYMENT does not manage keeps its button,
+                       disabled, with the reason on hover. The title sits on the
+                       wrapper because a disabled .a-btn has pointer-events:
+                       none and would never show one of its own. -->
+                  <span class="a-locked" x-show="canEdit" :title="lockHint(currentType)">
+                    <button
+                      class="a-btn a-btn--primary"
+                      :disabled="!entityManaged(currentType)"
+                      @click="openCreate()"
+                      x-text="'New ' + currentType.singular"
+                    ></button>
+                  </span>
                 </div>
 
                 <!-- Server-side filter bar: each row is a predicate sent to the
@@ -258,8 +267,14 @@
                                   <template x-if="currentType.manageMembers">
                                     <button class="a-linkbtn" @click="openMembers(row)">Members</button>
                                   </template>
-                                  <button class="a-linkbtn" @click="openEdit(row)">Edit</button>
-                                  <button class="a-linkbtn a-linkbtn--danger" @click="askDelete(row)">Delete</button>
+                                  <!-- Locked-control pattern: title on the
+                                       wrapper, :disabled on the button. -->
+                                  <span class="a-locked" :title="lockHint(currentType)">
+                                    <button class="a-linkbtn" :disabled="!entityManaged(currentType)" @click="openEdit(row)">Edit</button>
+                                  </span>
+                                  <span class="a-locked" :title="lockHint(currentType)">
+                                    <button class="a-linkbtn a-linkbtn--danger" :disabled="!entityManaged(currentType)" @click="askDelete(row)">Delete</button>
+                                  </span>
                                 </span>
                               </template>
                               <template x-if="!canEdit">
