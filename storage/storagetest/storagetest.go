@@ -50,6 +50,11 @@ func Run(t *testing.T, newStore Factory) {
 	t.Run("GroupsForPrincipal", func(t *testing.T) { testGroupsForPrincipal(t, newStore(t)) })
 	t.Run("NotFoundSemantics", func(t *testing.T) { testNotFoundSemantics(t, newStore(t)) })
 	t.Run("TimestampsRoundTrip", func(t *testing.T) { testTimestampsRoundTrip(t, newStore(t)) })
+	t.Run("TimestampUnsetRoundTrip", func(t *testing.T) { testTimestampUnsetRoundTrip(t, newStore(t)) })
+	t.Run("TimestampSubMicrosecondPrecision", func(t *testing.T) { testTimestampSubMicrosecondPrecision(t, newStore(t)) })
+	t.Run("TimestampRangeBoundaries", func(t *testing.T) { testTimestampRangeBoundaries(t, newStore(t)) })
+	t.Run("TimestampOutOfRangeRefused", func(t *testing.T) { testTimestampOutOfRangeRefused(t, newStore(t)) })
+	t.Run("AuditTimestampContract", func(t *testing.T) { testAuditTimestampContract(t, newStore(t)) })
 	t.Run("AuditAppendAndQuery", func(t *testing.T) { testAuditAppendAndQuery(t, newStore(t)) })
 	t.Run("AuditQueryFilters", func(t *testing.T) { testAuditQueryFilters(t, newStore(t)) })
 	t.Run("AuditRetentionPrune", func(t *testing.T) { testAuditRetentionPrune(t, newStore(t)) })
@@ -818,6 +823,415 @@ func testTimestampsRoundTrip(t *testing.T, s model.Storage) {
 	}
 }
 
+// ---- The stored-instant contract ----
+//
+// Every backend stores an instant as a signed 64-bit count of NANOSECONDS since
+// the Unix epoch, UTC. Three properties follow, and the cases below prove all
+// three on EVERY entity that carries a timestamp, for every backend:
+//
+//  1. The zero time.Time is "unset" and round-trips as the zero time.Time — not
+//     as the Unix epoch, and not by borrowing its sibling column.
+//  2. Precision is exact to the nanosecond. This is the load-bearing property:
+//     it is why the storage layer stores an integer count of nanoseconds instead
+//     of a per-dialect timestamp type (Postgres TIMESTAMPTZ is microsecond
+//     resolution and would silently drop the last three digits).
+//  3. The representable window is a closed contract. Both endpoints round-trip;
+//     one nanosecond outside either endpoint is refused with
+//     APERTURE_INVALID_INPUT rather than wrapped, clamped, or written as an
+//     overflow value.
+//
+// There is deliberately NO tolerance, rounding, or precision knob anywhere in
+// these comparisons. A conformance suite that compares instants approximately
+// stops proving the backends agree, which is the only thing it exists to do.
+// storage/storagetest/contract_test.go parses this file and enforces that.
+
+// storableMin and storableMax are the endpoints of the int64-nanosecond window.
+//
+// They are written out as literals rather than read back from
+// storage/storagetime on purpose: the conformance suite states the contract
+// independently of the code that implements it. If the suite derived the bounds
+// from the implementation, a wrong bound would make the suite agree with itself.
+var (
+	storableMin = time.Date(1677, 9, 21, 0, 12, 43, 145224192, time.UTC)
+	storableMax = time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC)
+)
+
+// subMicroCreated and subMicroUpdated carry sub-microsecond detail that a
+// microsecond-resolution backend cannot represent. 123456789 truncates to
+// 123456000 and 1 truncates to 0, so either loss is visible rather than subtle.
+var (
+	subMicroCreated = time.Date(2026, 2, 3, 4, 5, 6, 123456789, time.UTC)
+	subMicroUpdated = time.Date(2026, 2, 3, 4, 5, 7, 1, time.UTC)
+)
+
+// inRangeInstant is an ordinary, uncontroversial instant used as the valid half
+// of a pair when the other half is being rejected.
+var inRangeInstant = time.Date(2026, 5, 6, 7, 8, 9, 987654321, time.UTC)
+
+// stampedEntity is one entity that carries a CreatedAt/UpdatedAt pair through
+// the storage contract: a writer that stamps it and a reader that hands the pair
+// back. Every timestamp case walks the whole table, so a backend cannot satisfy
+// the contract on some entities and quietly miss others — which is exactly the
+// shape the bug takes when a new entity's write path forgets to encode.
+type stampedEntity struct {
+	name string
+	put  func(s model.Storage, created, updated time.Time) error
+	get  func(s model.Storage) (created, updated time.Time, err error)
+}
+
+// stampedEntities lists every entity in model.Storage with a CreatedAt/UpdatedAt
+// pair. Adding a stamped entity to the model means adding it here; the table is
+// the suite's definition of "every entity".
+//
+// Each entity uses a distinct identity and is otherwise minimally valid, so the
+// only thing a case can fail on is its timestamps.
+func stampedEntities() []stampedEntity {
+	return []stampedEntity{
+		{
+			name: "Account",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutAccount(ctx(), model.Account{
+					ID: "acme", Name: "Acme Corp", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				a, err := s.GetAccount(ctx(), "acme")
+				return a.CreatedAt, a.UpdatedAt, err
+			},
+		},
+		{
+			name: "Membership",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutMembership(ctx(), model.Membership{
+					PrincipalID: "alice", AccountID: "acme", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				m, err := s.GetMembership(ctx(), "alice", "acme")
+				return m.CreatedAt, m.UpdatedAt, err
+			},
+		},
+		{
+			name: "ObjectType",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutObjectType(ctx(), model.ObjectType{
+					Name: "widget", Actions: []string{"read"}, CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				ot, err := s.GetObjectType(ctx(), "widget")
+				return ot.CreatedAt, ot.UpdatedAt, err
+			},
+		},
+		{
+			name: "Permission",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutPermission(ctx(), model.Permission{
+					ID: "p-stamp", ObjectType: "document", Action: "read",
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				p, err := s.GetPermission(ctx(), "p-stamp")
+				return p.CreatedAt, p.UpdatedAt, err
+			},
+		},
+		{
+			name: "Principal",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutPrincipal(ctx(), model.Principal{
+					ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				p, err := s.GetPrincipal(ctx(), "alice")
+				return p.CreatedAt, p.UpdatedAt, err
+			},
+		},
+		{
+			name: "Role",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutRole(ctx(), model.Role{
+					ID: "r-admin", Name: "Administrator", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				r, err := s.GetRole(ctx(), "r-admin")
+				return r.CreatedAt, r.UpdatedAt, err
+			},
+		},
+		{
+			name: "Group",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutGroup(ctx(), model.Group{
+					ID: "eng", Name: "Engineering", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				g, err := s.GetGroup(ctx(), "eng")
+				return g.CreatedAt, g.UpdatedAt, err
+			},
+		},
+		{
+			name: "Grant",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutGrant(ctx(), model.Grant{
+					ID: "g-stamp", AccountID: "acme",
+					Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+					PermissionID: "p-read", Object: "**", Effect: model.EffectAllow,
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				g, err := s.GetGrant(ctx(), "g-stamp")
+				return g.CreatedAt, g.UpdatedAt, err
+			},
+		},
+		{
+			name: "Template",
+			put: func(s model.Storage, c, u time.Time) error {
+				tpl := sampleTemplate("onboard", 1)
+				tpl.CreatedAt, tpl.UpdatedAt = c, u
+				return s.PutTemplate(ctx(), tpl)
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				tpl, err := s.GetTemplate(ctx(), "onboard", 1)
+				return tpl.CreatedAt, tpl.UpdatedAt, err
+			},
+		},
+		{
+			name: "Rule",
+			put: func(s model.Storage, c, u time.Time) error {
+				r := sampleRule("public-only")
+				r.CreatedAt, r.UpdatedAt = c, u
+				return s.PutRule(ctx(), r)
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				r, err := s.GetRule(ctx(), "public-only")
+				return r.CreatedAt, r.UpdatedAt, err
+			},
+		},
+	}
+}
+
+// sameInstant asserts that a stored instant came back EXACTLY as it went in.
+// The comparison is time.Time.Equal on the instant — no tolerance, no rounding,
+// no truncation. A backend whose column cannot hold nanoseconds fails here.
+func sameInstant(t *testing.T, field string, got, want time.Time) {
+	t.Helper()
+	if got.Equal(want) {
+		return
+	}
+	t.Fatalf("%s did not survive the round trip exactly:\n got  %s (nanosecond field %d)\n want %s (nanosecond field %d)\n"+
+		"Stored instants are int64 nanoseconds; a microsecond-resolution column "+
+		"(Postgres TIMESTAMPTZ, for one) fails exactly here. Fix the backend — "+
+		"do not add tolerance to this comparison.",
+		field,
+		got.UTC().Format(time.RFC3339Nano), got.Nanosecond(),
+		want.UTC().Format(time.RFC3339Nano), want.Nanosecond())
+}
+
+// testTimestampUnsetRoundTrip proves the zero mapping on every entity: the zero
+// time.Time is written as "unset" and read back as the zero time.Time. The
+// failure this catches is a NOT NULL column defaulting to 0 and decoding as the
+// Unix epoch, which would turn "never stamped" into "stamped in 1970".
+func testTimestampUnsetRoundTrip(t *testing.T, s model.Storage) {
+	seedDocumentType(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			// Both unset.
+			if err := e.put(s, time.Time{}, time.Time{}); err != nil {
+				t.Fatalf("put with unset stamps: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			for _, f := range []struct {
+				name string
+				got  time.Time
+			}{{"CreatedAt", created}, {"UpdatedAt", updated}} {
+				if !f.got.IsZero() {
+					t.Fatalf("unset %s read back as %s, want the zero time. "+
+						"An unset column must decode to time.Time{}, never to the Unix epoch.",
+						f.name, f.got.UTC().Format(time.RFC3339Nano))
+				}
+			}
+
+			// Half set: an unset column must not borrow its sibling's value, and
+			// a set column must not be dragged to zero by the unset one.
+			if err := e.put(s, inRangeInstant, time.Time{}); err != nil {
+				t.Fatalf("put with one unset stamp: %v", err)
+			}
+			created, updated, err = e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt", created, inRangeInstant)
+			if !updated.IsZero() {
+				t.Fatalf("unset UpdatedAt read back as %s, want the zero time",
+					updated.UTC().Format(time.RFC3339Nano))
+			}
+		})
+	}
+}
+
+// testTimestampSubMicrosecondPrecision is the load-bearing case of this suite's
+// time contract: sub-microsecond detail survives a round trip EXACTLY, on every
+// entity, on every backend. Without it a contributor could swap in a
+// microsecond-resolution column and the suite would stay green.
+func testTimestampSubMicrosecondPrecision(t *testing.T, s model.Storage) {
+	seedDocumentType(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			if err := e.put(s, subMicroCreated, subMicroUpdated); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt", created, subMicroCreated)
+			sameInstant(t, "UpdatedAt", updated, subMicroUpdated)
+		})
+	}
+}
+
+// testTimestampRangeBoundaries proves both endpoints of the representable window
+// are storable, not merely "close enough". The endpoints are the two instants a
+// clamping or overflowing encoder is most likely to mangle.
+func testTimestampRangeBoundaries(t *testing.T, s model.Storage) {
+	seedDocumentType(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			if err := e.put(s, storableMin, storableMax); err != nil {
+				t.Fatalf("put at the window endpoints: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt (window minimum)", created, storableMin)
+			sameInstant(t, "UpdatedAt (window maximum)", updated, storableMax)
+		})
+	}
+}
+
+// testTimestampOutOfRangeRefused proves the window is closed on both sides, for
+// both stamps, on every entity: one nanosecond past either endpoint is refused
+// with APERTURE_INVALID_INPUT and nothing is written. The storable range is a
+// property of the storage CONTRACT, not of one dialect's encoding — a backend
+// that keeps a time.Time in memory must refuse the same instants a backend that
+// encodes to an integer refuses, or the two have silently diverged.
+func testTimestampOutOfRangeRefused(t *testing.T, s model.Storage) {
+	seedDocumentType(t, s)
+	beforeMin := storableMin.Add(-time.Nanosecond)
+	afterMax := storableMax.Add(time.Nanosecond)
+
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			for _, c := range []struct {
+				label            string
+				created, updated time.Time
+			}{
+				{"CreatedAtBeforeWindow", beforeMin, inRangeInstant},
+				{"CreatedAtAfterWindow", afterMax, inRangeInstant},
+				{"UpdatedAtBeforeWindow", inRangeInstant, beforeMin},
+				{"UpdatedAtAfterWindow", inRangeInstant, afterMax},
+			} {
+				t.Run(c.label, func(t *testing.T) {
+					mustCode(t, e.put(s, c.created, c.updated), aerr.APERTURE_INVALID_INPUT)
+				})
+			}
+			// A refused write must leave nothing behind: the rejection happens
+			// before any row is touched, never as a partial or clamped write.
+			_, _, err := e.get(s)
+			mustCode(t, err, aerr.APERTURE_NOT_FOUND)
+		})
+	}
+}
+
+// testAuditTimestampContract holds the audit trail's occurred_at to the same
+// contract as the entity stamps. It is a separate case only because an audit
+// event carries one instant rather than a CreatedAt/UpdatedAt pair — the rules
+// it is held to are identical.
+func testAuditTimestampContract(t *testing.T, s model.Storage) {
+	events := []struct {
+		id   string
+		when time.Time
+	}{
+		{"a-submicro", subMicroCreated},
+		{"a-min", storableMin},
+		{"a-max", storableMax},
+	}
+	for _, e := range events {
+		when := e.when
+		if err := s.AppendAudit(ctx(), mkAudit(e.id, 0, func(ev *model.AuditEvent) {
+			ev.Timestamp = when
+		})); err != nil {
+			t.Fatalf("append %s: %v", e.id, err)
+		}
+	}
+	got := mustQuery(t, s, model.AuditFilter{})
+	for _, e := range events {
+		ev, ok := findAudit(got, e.id)
+		if !ok {
+			t.Fatalf("appended event %s is missing from the query result", e.id)
+		}
+		sameInstant(t, "AuditEvent.Timestamp of "+e.id, ev.Timestamp, e.when)
+	}
+
+	// The zero Timestamp is "unset" and reads back as the zero time.
+	if err := s.AppendAudit(ctx(), mkAudit("a-unset", 0, func(ev *model.AuditEvent) {
+		ev.Timestamp = time.Time{}
+	})); err != nil {
+		t.Fatalf("append unset timestamp: %v", err)
+	}
+	ev, ok := findAudit(mustQuery(t, s, model.AuditFilter{}), "a-unset")
+	if !ok {
+		t.Fatalf("appended event a-unset is missing from the query result")
+	}
+	if !ev.Timestamp.IsZero() {
+		t.Fatalf("unset AuditEvent.Timestamp read back as %s, want the zero time",
+			ev.Timestamp.UTC().Format(time.RFC3339Nano))
+	}
+
+	// One nanosecond outside either endpoint is refused, on the write path...
+	for _, when := range []time.Time{
+		storableMin.Add(-time.Nanosecond),
+		storableMax.Add(time.Nanosecond),
+	} {
+		out := when
+		mustCode(t, s.AppendAudit(ctx(), mkAudit("a-outside", 0, func(ev *model.AuditEvent) {
+			ev.Timestamp = out
+		})), aerr.APERTURE_INVALID_INPUT)
+	}
+	if _, ok := findAudit(mustQuery(t, s, model.AuditFilter{}), "a-outside"); ok {
+		t.Fatalf("a refused AppendAudit left an event behind")
+	}
+
+	// ...and on the query path, where the same bound is a filter argument.
+	mustCode(t, func() error {
+		_, err := s.QueryAudit(ctx(), model.AuditFilter{Since: storableMin.Add(-time.Nanosecond)})
+		return err
+	}(), aerr.APERTURE_INVALID_INPUT)
+	mustCode(t, func() error {
+		_, err := s.QueryAudit(ctx(), model.AuditFilter{Until: storableMax.Add(time.Nanosecond)})
+		return err
+	}(), aerr.APERTURE_INVALID_INPUT)
+}
+
+// findAudit locates one event by id in a query result.
+func findAudit(evs []model.AuditEvent, id string) (model.AuditEvent, bool) {
+	for _, ev := range evs {
+		if ev.ID == id {
+			return ev, true
+		}
+	}
+	return model.AuditEvent{}, false
+}
+
 // ---- Audit trail ----
 
 // auditBase is a reference instant the audit cases stamp events relative to, so
@@ -1335,10 +1749,16 @@ func testAtomicRollback(t *testing.T, s model.Storage) {
 
 // ---- normalization helpers ----
 //
-// Backends persist timestamps verbatim, but the SQLite backend round-trips them
-// through RFC3339Nano text, which canonicalizes the location to UTC. Normalize
-// both sides through .UTC().Round(0) so reflect.DeepEqual compares instants, not
-// location pointers or monotonic clock readings.
+// Backends persist instants verbatim, but a backend that encodes to int64
+// nanoseconds hands the value back in UTC with no monotonic reading, while the
+// in-memory backend returns the time.Time it was given. Normalize both sides
+// through .UTC().Round(0) so reflect.DeepEqual compares instants, not location
+// pointers or monotonic clock readings.
+//
+// Round(0) strips the monotonic reading. It does NOT truncate, and it must never
+// be changed to do so: rounding here would let a backend that loses precision
+// pass the whole suite. storage/storagetest/contract_test.go parses this file
+// and fails if this function is anything other than what it is below.
 
 func normTime(t time.Time) time.Time { return t.UTC().Round(0) }
 
