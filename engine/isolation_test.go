@@ -39,12 +39,20 @@ func newIsoFixture(t *testing.T) *isoFixture {
 		t.Fatalf("setup: %v", err)
 	}
 	f := &isoFixture{t: t, store: store}
+	f.must(store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
+	f.must(store.PutAccount(ctx, model.Account{ID: acctOther, Name: acctOther}))
 	f.must(store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read", "write", "delete"}}))
 	f.must(store.PutPermission(ctx, model.Permission{ID: permRead, ObjectType: "document", Action: "read"}))
 	f.must(store.PutPermission(ctx, model.Permission{ID: permWrite, ObjectType: "document", Action: "write"}))
-	// Two tenancies; alice is admitted to both, bob only to acme.
+	// Two tenancies; alice is admitted to both, bob only to acme. The principals
+	// are written BEFORE their memberships: apt_memberships.principal_id is a real
+	// reference in every backend now, so a membership may not name a principal
+	// that does not exist yet. The subject-shape cases below re-save alice with a
+	// role; that is an upsert of the same principal, not a second one.
 	f.account(acctAcme)
 	f.account(acctOther)
+	f.principal("alice")
+	f.principal("bob")
 	f.member("alice", acctAcme)
 	f.member("alice", acctOther)
 	f.member("bob", acctAcme)

@@ -249,6 +249,33 @@ func Parse(data []byte, format Format) (*Document, error) {
 // funnels a whole Document through this function and therefore carries its own
 // explicit check. A NEW caller of Apply that is reachable at runtime needs one
 // too; it will not inherit anything from here.
+//
+// THE ORDER OF THE LOOPS BELOW IS LOAD-BEARING. Aperture's storage carries real
+// foreign keys (see the "Referential integrity" note in
+// storage/sqlite/schema.sql), so a record must be written AFTER everything it
+// references or the write is refused outright. The dependency order is:
+//
+//	accounts, object types  ->  nothing
+//	permissions             ->  object types
+//	roles                   ->  permissions
+//	principals              ->  roles
+//	memberships             ->  principals, accounts
+//	groups                  ->  principals
+//	grants                  ->  permissions, accounts, and their SUBJECT — a
+//	                            principal, role, or group, whichever
+//	                            subject_kind names, which is why grants come
+//	                            after all three
+//
+// The account edges are the reason `accounts:` must be declared before anything
+// stamped with them: account_id must name a real account or be exactly
+// model.AccountWildcard ("*"), and "*" needs no declaration — it is a sentinel,
+// not a row.
+//
+// Reordering these loops to suit a document's own layout, or appending a new
+// entity kind to the end without checking what it points at, breaks seeding
+// against any enforcing backend — and NOT against the in-memory one, which is
+// what most of this package's tests run on. Seed a real SQLite store when you
+// change this.
 func (d *Document) Apply(ctx context.Context, store model.Storage) error {
 	for _, a := range d.Accounts {
 		if err := store.PutAccount(ctx, model.Account{
@@ -280,6 +307,16 @@ func (d *Document) Apply(ctx context.Context, store model.Storage) error {
 			return aerr.Wrapf(aerr.APERTURE_INVALID_INPUT, err, "seed: permission %q", p.ID)
 		}
 	}
+	for _, r := range d.Roles {
+		if err := store.PutRole(ctx, model.Role{
+			ID:            r.ID,
+			Name:          r.Name,
+			Description:   r.Description,
+			PermissionIDs: r.Permissions,
+		}); err != nil {
+			return aerr.Wrapf(aerr.APERTURE_INVALID_INPUT, err, "seed: role %q", r.ID)
+		}
+	}
 	for _, p := range d.Principals {
 		if err := store.PutPrincipal(ctx, model.Principal{
 			ID:          p.ID,
@@ -297,16 +334,6 @@ func (d *Document) Apply(ctx context.Context, store model.Storage) error {
 			AccountID:   m.Account,
 		}); err != nil {
 			return aerr.Wrapf(aerr.APERTURE_INVALID_INPUT, err, "seed: membership %q@%q", m.Principal, m.Account)
-		}
-	}
-	for _, r := range d.Roles {
-		if err := store.PutRole(ctx, model.Role{
-			ID:            r.ID,
-			Name:          r.Name,
-			Description:   r.Description,
-			PermissionIDs: r.Permissions,
-		}); err != nil {
-			return aerr.Wrapf(aerr.APERTURE_INVALID_INPUT, err, "seed: role %q", r.ID)
 		}
 	}
 	for _, g := range d.Groups {

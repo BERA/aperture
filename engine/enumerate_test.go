@@ -74,6 +74,9 @@ func newEnumFixture(t *testing.T, docIDs ...string) *enumFixture {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	if err := store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
 	if err := store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}); err != nil {
 		t.Fatalf("seed object type: %v", err)
 	}
@@ -283,6 +286,7 @@ func TestEnumerate_UnconfiguredListerErrors(t *testing.T) {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	mustSeed(t, store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
 	mustSeed(t, store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}))
 	mustSeed(t, store.PutPermission(ctx, model.Permission{ID: "p-impl", ObjectType: "document", Action: "read", ScopeStrategy: scope.StrategyImplicit}))
 	mustSeed(t, store.PutPrincipal(ctx, model.Principal{ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice"}))

@@ -30,6 +30,7 @@ func newRefSvc(t *testing.T) (*Service, *engine.Engine) {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	mustPut(t, store.PutAccount(ctx, model.Account{ID: acct, Name: acct}))
 	mustPut(t, store.PutPrincipal(ctx, model.Principal{ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice"}))
 	for _, typ := range []string{"dataset", "brand"} {
 		mustPut(t, store.PutObjectType(ctx, model.ObjectType{Name: typ, Actions: []string{"read"}}))

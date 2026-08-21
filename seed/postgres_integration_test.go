@@ -64,7 +64,14 @@ func TestPostgresIntegration_SeedFileAloneServesRealObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	defer func() { _ = admin.Close() }()
+	// The pool is closed by a CLEANUP, not by a defer. Cleanups run after the
+	// deferred calls of the test function and in reverse registration order, so a
+	// `defer admin.Close()` closes the pool BEFORE the DROP below ever runs — the
+	// DROP then fails with sql.ErrConnDone, the `_, _ =` swallows it, and the
+	// scratch table survives every run. That is exactly what happened: this test
+	// left one table (and its index) behind per run in whatever database it was
+	// pointed at. Registering Close FIRST makes it run LAST.
+	t.Cleanup(func() { _ = admin.Close() })
 	if err := admin.PingContext(ctx); err != nil {
 		t.Fatalf("ping %s: %v", pgDSNEnv, err)
 	}
@@ -74,7 +81,12 @@ func TestPostgresIntegration_SeedFileAloneServesRealObjects(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = admin.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s`, table))
+		// Reported, not discarded. A cleanup that cannot fail is a cleanup nobody
+		// finds out has stopped working.
+		if _, err := admin.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s`, table)); err != nil {
+			t.Errorf("the scratch table %s was not dropped: %v — this test must leave no residue in "+
+				"the database the operator pointed it at", table, err)
+		}
 	})
 	if _, err := admin.ExecContext(ctx, fmt.Sprintf(
 		`INSERT INTO %s VALUES ('1','gold',12,'2026-03-01'), ('2','silver',3,'2026-09-15')`, table)); err != nil {

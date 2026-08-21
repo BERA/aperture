@@ -38,6 +38,33 @@ const (
 	// APERTURE_STORAGE — the underlying Storage implementation returned an error
 	// (query, write, or schema setup).
 	APERTURE_STORAGE Code = "APERTURE_STORAGE"
+	// APERTURE_STORAGE_SCHEMA_INCOMPATIBLE — an existing database was written by a
+	// build of Aperture whose schema this build cannot read, and Setup refused it
+	// at startup rather than let a read misinterpret the rows later. Aperture has
+	// no migration tool and no schema versioning by design: a schema break is a
+	// hard break, and the only remedy is a new database. Distinct from
+	// APERTURE_STORAGE because nothing failed — the storage engine answered every
+	// query correctly; it is the SHAPE of what it answered with that is wrong,
+	// and the fix is an operator action, not a retry.
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE Code = "APERTURE_STORAGE_SCHEMA_INCOMPATIBLE"
+	// APERTURE_STORAGE_CONSTRAINT — the database refused a write because it would
+	// break a declared constraint, or the connection is not in a position to
+	// enforce those constraints at all.
+	//
+	// In practice that is a foreign key: deleting an account that still has
+	// members, a permission a grant still cites, or a principal that is still in a
+	// group. Before Aperture's schema carried real foreign keys those deletes
+	// SUCCEEDED and left the child rows behind, pointing at nothing — a grant
+	// naming a permission that no longer exists is not a tidy leftover, it is
+	// authority nobody can read or revoke. The refusal is the feature, and it is
+	// deliberately distinct from APERTURE_STORAGE: nothing failed, no retry helps,
+	// and the caller's next move is to delete the children first (or not to
+	// delete the parent).
+	//
+	// The same code covers a SQLite connection whose foreign_keys pragma is off,
+	// which Setup refuses up front: constraints that cannot be enforced are the
+	// same problem as a constraint that was, one step earlier.
+	APERTURE_STORAGE_CONSTRAINT Code = "APERTURE_STORAGE_CONSTRAINT"
 	// APERTURE_CONFIG_INVALID — configuration (env vars or YAML) was read but is
 	// malformed or internally inconsistent.
 	APERTURE_CONFIG_INVALID Code = "APERTURE_CONFIG_INVALID"
@@ -316,6 +343,25 @@ var Registry = map[Code]Metadata{
 			"Inspect the wrapped cause for the underlying storage failure.",
 		},
 	},
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE: {
+		Message: "the existing database was written by an incompatible build and cannot be upgraded",
+		Fixups: []string{
+			"Recreate the database: move or delete the old file, start Aperture so Setup builds the schema fresh, then re-seed it.",
+			"Point the store at a new, empty database if you need to keep the old file for reference.",
+			"Do not expect an in-place upgrade: Aperture ships no migration tool and no schema versioning, so a schema break is a hard break by design.",
+		},
+	},
+	APERTURE_STORAGE_CONSTRAINT: {
+		Message: "the database refused the write because it would break referential integrity",
+		Fixups: []string{
+			"Delete the rows that reference the record first: a principal's memberships and group memberships, a permission's role assignments and grants, a role's principal assignments, an object type's permissions, an account's memberships and grants, and the grants that name a principal, role, or group as their subject.",
+			"Creating a record? Create what it references first — a permission needs its object type, a membership and a group member need their principal, a grant and a role assignment need their permission, and a membership and a grant need their account.",
+			"Refused on a grant's subject? subject_kind chooses the table subject_id must exist in — principal, role, or group. A grant naming a role id under kind \"group\" is refused even though that id exists elsewhere.",
+			"Refused on an account id? It must name a real account, or be exactly \"*\" (the all-accounts wildcard). \"*\" is a sentinel, not an account: it needs no account record and cannot be given one.",
+			"Ids are immutable in Aperture: to change one, create the new record, move the children, then delete the old one — an UPDATE that moved a key is refused rather than silently re-parenting.",
+			"Seeing this from Setup rather than a write? The connection is not enforcing foreign keys. Open the store with sqlite.Open, which forces _pragma=foreign_keys(1) into the DSN whatever the caller passed.",
+		},
+	},
 	APERTURE_CONFIG_INVALID: {
 		Message: "configuration is invalid",
 		Fixups: []string{
@@ -571,6 +617,8 @@ var AllCodes = []Code{
 	APERTURE_IDENTITY_INVALID,
 	APERTURE_NOT_FOUND,
 	APERTURE_STORAGE,
+	APERTURE_STORAGE_SCHEMA_INCOMPATIBLE,
+	APERTURE_STORAGE_CONSTRAINT,
 	APERTURE_CONFIG_INVALID,
 	APERTURE_ACTION_UNDECLARED,
 	APERTURE_SCOPE_INVALID,

@@ -32,6 +32,7 @@ func ruleBackedFixture(t *testing.T, opts ...rules.Option) *Engine {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	mustSeed(t, store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
 	mustSeed(t, store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}))
 	mustSeed(t, store.PutPermission(ctx, model.Permission{
 		ID: "p-rule", ObjectType: "document", Action: "read", ScopeStrategy: "inclusive;rule=sensitive",

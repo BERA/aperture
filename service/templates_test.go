@@ -274,7 +274,7 @@ func TestBulkDeleteGrants_RoundTripAndRollback(t *testing.T) {
 		if err := store.PutGrant(ctx, model.Grant{
 			ID: id, AccountID: "acme",
 			Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
-			PermissionID: "p", Object: "account:acme/**", Effect: model.EffectAllow,
+			PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}

@@ -32,6 +32,34 @@ import (
 // / delegator / operator); an empty one is APERTURE_UNAUTHENTICATED. The Twirp
 // surface overrides these with the identity the auth middleware resolved, so a
 // caller can never spoof a different actor on the wire.
+//
+// ---- Delete order ----
+//
+// Storage enforces referential integrity, so a delete that would strand a child
+// row is REFUSED with APERTURE_STORAGE_CONSTRAINT rather than silently orphaning
+// it. Six of the deletes below can be refused that way; the caller's move is to
+// remove the children first, in this order:
+//
+//	grants  ->  memberships  ->  group / role / principal  ->  permission
+//	                                                       ->  object type
+//	                                                       ->  account
+//
+// Every step is reachable through this facade. Two of the child edges are FIELDS
+// rather than entities — a principal's RoleIDs and a group's MemberPrincipalIDs —
+// so they come off with a PutPrincipal / PutGroup that omits them, not a delete.
+// A group's member rows and a role's permission rows are owned by their parent
+// and go with it; nothing has to be detached by hand there.
+//
+// DeleteMembership, DeleteGrant, DeleteTemplate, and DeleteRule have no child
+// edges at all and cannot be refused for referential reasons.
+//
+// Each Delete* below is a SINGLE storage call and returns the storage layer's
+// error UNWRAPPED. That is deliberate and load-bearing: aerr.Wrap stamps the code
+// it is handed onto a fresh error rather than passing an existing one through, so
+// wrapping here would flatten APERTURE_STORAGE_CONSTRAINT — and with it the
+// Registry fixups naming exactly which children to remove — into a generic
+// storage failure. service/delete_order_test.go enumerates every path and pins
+// both halves.
 
 // Actor is the authenticated caller a mutation is attributed to and authorized
 // against: the principal id and the active account it is operating in.
@@ -187,6 +215,8 @@ func (s *Service) ListObjectTypes(ctx context.Context) ([]model.ObjectType, erro
 	return s.store.ListObjectTypes(ctx)
 }
 
+// DeleteObjectType removes an object type (system-admin tier). It is refused
+// with APERTURE_STORAGE_CONSTRAINT while any permission is declared on it.
 func (s *Service) DeleteObjectType(ctx context.Context, actor Actor, name string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err
@@ -226,6 +256,8 @@ func (s *Service) ListPermissions(ctx context.Context) ([]model.Permission, erro
 	return s.store.ListPermissions(ctx)
 }
 
+// DeletePermission removes a permission (system-admin tier). It is refused with
+// APERTURE_STORAGE_CONSTRAINT while a role bundles it or a grant cites it.
 func (s *Service) DeletePermission(ctx context.Context, actor Actor, id string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err
@@ -299,6 +331,9 @@ func (s *Service) ListPrincipals(ctx context.Context, actor Actor) ([]model.Prin
 	return out, nil
 }
 
+// DeletePrincipal removes a principal (system-admin tier). It is refused with
+// APERTURE_STORAGE_CONSTRAINT while the principal holds an account membership,
+// belongs to a group, or is a grant's subject. Its role assignments go with it.
 func (s *Service) DeletePrincipal(ctx context.Context, actor Actor, id string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err
@@ -341,6 +376,9 @@ func (s *Service) ListRoles(ctx context.Context) ([]model.Role, error) {
 	return s.store.ListRoles(ctx)
 }
 
+// DeleteRole removes a role (system-admin tier). It is refused with
+// APERTURE_STORAGE_CONSTRAINT while a principal holds it or a grant names it as
+// its subject. The role's own permission assignments go with it.
 func (s *Service) DeleteRole(ctx context.Context, actor Actor, id string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err
@@ -380,6 +418,9 @@ func (s *Service) ListGroups(ctx context.Context) ([]model.Group, error) {
 	return s.store.ListGroups(ctx)
 }
 
+// DeleteGroup removes a group (system-admin tier). It is refused with
+// APERTURE_STORAGE_CONSTRAINT while a grant names it as its subject. The group's
+// own member rows go with it.
 func (s *Service) DeleteGroup(ctx context.Context, actor Actor, id string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err
@@ -441,6 +482,9 @@ func (s *Service) ListAccounts(ctx context.Context, actor Actor) ([]model.Accoun
 	return out, nil
 }
 
+// DeleteAccount removes an account (system-admin tier). It is refused with
+// APERTURE_STORAGE_CONSTRAINT while a membership or a grant is still stamped
+// with it.
 func (s *Service) DeleteAccount(ctx context.Context, actor Actor, id string) (err error) {
 	if err = s.requireMutator(); err != nil {
 		return err

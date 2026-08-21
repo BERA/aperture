@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,11 @@ func Run(t *testing.T, newStore Factory) {
 	t.Run("GroupsForPrincipal", func(t *testing.T) { testGroupsForPrincipal(t, newStore(t)) })
 	t.Run("NotFoundSemantics", func(t *testing.T) { testNotFoundSemantics(t, newStore(t)) })
 	t.Run("TimestampsRoundTrip", func(t *testing.T) { testTimestampsRoundTrip(t, newStore(t)) })
+	t.Run("TimestampUnsetRoundTrip", func(t *testing.T) { testTimestampUnsetRoundTrip(t, newStore(t)) })
+	t.Run("TimestampSubMicrosecondPrecision", func(t *testing.T) { testTimestampSubMicrosecondPrecision(t, newStore(t)) })
+	t.Run("TimestampRangeBoundaries", func(t *testing.T) { testTimestampRangeBoundaries(t, newStore(t)) })
+	t.Run("TimestampOutOfRangeRefused", func(t *testing.T) { testTimestampOutOfRangeRefused(t, newStore(t)) })
+	t.Run("AuditTimestampContract", func(t *testing.T) { testAuditTimestampContract(t, newStore(t)) })
 	t.Run("AuditAppendAndQuery", func(t *testing.T) { testAuditAppendAndQuery(t, newStore(t)) })
 	t.Run("AuditQueryFilters", func(t *testing.T) { testAuditQueryFilters(t, newStore(t)) })
 	t.Run("AuditRetentionPrune", func(t *testing.T) { testAuditRetentionPrune(t, newStore(t)) })
@@ -59,6 +65,37 @@ func Run(t *testing.T, newStore Factory) {
 	t.Run("RuleValidation", func(t *testing.T) { testRuleValidation(t, newStore(t)) })
 	t.Run("AtomicCommit", func(t *testing.T) { testAtomicCommit(t, newStore(t)) })
 	t.Run("AtomicRollback", func(t *testing.T) { testAtomicRollback(t, newStore(t)) })
+
+	// Referential integrity. These take the Factory rather than a store: each
+	// case needs several independent worlds, one per edge, so that exactly one
+	// relationship is left holding each delete.
+	t.Run("ReferentialWriteRefusesAnUnknownParent", func(t *testing.T) {
+		testReferentialWriteRefusesAnUnknownParent(t, newStore)
+	})
+	t.Run("ReferentialRefusedWriteIsAllOrNothing", func(t *testing.T) {
+		testReferentialRefusedWriteIsAllOrNothing(t, newStore)
+	})
+	t.Run("ReferentialRestrictRefusesADeleteThatWouldOrphan", func(t *testing.T) {
+		testReferentialRestrictRefusesADeleteThatWouldOrphan(t, newStore)
+	})
+	t.Run("ReferentialCascadeRemovesTheJoinRowsWithTheirOwner", func(t *testing.T) {
+		testReferentialCascadeRemovesTheJoinRowsWithTheirOwner(t, newStore)
+	})
+	t.Run("GrantSubjectMustExistInTheTableItsKindSelects", func(t *testing.T) {
+		testGrantSubjectMustExistInTheTableItsKindSelects(t, newStore)
+	})
+	t.Run("DeletingAGrantSubjectIsRefused", func(t *testing.T) {
+		testDeletingAGrantSubjectIsRefused(t, newStore)
+	})
+	t.Run("AccountReferenceIsARowOrTheWildcard", func(t *testing.T) {
+		testAccountReferenceIsARowOrTheWildcard(t, newStore)
+	})
+	t.Run("DeletingAnAccountWithLiveChildrenIsRefused", func(t *testing.T) {
+		testDeletingAnAccountWithLiveChildrenIsRefused(t, newStore)
+	})
+	t.Run("WildcardRowsDoNotPinARealAccount", func(t *testing.T) {
+		testWildcardRowsDoNotPinARealAccount(t, newStore)
+	})
 }
 
 func ctx() context.Context { return context.Background() }
@@ -81,6 +118,105 @@ func seedDocumentType(t *testing.T, s model.Storage) {
 	if err := s.PutObjectType(ctx(), ot); err != nil {
 		t.Fatalf("seed object type: %v", err)
 	}
+}
+
+// ---- referential fixtures ----
+//
+// Aperture's storage is RELATIONAL, and the relationships are real: a membership
+// names a principal, a role assignment names a role, a grant names a permission,
+// a group member names a principal, a membership and a grant name an account,
+// and a grant names a subject — a principal, a role, or a group, whichever its
+// subject_kind selects. A backend that enforces those relationships
+// refuses a child row whose parent was never written — correctly, because a
+// grant citing a permission that does not exist is authority nobody can read or
+// revoke.
+//
+// The cases below used to write children into an empty store, which only ever
+// worked because nothing was checking. The helpers here write the parents first.
+// They ASSERT NOTHING: they are setup, every case keeps exactly the assertions it
+// had, and none of this is conditional on which backend is running — a backend
+// that does not enforce the relationships is simply unaffected by the parents
+// being there. Enforcement itself is asserted by its own cases, not here.
+//
+// All of them are upserts, so calling one twice in a store is harmless.
+
+// seedPrincipals writes the principals a membership, group member or grant
+// subject in the case below refers to.
+func seedPrincipals(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		p := model.Principal{ID: id, Kind: model.PrincipalUser, Identity: "user:" + id}
+		if err := s.PutPrincipal(ctx(), p); err != nil {
+			t.Fatalf("seed principal %s: %v", id, err)
+		}
+	}
+}
+
+// seedAccounts writes the accounts a membership or a grant in the case below is
+// stamped with. account_id must name a real apt_accounts row OR be exactly
+// model.AccountWildcard, so the wildcard is SKIPPED rather than written: "*" is
+// a sentinel, not an account, and ValidateAccount refuses to create it (see
+// testAccountCRUD). Passing it through here is what lets a case seed a mixed
+// list of accounts, wildcard included, in one call.
+func seedAccounts(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if id == model.AccountWildcard {
+			continue
+		}
+		if err := s.PutAccount(ctx(), model.Account{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed account %s: %v", id, err)
+		}
+	}
+}
+
+// seedGroups writes the groups a grant subject in the case below refers to.
+func seedGroups(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if err := s.PutGroup(ctx(), model.Group{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed group %s: %v", id, err)
+		}
+	}
+}
+
+// seedRoles writes the roles a principal's role assignments refer to.
+func seedRoles(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if err := s.PutRole(ctx(), model.Role{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed role %s: %v", id, err)
+		}
+	}
+}
+
+// seedPermissions writes the permissions a grant or a role's permission bundle
+// refers to, along with the object type they hang off — a permission's action
+// verb is only legal because its object type declares it, so the two are seeded
+// together or neither is.
+func seedPermissions(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	seedDocumentType(t, s)
+	for _, id := range ids {
+		p := model.Permission{ID: id, ObjectType: "document", Action: "read"}
+		if err := s.PutPermission(ctx(), p); err != nil {
+			t.Fatalf("seed permission %s: %v", id, err)
+		}
+	}
+}
+
+// seedStampedEntityReferents writes the parents stampedEntities() refers to. The
+// stamped-entity table runs every entity against ONE store in a fixed order, and
+// the Membership entry names principal "alice" while the Grant entry names
+// permission "p-read" — neither of which the table itself ever creates (the
+// Principal entry writes "alice" but runs after Membership, and no entry writes
+// "p-read" at all). Seeding them up front is what lets the table stay a flat
+// list of independent entries rather than an ordered one.
+func seedStampedEntityReferents(t *testing.T, s model.Storage) {
+	t.Helper()
+	seedDocumentType(t, s)
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 }
 
 func testAccountCRUD(t *testing.T, s model.Storage) {
@@ -133,6 +269,8 @@ func testMembershipCRUDAndQueries(t *testing.T, s model.Storage) {
 			t.Fatalf("put membership %s@%s: %v", principalID, accountID, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice", "bob")
 	// alice spans two accounts; bob is only in acme.
 	put("alice", "acme")
 	put("alice", "other")
@@ -325,6 +463,7 @@ func testPermissionUnknownObjectType(t *testing.T, s model.Storage) {
 }
 
 func testPrincipalCRUD(t *testing.T, s model.Storage) {
+	seedRoles(t, s, "r-admin", "r-editor")
 	p := model.Principal{
 		ID:          "alice",
 		Kind:        model.PrincipalUser,
@@ -358,6 +497,7 @@ func testPrincipalCRUD(t *testing.T, s model.Storage) {
 }
 
 func testRoleCRUD(t *testing.T, s model.Storage) {
+	seedPermissions(t, s, "p1", "p2")
 	r := model.Role{ID: "r-admin", Name: "Administrator", Description: "all", PermissionIDs: []string{"p1", "p2"}}
 	if err := s.PutRole(ctx(), r); err != nil {
 		t.Fatalf("put: %v", err)
@@ -385,6 +525,7 @@ func testRoleCRUD(t *testing.T, s model.Storage) {
 }
 
 func testGroupCRUD(t *testing.T, s model.Storage) {
+	seedPrincipals(t, s, "alice", "bob")
 	g := model.Group{ID: "eng", Name: "Engineering", MemberPrincipalIDs: []string{"alice", "bob"}}
 	if err := s.PutGroup(ctx(), g); err != nil {
 		t.Fatalf("put: %v", err)
@@ -403,6 +544,9 @@ func testGroupCRUD(t *testing.T, s model.Storage) {
 }
 
 func testGrantCRUDAndUpsert(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	g := model.Grant{
 		ID:           "g1",
 		AccountID:    "acme",
@@ -465,6 +609,9 @@ func testListGrantsAccountScoped(t *testing.T, s model.Storage) {
 			t.Fatalf("seed grant %s: %v", id, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	seed("g-acme-1", "acme")
 	seed("g-acme-2", "acme")
 	seed("g-other-1", "other")
@@ -509,6 +656,9 @@ func seedGrant(t *testing.T, s model.Storage, id, account string) {
 // model.AllAccounts ("") returns grants across every account — including the
 // wildcard "*" rows inline — while a concrete account id stays account-scoped.
 func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	seedGrant(t, s, "g-acme-1", "acme")
 	seedGrant(t, s, "g-acme-2", "acme")
 	seedGrant(t, s, "g-other-1", "other")
@@ -562,6 +712,9 @@ func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
 // ordered set without gaps or overlap, and an offset past the end is empty.
 func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 	const n = 7
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	for i := 0; i < n; i++ {
 		// Zero-padded ids so lexical id order is stable and predictable.
 		seedGrant(t, s, "g-"+itoa2(i), "acme")
@@ -608,6 +761,9 @@ func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 // non-positive limit falls back to the default page size.
 func testListGrantsPageMaxPageSize(t *testing.T, s model.Storage) {
 	total := model.MaxGrantPageSize + 5
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	for i := 0; i < total; i++ {
 		seedGrant(t, s, "g-"+itoa2(i), "acme")
 	}
@@ -661,6 +817,11 @@ func testGrantsForSubjects(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice", "bob")
+	seedGroups(t, s, "eng")
+	seedRoles(t, s, "admin")
+	seedPermissions(t, s, "p-read")
 	put("g-alice", "acme", model.Subject{Kind: model.SubjectPrincipal, ID: "alice"})
 	put("g-eng", "acme", model.Subject{Kind: model.SubjectGroup, ID: "eng"})
 	put("g-admin", "acme", model.Subject{Kind: model.SubjectRole, ID: "admin"})
@@ -718,6 +879,11 @@ func testGrantsForSubjectsWildcardAccount(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	// The wildcard row needs no account: "*" is a sentinel, not an apt_accounts
+	// row, and seedAccounts passes it through untouched.
+	seedAccounts(t, s, "acme", model.AccountWildcard)
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	put("g-acme", "acme", "account:acme/**")   // account-specific
 	put("g-star", model.AccountWildcard, "**") // spans every account
 
@@ -756,6 +922,7 @@ func testGroupsForPrincipal(t *testing.T, s model.Storage) {
 			t.Fatalf("put group %s: %v", id, err)
 		}
 	}
+	seedPrincipals(t, s, "alice", "bob", "carol")
 	put("eng", "alice", "bob")
 	put("ops", "bob")
 	put("sales", "carol")
@@ -816,6 +983,421 @@ func testTimestampsRoundTrip(t *testing.T, s model.Storage) {
 		t.Fatalf("timestamps not preserved: created %v (want %v), updated %v (want %v)",
 			got.CreatedAt, created, got.UpdatedAt, updated)
 	}
+}
+
+// ---- The stored-instant contract ----
+//
+// Every backend stores an instant as a signed 64-bit count of NANOSECONDS since
+// the Unix epoch, UTC. Three properties follow, and the cases below prove all
+// three on EVERY entity that carries a timestamp, for every backend:
+//
+//  1. The zero time.Time is "unset" and round-trips as the zero time.Time — not
+//     as the Unix epoch, and not by borrowing its sibling column.
+//  2. Precision is exact to the nanosecond. This is the load-bearing property:
+//     it is why the storage layer stores an integer count of nanoseconds instead
+//     of a per-dialect timestamp type (Postgres TIMESTAMPTZ is microsecond
+//     resolution and would silently drop the last three digits).
+//  3. The representable window is a closed contract. Both endpoints round-trip;
+//     one nanosecond outside either endpoint is refused with
+//     APERTURE_INVALID_INPUT rather than wrapped, clamped, or written as an
+//     overflow value.
+//
+// There is deliberately NO tolerance, rounding, or precision knob anywhere in
+// these comparisons. A conformance suite that compares instants approximately
+// stops proving the backends agree, which is the only thing it exists to do.
+// storage/storagetest/contract_test.go parses this file and enforces that.
+
+// storableMin and storableMax are the endpoints of the int64-nanosecond window.
+//
+// They are written out as literals rather than read back from
+// storage/storagetime on purpose: the conformance suite states the contract
+// independently of the code that implements it. If the suite derived the bounds
+// from the implementation, a wrong bound would make the suite agree with itself.
+var (
+	storableMin = time.Date(1677, 9, 21, 0, 12, 43, 145224192, time.UTC)
+	storableMax = time.Date(2262, 4, 11, 23, 47, 16, 854775807, time.UTC)
+)
+
+// subMicroCreated and subMicroUpdated carry sub-microsecond detail that a
+// microsecond-resolution backend cannot represent. 123456789 truncates to
+// 123456000 and 1 truncates to 0, so either loss is visible rather than subtle.
+var (
+	subMicroCreated = time.Date(2026, 2, 3, 4, 5, 6, 123456789, time.UTC)
+	subMicroUpdated = time.Date(2026, 2, 3, 4, 5, 7, 1, time.UTC)
+)
+
+// inRangeInstant is an ordinary, uncontroversial instant used as the valid half
+// of a pair when the other half is being rejected.
+var inRangeInstant = time.Date(2026, 5, 6, 7, 8, 9, 987654321, time.UTC)
+
+// stampedEntity is one entity that carries a CreatedAt/UpdatedAt pair through
+// the storage contract: a writer that stamps it and a reader that hands the pair
+// back. Every timestamp case walks the whole table, so a backend cannot satisfy
+// the contract on some entities and quietly miss others — which is exactly the
+// shape the bug takes when a new entity's write path forgets to encode.
+type stampedEntity struct {
+	name string
+	put  func(s model.Storage, created, updated time.Time) error
+	get  func(s model.Storage) (created, updated time.Time, err error)
+}
+
+// stampedEntities lists every entity in model.Storage with a CreatedAt/UpdatedAt
+// pair. Adding a stamped entity to the model means adding it here; the table is
+// the suite's definition of "every entity".
+//
+// Each entity uses a distinct identity and is otherwise minimally valid, so the
+// only thing a case can fail on is its timestamps.
+func stampedEntities() []stampedEntity {
+	return []stampedEntity{
+		{
+			name: "Account",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutAccount(ctx(), model.Account{
+					ID: "acme", Name: "Acme Corp", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				a, err := s.GetAccount(ctx(), "acme")
+				return a.CreatedAt, a.UpdatedAt, err
+			},
+		},
+		{
+			name: "Membership",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutMembership(ctx(), model.Membership{
+					PrincipalID: "alice", AccountID: "acme", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				m, err := s.GetMembership(ctx(), "alice", "acme")
+				return m.CreatedAt, m.UpdatedAt, err
+			},
+		},
+		{
+			name: "ObjectType",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutObjectType(ctx(), model.ObjectType{
+					Name: "widget", Actions: []string{"read"}, CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				ot, err := s.GetObjectType(ctx(), "widget")
+				return ot.CreatedAt, ot.UpdatedAt, err
+			},
+		},
+		{
+			name: "Permission",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutPermission(ctx(), model.Permission{
+					ID: "p-stamp", ObjectType: "document", Action: "read",
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				p, err := s.GetPermission(ctx(), "p-stamp")
+				return p.CreatedAt, p.UpdatedAt, err
+			},
+		},
+		{
+			name: "Principal",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutPrincipal(ctx(), model.Principal{
+					ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				p, err := s.GetPrincipal(ctx(), "alice")
+				return p.CreatedAt, p.UpdatedAt, err
+			},
+		},
+		{
+			name: "Role",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutRole(ctx(), model.Role{
+					ID: "r-admin", Name: "Administrator", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				r, err := s.GetRole(ctx(), "r-admin")
+				return r.CreatedAt, r.UpdatedAt, err
+			},
+		},
+		{
+			name: "Group",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutGroup(ctx(), model.Group{
+					ID: "eng", Name: "Engineering", CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				g, err := s.GetGroup(ctx(), "eng")
+				return g.CreatedAt, g.UpdatedAt, err
+			},
+		},
+		{
+			name: "Grant",
+			put: func(s model.Storage, c, u time.Time) error {
+				return s.PutGrant(ctx(), model.Grant{
+					ID: "g-stamp", AccountID: "acme",
+					Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+					PermissionID: "p-read", Object: "**", Effect: model.EffectAllow,
+					CreatedAt: c, UpdatedAt: u,
+				})
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				g, err := s.GetGrant(ctx(), "g-stamp")
+				return g.CreatedAt, g.UpdatedAt, err
+			},
+		},
+		{
+			name: "Template",
+			put: func(s model.Storage, c, u time.Time) error {
+				tpl := sampleTemplate("onboard", 1)
+				tpl.CreatedAt, tpl.UpdatedAt = c, u
+				return s.PutTemplate(ctx(), tpl)
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				tpl, err := s.GetTemplate(ctx(), "onboard", 1)
+				return tpl.CreatedAt, tpl.UpdatedAt, err
+			},
+		},
+		{
+			name: "Rule",
+			put: func(s model.Storage, c, u time.Time) error {
+				r := sampleRule("public-only")
+				r.CreatedAt, r.UpdatedAt = c, u
+				return s.PutRule(ctx(), r)
+			},
+			get: func(s model.Storage) (time.Time, time.Time, error) {
+				r, err := s.GetRule(ctx(), "public-only")
+				return r.CreatedAt, r.UpdatedAt, err
+			},
+		},
+	}
+}
+
+// sameInstant asserts that a stored instant came back EXACTLY as it went in.
+// The comparison is time.Time.Equal on the instant — no tolerance, no rounding,
+// no truncation. A backend whose column cannot hold nanoseconds fails here.
+func sameInstant(t *testing.T, field string, got, want time.Time) {
+	t.Helper()
+	if got.Equal(want) {
+		return
+	}
+	t.Fatalf("%s did not survive the round trip exactly:\n got  %s (nanosecond field %d)\n want %s (nanosecond field %d)\n"+
+		"Stored instants are int64 nanoseconds; a microsecond-resolution column "+
+		"(Postgres TIMESTAMPTZ, for one) fails exactly here. Fix the backend — "+
+		"do not add tolerance to this comparison.",
+		field,
+		got.UTC().Format(time.RFC3339Nano), got.Nanosecond(),
+		want.UTC().Format(time.RFC3339Nano), want.Nanosecond())
+}
+
+// testTimestampUnsetRoundTrip proves the zero mapping on every entity: the zero
+// time.Time is written as "unset" and read back as the zero time.Time. The
+// failure this catches is a NOT NULL column defaulting to 0 and decoding as the
+// Unix epoch, which would turn "never stamped" into "stamped in 1970".
+func testTimestampUnsetRoundTrip(t *testing.T, s model.Storage) {
+	seedStampedEntityReferents(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			// Both unset.
+			if err := e.put(s, time.Time{}, time.Time{}); err != nil {
+				t.Fatalf("put with unset stamps: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			for _, f := range []struct {
+				name string
+				got  time.Time
+			}{{"CreatedAt", created}, {"UpdatedAt", updated}} {
+				if !f.got.IsZero() {
+					t.Fatalf("unset %s read back as %s, want the zero time. "+
+						"An unset column must decode to time.Time{}, never to the Unix epoch.",
+						f.name, f.got.UTC().Format(time.RFC3339Nano))
+				}
+			}
+
+			// Half set: an unset column must not borrow its sibling's value, and
+			// a set column must not be dragged to zero by the unset one.
+			if err := e.put(s, inRangeInstant, time.Time{}); err != nil {
+				t.Fatalf("put with one unset stamp: %v", err)
+			}
+			created, updated, err = e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt", created, inRangeInstant)
+			if !updated.IsZero() {
+				t.Fatalf("unset UpdatedAt read back as %s, want the zero time",
+					updated.UTC().Format(time.RFC3339Nano))
+			}
+		})
+	}
+}
+
+// testTimestampSubMicrosecondPrecision is the load-bearing case of this suite's
+// time contract: sub-microsecond detail survives a round trip EXACTLY, on every
+// entity, on every backend. Without it a contributor could swap in a
+// microsecond-resolution column and the suite would stay green.
+func testTimestampSubMicrosecondPrecision(t *testing.T, s model.Storage) {
+	seedStampedEntityReferents(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			if err := e.put(s, subMicroCreated, subMicroUpdated); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt", created, subMicroCreated)
+			sameInstant(t, "UpdatedAt", updated, subMicroUpdated)
+		})
+	}
+}
+
+// testTimestampRangeBoundaries proves both endpoints of the representable window
+// are storable, not merely "close enough". The endpoints are the two instants a
+// clamping or overflowing encoder is most likely to mangle.
+func testTimestampRangeBoundaries(t *testing.T, s model.Storage) {
+	seedStampedEntityReferents(t, s)
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			if err := e.put(s, storableMin, storableMax); err != nil {
+				t.Fatalf("put at the window endpoints: %v", err)
+			}
+			created, updated, err := e.get(s)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			sameInstant(t, "CreatedAt (window minimum)", created, storableMin)
+			sameInstant(t, "UpdatedAt (window maximum)", updated, storableMax)
+		})
+	}
+}
+
+// testTimestampOutOfRangeRefused proves the window is closed on both sides, for
+// both stamps, on every entity: one nanosecond past either endpoint is refused
+// with APERTURE_INVALID_INPUT and nothing is written. The storable range is a
+// property of the storage CONTRACT, not of one dialect's encoding — a backend
+// that keeps a time.Time in memory must refuse the same instants a backend that
+// encodes to an integer refuses, or the two have silently diverged.
+func testTimestampOutOfRangeRefused(t *testing.T, s model.Storage) {
+	// Only the object type, NOT the full referent set: this case asserts that a
+	// refused write leaves NOTHING behind, so seeding an entity it names — the
+	// principal "alice", say — would make that assertion vacuous. Nothing here is
+	// ever written successfully, so no parent row is needed; the object type is
+	// present only so PutPermission reaches validation instead of stopping at
+	// NOT_FOUND on the type.
+	seedDocumentType(t, s)
+	beforeMin := storableMin.Add(-time.Nanosecond)
+	afterMax := storableMax.Add(time.Nanosecond)
+
+	for _, e := range stampedEntities() {
+		t.Run(e.name, func(t *testing.T) {
+			for _, c := range []struct {
+				label            string
+				created, updated time.Time
+			}{
+				{"CreatedAtBeforeWindow", beforeMin, inRangeInstant},
+				{"CreatedAtAfterWindow", afterMax, inRangeInstant},
+				{"UpdatedAtBeforeWindow", inRangeInstant, beforeMin},
+				{"UpdatedAtAfterWindow", inRangeInstant, afterMax},
+			} {
+				t.Run(c.label, func(t *testing.T) {
+					mustCode(t, e.put(s, c.created, c.updated), aerr.APERTURE_INVALID_INPUT)
+				})
+			}
+			// A refused write must leave nothing behind: the rejection happens
+			// before any row is touched, never as a partial or clamped write.
+			_, _, err := e.get(s)
+			mustCode(t, err, aerr.APERTURE_NOT_FOUND)
+		})
+	}
+}
+
+// testAuditTimestampContract holds the audit trail's occurred_at to the same
+// contract as the entity stamps. It is a separate case only because an audit
+// event carries one instant rather than a CreatedAt/UpdatedAt pair — the rules
+// it is held to are identical.
+func testAuditTimestampContract(t *testing.T, s model.Storage) {
+	events := []struct {
+		id   string
+		when time.Time
+	}{
+		{"a-submicro", subMicroCreated},
+		{"a-min", storableMin},
+		{"a-max", storableMax},
+	}
+	for _, e := range events {
+		when := e.when
+		if err := s.AppendAudit(ctx(), mkAudit(e.id, 0, func(ev *model.AuditEvent) {
+			ev.Timestamp = when
+		})); err != nil {
+			t.Fatalf("append %s: %v", e.id, err)
+		}
+	}
+	got := mustQuery(t, s, model.AuditFilter{})
+	for _, e := range events {
+		ev, ok := findAudit(got, e.id)
+		if !ok {
+			t.Fatalf("appended event %s is missing from the query result", e.id)
+		}
+		sameInstant(t, "AuditEvent.Timestamp of "+e.id, ev.Timestamp, e.when)
+	}
+
+	// The zero Timestamp is "unset" and reads back as the zero time.
+	if err := s.AppendAudit(ctx(), mkAudit("a-unset", 0, func(ev *model.AuditEvent) {
+		ev.Timestamp = time.Time{}
+	})); err != nil {
+		t.Fatalf("append unset timestamp: %v", err)
+	}
+	ev, ok := findAudit(mustQuery(t, s, model.AuditFilter{}), "a-unset")
+	if !ok {
+		t.Fatalf("appended event a-unset is missing from the query result")
+	}
+	if !ev.Timestamp.IsZero() {
+		t.Fatalf("unset AuditEvent.Timestamp read back as %s, want the zero time",
+			ev.Timestamp.UTC().Format(time.RFC3339Nano))
+	}
+
+	// One nanosecond outside either endpoint is refused, on the write path...
+	for _, when := range []time.Time{
+		storableMin.Add(-time.Nanosecond),
+		storableMax.Add(time.Nanosecond),
+	} {
+		out := when
+		mustCode(t, s.AppendAudit(ctx(), mkAudit("a-outside", 0, func(ev *model.AuditEvent) {
+			ev.Timestamp = out
+		})), aerr.APERTURE_INVALID_INPUT)
+	}
+	if _, ok := findAudit(mustQuery(t, s, model.AuditFilter{}), "a-outside"); ok {
+		t.Fatalf("a refused AppendAudit left an event behind")
+	}
+
+	// ...and on the query path, where the same bound is a filter argument.
+	mustCode(t, func() error {
+		_, err := s.QueryAudit(ctx(), model.AuditFilter{Since: storableMin.Add(-time.Nanosecond)})
+		return err
+	}(), aerr.APERTURE_INVALID_INPUT)
+	mustCode(t, func() error {
+		_, err := s.QueryAudit(ctx(), model.AuditFilter{Until: storableMax.Add(time.Nanosecond)})
+		return err
+	}(), aerr.APERTURE_INVALID_INPUT)
+}
+
+// findAudit locates one event by id in a query result.
+func findAudit(evs []model.AuditEvent, id string) (model.AuditEvent, bool) {
+	for _, ev := range evs {
+		if ev.ID == id {
+			return ev, true
+		}
+	}
+	return model.AuditEvent{}, false
 }
 
 // ---- Audit trail ----
@@ -1237,6 +1819,9 @@ func normalizeJSON(t *testing.T, raw []byte) []byte {
 // ---- Transactional apply ----
 
 func testAtomicCommit(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	mkGrant := func(id string) model.Grant {
 		return model.Grant{
 			ID: id, AccountID: "acme",
@@ -1279,6 +1864,9 @@ func testAtomicCommit(t *testing.T, s model.Storage) {
 // BOTH backends. It covers two failure modes: a write error mid-batch, and an
 // explicit error returned by fn after a successful write.
 func testAtomicRollback(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
+	seedPermissions(t, s, "p-read")
 	keep := model.Grant{
 		ID: "g-keep", AccountID: "acme",
 		Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
@@ -1333,12 +1921,854 @@ func testAtomicRollback(t *testing.T, s model.Storage) {
 	}
 }
 
+// ---- Referential integrity ----
+//
+// Aperture's storage layer refuses to orphan a row. Twelve relationship columns
+// carry that guarantee; NINE of them are declared foreign keys in
+// storage/sqlite/schema.sql (six ON DELETE RESTRICT, three ON DELETE CASCADE)
+// and THREE cannot be, because the value they hold is not always a row
+// reference — apt_grants.(subject_kind, subject_id) is polymorphic, and the two
+// account_id columns carry the reserved model.AccountWildcard sentinel. Those
+// three are enforced in Go instead, on identical terms.
+//
+// The cases below are the proof that EVERY backend does all twelve, in BOTH
+// directions: a write may not name a parent that does not exist, and a delete is
+// either refused (RESTRICT) or takes its children with it (CASCADE). Until they
+// existed the conformance suite was green only because its fixtures had been
+// made referentially complete — nothing asserted a refusal, so a backend that
+// enforced nothing at all passed the whole suite.
+//
+// Everything here is expressed through model.Storage alone. There is no table
+// count, no PRAGMA, no SQL: a CASCADE is observed as "the entity the join row
+// pointed at is now deletable, and a re-created owner starts empty", which is
+// what a caller can actually see and is therefore what the two backends must
+// agree on. The backend-specific mirrors (storage/sqlite/foreign_keys_test.go +
+// integrity_test.go, storage/memory/referential_test.go +
+// sentinel_columns_test.go) keep their sharper, dialect-aware assertions; these
+// are the ones that must hold identically everywhere.
+//
+// TWO edges name a code other than APERTURE_STORAGE_CONSTRAINT or have no
+// expressible violation at all. Both are pinned below rather than papered over,
+// because "the backends behave the same" is the contract, not "a constraint
+// fires everywhere".
+
+// ON READING ERROR TEXT. The three Go-level checks — and ONLY those three — are
+// additionally asserted on by the edge name their refusal carries (mustNameEdge
+// below). They are hand-duplicated Go code in every backend with no compiler,
+// registry, or generator keeping the wording in step, and the message is the only
+// thing that says WHICH edge objected — for the polymorphic subject, which TABLE
+// its kind selected. A case that merely saw APERTURE_STORAGE_CONSTRAINT could be
+// passing for an entirely different reason. The cost is real and is accepted
+// knowingly: these cases are coupled to that wording, and a backend that renders
+// it differently is a divergence this suite will report.
+//
+// The nine SQL edges are deliberately NOT text-asserted. Their refusal is
+// rendered by a driver in one backend and by hand in another, so the wording is
+// not, and must not become, part of the contract.
+
+// referentialWorld builds one referentially complete world in a fresh store: an
+// object type with a permission, a role bundling that permission, two principals
+// (alice, who is grouped and holds the role; bob, who is only an account
+// member), a group, two memberships, and a grant. Every RESTRICT edge has at
+// least one live child in it, so each case below can clear the edges it is not
+// testing and leave exactly one relationship holding the delete.
+func referentialWorld(t *testing.T, newStore Factory) model.Storage {
+	t.Helper()
+	s := newStore(t)
+	put := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("seed %s: %v", what, err)
+		}
+	}
+	put("account", s.PutAccount(ctx(), model.Account{ID: "acme", Name: "Acme"}))
+	put("object type", s.PutObjectType(ctx(), model.ObjectType{
+		Name: "document", Actions: []string{"read", "write"},
+	}))
+	put("permission", s.PutPermission(ctx(), model.Permission{
+		ID: "p-read", ObjectType: "document", Action: "read",
+	}))
+	put("role", s.PutRole(ctx(), model.Role{
+		ID: "r-admin", Name: "Admin", PermissionIDs: []string{"p-read"},
+	}))
+	put("principal alice", s.PutPrincipal(ctx(), model.Principal{
+		ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice", RoleIDs: []string{"r-admin"},
+	}))
+	put("principal bob", s.PutPrincipal(ctx(), model.Principal{
+		ID: "bob", Kind: model.PrincipalUser, Identity: "user:bob",
+	}))
+	put("group", s.PutGroup(ctx(), model.Group{
+		ID: "eng", Name: "Engineering", MemberPrincipalIDs: []string{"alice"},
+	}))
+	put("membership alice", s.PutMembership(ctx(), model.Membership{PrincipalID: "alice", AccountID: "acme"}))
+	put("membership bob", s.PutMembership(ctx(), model.Membership{PrincipalID: "bob", AccountID: "acme"}))
+	put("grant", s.PutGrant(ctx(), grantCitingPermission("p-read")))
+	return s
+}
+
+// grantCitingPermission is referentialWorld's grant, parameterized on the
+// permission it cites so a case can aim it at one that does not exist.
+func grantCitingPermission(permissionID string) model.Grant {
+	return model.Grant{
+		ID: "g1", AccountID: "acme",
+		Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+		PermissionID: permissionID, Object: "account:acme/**", Effect: model.EffectAllow,
+	}
+}
+
+// mustConstraint asserts an operation was refused with
+// APERTURE_STORAGE_CONSTRAINT specifically, and returns the error so a caller
+// can go on to inspect it. The code matters as much as the refusal:
+// APERTURE_STORAGE would tell a caller "the backend broke, maybe retry", which
+// is the opposite of what happened, and APERTURE_NOT_FOUND would say the row was
+// never there.
+func mustConstraint(t *testing.T, what string, err error) error {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: succeeded, want refusal with %s", what, aerr.APERTURE_STORAGE_CONSTRAINT)
+	}
+	if got := aerr.CodeOf(err); got != aerr.APERTURE_STORAGE_CONSTRAINT {
+		t.Fatalf("%s: got code %s (%v), want %s", what, got, err, aerr.APERTURE_STORAGE_CONSTRAINT)
+	}
+	return err
+}
+
+// mustNameEdge asserts a Go-level refusal names the edge that objected. See "ON
+// READING ERROR TEXT" above for why only those three refusals are read this way.
+func mustNameEdge(t *testing.T, what string, err error, edge string) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), edge) {
+		t.Fatalf("%s: refusal does not name %s, so it may have been refused for another "+
+			"reason entirely: %v", what, edge, err)
+	}
+}
+
+// mustNotExist asserts a read came back APERTURE_NOT_FOUND — the shape of "the
+// refused write left nothing behind".
+func mustNotExist(t *testing.T, what string, err error) {
+	t.Helper()
+	if got := aerr.CodeOf(err); got != aerr.APERTURE_NOT_FOUND {
+		t.Fatalf("%s: got code %s (%v), want %s — the refused write was applied anyway",
+			what, got, err, aerr.APERTURE_NOT_FOUND)
+	}
+}
+
+// mustExist asserts a read succeeded — the shape of "the refused delete removed
+// nothing".
+func mustExist(t *testing.T, what string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("%s: %v — the refused delete was applied anyway", what, err)
+	}
+}
+
+// testReferentialWriteRefusesAnUnknownParent covers direction one: a child row
+// may not name a parent that was never written.
+//
+// FIVE of the nine SQL edges are reachable this way. The other four are pinned
+// here too, as the different answers they are:
+//
+//   - apt_permissions.object_type answers APERTURE_NOT_FOUND, not
+//     APERTURE_STORAGE_CONSTRAINT, in every backend. PutPermission must READ the
+//     object type anyway to validate the action verb against its declared set, so
+//     the lookup misses before the reference is ever offered to the constraint.
+//     That is parity of observable behaviour, which is the thing this suite
+//     exists to hold; "always a constraint" would be a different, weaker claim.
+//   - apt_principal_roles.principal_id, apt_role_permissions.role_id and
+//     apt_group_members.group_id — the three CASCADE edges — have no write
+//     direction to violate AT ALL. Their join rows are only ever written as part
+//     of the owner record itself (a principal's RoleIDs, a role's PermissionIDs,
+//     a group's MemberPrincipalIDs), so a row naming an owner that does not exist
+//     is not a value model.Storage can express. Their whole behaviour is the
+//     delete direction, and it is in
+//     testReferentialCascadeRemovesTheJoinRowsWithTheirOwner.
+func testReferentialWriteRefusesAnUnknownParent(t *testing.T, newStore Factory) {
+	t.Run("apt_memberships.principal_id", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "membership naming an unknown principal",
+			s.PutMembership(ctx(), model.Membership{PrincipalID: "ghost", AccountID: "acme"}))
+		_, err := s.GetMembership(ctx(), "ghost", "acme")
+		mustNotExist(t, "get the refused membership", err)
+	})
+
+	t.Run("apt_group_members.principal_id", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "group naming an unknown member",
+			s.PutGroup(ctx(), model.Group{
+				ID: "phantoms", Name: "Phantoms", MemberPrincipalIDs: []string{"ghost"},
+			}))
+		_, err := s.GetGroup(ctx(), "phantoms")
+		mustNotExist(t, "get the refused group", err)
+	})
+
+	t.Run("apt_principal_roles.role_id", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "principal holding an unknown role",
+			s.PutPrincipal(ctx(), model.Principal{
+				ID: "carol", Kind: model.PrincipalUser, Identity: "user:carol",
+				RoleIDs: []string{"r-nonexistent"},
+			}))
+		_, err := s.GetPrincipal(ctx(), "carol")
+		mustNotExist(t, "get the refused principal", err)
+	})
+
+	t.Run("apt_role_permissions.permission_id", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "role bundling an unknown permission",
+			s.PutRole(ctx(), model.Role{
+				ID: "r-ghost", Name: "Ghost", PermissionIDs: []string{"p-nonexistent"},
+			}))
+		_, err := s.GetRole(ctx(), "r-ghost")
+		mustNotExist(t, "get the refused role", err)
+	})
+
+	t.Run("apt_grants.permission_id", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "grant citing an unknown permission",
+			s.PutGrant(ctx(), model.Grant{
+				ID: "g-ghost-permission", AccountID: "acme",
+				Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+				PermissionID: "no-such-permission", Object: "account:acme/**", Effect: model.EffectAllow,
+			}))
+		_, err := s.GetGrant(ctx(), "g-ghost-permission")
+		mustNotExist(t, "get the refused grant", err)
+	})
+
+	// The documented exception, asserted as what it is.
+	t.Run("apt_permissions.object_type answers NOT_FOUND, identically everywhere", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		err := s.PutPermission(ctx(), model.Permission{
+			ID: "p-x", ObjectType: "no-such-type", Action: "read",
+		})
+		mustCode(t, err, aerr.APERTURE_NOT_FOUND)
+		_, err = s.GetPermission(ctx(), "p-x")
+		mustNotExist(t, "get the refused permission", err)
+	})
+}
+
+// testReferentialRefusedWriteIsAllOrNothing pins the ordering requirement behind
+// every refusal above: the check runs before anything is written, so a list whose
+// LAST entry is bad does not leave the earlier entries — or the entity itself —
+// behind. A SQL backend gets this from the transaction its upsert runs in; a
+// backend without transactions has to get it by checking first, and that is a
+// property an ordinary-looking edit can quietly lose.
+func testReferentialRefusedWriteIsAllOrNothing(t *testing.T, newStore Factory) {
+	t.Run("a new principal whose second role is a ghost", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "principal with one good and one unknown role",
+			s.PutPrincipal(ctx(), model.Principal{
+				ID: "carol", Kind: model.PrincipalUser, Identity: "user:carol",
+				RoleIDs: []string{"r-admin", "r-ghost"},
+			}))
+		_, err := s.GetPrincipal(ctx(), "carol")
+		mustNotExist(t, "get the partially written principal", err)
+	})
+
+	t.Run("re-saving an existing entity with a bad reference leaves it untouched", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "re-save alice holding an unknown role",
+			s.PutPrincipal(ctx(), model.Principal{
+				ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+				DisplayName: "Alice Renamed", RoleIDs: []string{"r-ghost"},
+			}))
+		got, err := s.GetPrincipal(ctx(), "alice")
+		if err != nil {
+			t.Fatalf("get alice: %v", err)
+		}
+		if got.DisplayName != "" || len(got.RoleIDs) != 1 || got.RoleIDs[0] != "r-admin" {
+			t.Fatalf("the refused upsert partially applied: %+v", got)
+		}
+	})
+
+	t.Run("a group whose second member is a ghost", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "group with one good and one unknown member",
+			s.PutGroup(ctx(), model.Group{
+				ID: "eng", Name: "Engineering Renamed",
+				MemberPrincipalIDs: []string{"alice", "ghost"},
+			}))
+		got, err := s.GetGroup(ctx(), "eng")
+		if err != nil {
+			t.Fatalf("get group: %v", err)
+		}
+		if got.Name != "Engineering" || len(got.MemberPrincipalIDs) != 1 {
+			t.Fatalf("the refused group upsert partially applied: %+v", got)
+		}
+	})
+
+	t.Run("a refused batch rolls the whole Atomic back", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "an atomic batch citing an unknown permission",
+			s.Atomic(ctx(), func(tx model.Storage) error {
+				if err := tx.PutPrincipal(ctx(), model.Principal{
+					ID: "carol", Kind: model.PrincipalUser, Identity: "user:carol",
+				}); err != nil {
+					return err
+				}
+				return tx.PutGrant(ctx(), model.Grant{
+					ID: "g-carol", AccountID: "acme",
+					Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "carol"},
+					PermissionID: "p-ghost", Object: "account:acme/**", Effect: model.EffectAllow,
+				})
+			}))
+		_, err := s.GetPrincipal(ctx(), "carol")
+		mustNotExist(t, "carol survived the rolled-back batch", err)
+		_, err = s.GetGrant(ctx(), "g-carol")
+		mustNotExist(t, "the refused grant survived the rolled-back batch", err)
+	})
+}
+
+// testReferentialRestrictRefusesADeleteThatWouldOrphan covers the six
+// ON DELETE RESTRICT edges. Every one of these deletes SUCCEEDED before the keys
+// landed, leaving the child rows pointing at nothing.
+//
+// Each case first clears the edges it is not testing, so exactly one
+// relationship is left to refuse — which means the case fails when THAT edge
+// stops being enforced, not merely when some edge does.
+func testReferentialRestrictRefusesADeleteThatWouldOrphan(t *testing.T, newStore Factory) {
+	t.Run("apt_memberships.principal_id: a principal still in an account", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// bob is a member of acme and nothing else: no group holds him, no grant
+		// names him, he holds no role. The membership edge is the only one that can
+		// refuse this, which is why he is seeded separately.
+		mustConstraint(t, "delete a member principal", s.DeletePrincipal(ctx(), "bob"))
+		_, err := s.GetPrincipal(ctx(), "bob")
+		mustExist(t, "get bob after the refusal", err)
+	})
+
+	t.Run("apt_group_members.principal_id: a principal still in a group", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Clear alice's OTHER pins — her account membership, and the grant that
+		// names her as its subject — so the group member row is all that is left.
+		if err := s.DeleteMembership(ctx(), "alice", "acme"); err != nil {
+			t.Fatalf("free the membership: %v", err)
+		}
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		mustConstraint(t, "delete a grouped principal", s.DeletePrincipal(ctx(), "alice"))
+		_, err := s.GetPrincipal(ctx(), "alice")
+		mustExist(t, "get alice after the refusal", err)
+	})
+
+	t.Run("apt_principal_roles.role_id: a role a principal still holds", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Nothing else points at r-admin: the grant names alice, and the role's own
+		// permission bundle is the CASCADE side.
+		mustConstraint(t, "delete an assigned role", s.DeleteRole(ctx(), "r-admin"))
+		_, err := s.GetRole(ctx(), "r-admin")
+		mustExist(t, "get the role after the refusal", err)
+	})
+
+	t.Run("apt_role_permissions.permission_id: a permission a role still bundles", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Revoke the grant so the role bundle is the only thing citing p-read.
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		mustConstraint(t, "delete a bundled permission", s.DeletePermission(ctx(), "p-read"))
+		_, err := s.GetPermission(ctx(), "p-read")
+		mustExist(t, "get the permission after the refusal", err)
+	})
+
+	t.Run("apt_grants.permission_id: a permission a grant still cites", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Strip the role's bundle so the GRANT is the only thing citing p-read.
+		if err := s.PutRole(ctx(), model.Role{ID: "r-admin", Name: "Admin"}); err != nil {
+			t.Fatalf("re-save the role without its bundle: %v", err)
+		}
+		mustConstraint(t, "delete a cited permission", s.DeletePermission(ctx(), "p-read"))
+		_, err := s.GetPermission(ctx(), "p-read")
+		mustExist(t, "get the permission after the refusal", err)
+	})
+
+	t.Run("apt_permissions.object_type: an object type a permission hangs off", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustConstraint(t, "delete a referenced object type", s.DeleteObjectType(ctx(), "document"))
+		_, err := s.GetObjectType(ctx(), "document")
+		mustExist(t, "get the object type after the refusal", err)
+	})
+
+	// Anti-conflation: the checks may not turn a row that was never there into a
+	// constraint refusal. A missing parent is still NOT_FOUND.
+	t.Run("a delete of something absent is still NOT_FOUND", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		mustCode(t, s.DeletePrincipal(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeleteRole(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeletePermission(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeleteObjectType(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeleteGroup(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeleteAccount(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+		mustCode(t, s.DeleteGrant(ctx(), "ghost"), aerr.APERTURE_NOT_FOUND)
+	})
+}
+
+// testReferentialCascadeRemovesTheJoinRowsWithTheirOwner covers the three
+// ON DELETE CASCADE edges — the ones where an entity owns its own join rows and
+// deleting it deletes them.
+//
+// A cascade is invisible from model.Storage as such: there is no row count to
+// read. So each case proves it by its CONSEQUENCE, which is the same thing a
+// caller would notice — the entity the join row pointed at becomes deletable,
+// which it could not be if a stale row were still lying around for a RESTRICT
+// check to find, and a re-created owner starts with an empty list rather than
+// inheriting the dead one. Each case first asserts the RESTRICT refusal that
+// proves the join row was really there, so a backend that never wrote it cannot
+// pass by having nothing to cascade.
+func testReferentialCascadeRemovesTheJoinRowsWithTheirOwner(t *testing.T, newStore Factory) {
+	t.Run("apt_principal_roles.principal_id: a principal owns its role assignments", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// The join row exists: alice holds r-admin, so the role is undeletable.
+		mustConstraint(t, "delete the role alice holds", s.DeleteRole(ctx(), "r-admin"))
+
+		// Free alice's RESTRICT edges, then delete her.
+		if err := s.DeleteMembership(ctx(), "alice", "acme"); err != nil {
+			t.Fatalf("free the membership: %v", err)
+		}
+		if err := s.PutGroup(ctx(), model.Group{ID: "eng", Name: "Engineering"}); err != nil {
+			t.Fatalf("empty the group: %v", err)
+		}
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		if err := s.DeletePrincipal(ctx(), "alice"); err != nil {
+			t.Fatalf("delete principal: %v", err)
+		}
+
+		// The cascade: her role assignment went with her, so the role is free.
+		if err := s.DeleteRole(ctx(), "r-admin"); err != nil {
+			t.Fatalf("alice's role assignment outlived her, so the role is still pinned: %v", err)
+		}
+		// And a principal re-created under the same id does not inherit it.
+		if err := s.PutPrincipal(ctx(), model.Principal{
+			ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+		}); err != nil {
+			t.Fatalf("re-create alice: %v", err)
+		}
+		got, err := s.GetPrincipal(ctx(), "alice")
+		if err != nil {
+			t.Fatalf("get the re-created alice: %v", err)
+		}
+		if len(got.RoleIDs) != 0 {
+			t.Fatalf("the re-created alice inherited role assignments %v from the deleted principal", got.RoleIDs)
+		}
+	})
+
+	t.Run("apt_role_permissions.role_id: a role owns its permission bundle", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Revoke the grant so the bundle is the only thing citing p-read; the
+		// refusal then proves the bundle row is really there.
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		mustConstraint(t, "delete the bundled permission", s.DeletePermission(ctx(), "p-read"))
+
+		// Drop alice's assignment so the role itself is deletable.
+		if err := s.PutPrincipal(ctx(), model.Principal{
+			ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+		}); err != nil {
+			t.Fatalf("drop alice's role assignment: %v", err)
+		}
+		if err := s.DeleteRole(ctx(), "r-admin"); err != nil {
+			t.Fatalf("delete role: %v", err)
+		}
+
+		// The cascade: the bundle row went with the role.
+		if err := s.DeletePermission(ctx(), "p-read"); err != nil {
+			t.Fatalf("the role's bundle outlived the role, so the permission is still pinned: %v", err)
+		}
+		// The permission was the object type's only child, so it is free too.
+		if err := s.DeleteObjectType(ctx(), "document"); err != nil {
+			t.Fatalf("delete object type: %v", err)
+		}
+		// A role re-created under the same id starts with an empty bundle.
+		if err := s.PutObjectType(ctx(), model.ObjectType{
+			Name: "document", Actions: []string{"read", "write"},
+		}); err != nil {
+			t.Fatalf("re-create the object type: %v", err)
+		}
+		if err := s.PutRole(ctx(), model.Role{ID: "r-admin", Name: "Admin"}); err != nil {
+			t.Fatalf("re-create the role: %v", err)
+		}
+		got, err := s.GetRole(ctx(), "r-admin")
+		if err != nil {
+			t.Fatalf("get the re-created role: %v", err)
+		}
+		if len(got.PermissionIDs) != 0 {
+			t.Fatalf("the re-created role inherited permissions %v from the deleted role", got.PermissionIDs)
+		}
+	})
+
+	t.Run("apt_group_members.group_id: a group owns its member rows", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Free alice's other pins so the group member row is the only one left.
+		if err := s.DeleteMembership(ctx(), "alice", "acme"); err != nil {
+			t.Fatalf("free the membership: %v", err)
+		}
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		mustConstraint(t, "delete a grouped principal", s.DeletePrincipal(ctx(), "alice"))
+
+		// Nothing points AT a group, so this delete is never refused.
+		if err := s.DeleteGroup(ctx(), "eng"); err != nil {
+			t.Fatalf("delete group: %v", err)
+		}
+
+		// The cascade, seen two ways: the membership edge is gone from the read
+		// path, and alice is deletable again.
+		if gs, err := s.GroupsForPrincipal(ctx(), "alice"); err != nil || len(gs) != 0 {
+			t.Fatalf("GroupsForPrincipal(alice) = %v, %v — the member rows outlived the group", gs, err)
+		}
+		if err := s.DeletePrincipal(ctx(), "alice"); err != nil {
+			t.Fatalf("the group's member row outlived the group, so alice is still pinned: %v", err)
+		}
+	})
+}
+
+// ---- The three columns that carry no foreign key ----
+
+// testGrantSubjectMustExistInTheTableItsKindSelects is CHECK 2's write half:
+// apt_grants.(subject_kind, subject_id) is POLYMORPHIC — the kind picks which of
+// apt_principals, apt_roles or apt_groups the id must exist in — and no
+// single-table foreign key can express that, in SQLite or in Postgres. Every
+// backend therefore dispatches on the kind in Go, and this is where they are held
+// to the same dispatch.
+func testGrantSubjectMustExistInTheTableItsKindSelects(t *testing.T, newStore Factory) {
+	t.Run("an unknown subject is refused, per kind", func(t *testing.T) {
+		for _, tc := range []struct {
+			kind  model.SubjectKind
+			table string
+		}{
+			{model.SubjectPrincipal, "apt_principals"},
+			{model.SubjectRole, "apt_roles"},
+			{model.SubjectGroup, "apt_groups"},
+		} {
+			t.Run(string(tc.kind), func(t *testing.T) {
+				s := referentialWorld(t, newStore)
+				err := s.PutGrant(ctx(), model.Grant{
+					ID: "g-ghost-subject", AccountID: "acme",
+					Subject:      model.Subject{Kind: tc.kind, ID: "ghost"},
+					PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
+				})
+				mustConstraint(t, "grant naming an unknown "+string(tc.kind), err)
+				mustNameEdge(t, "grant naming an unknown "+string(tc.kind), err, tc.table)
+				_, err = s.GetGrant(ctx(), "g-ghost-subject")
+				mustNotExist(t, "get the refused grant", err)
+			})
+		}
+	})
+
+	// The dispatch is real, not "does this id exist anywhere?". The world holds a
+	// principal "alice", a role "r-admin" and a group "eng"; naming one of them
+	// under ANOTHER kind must be refused. A backend that searched every table
+	// would accept all three and hand the engine a grant whose subject can never
+	// resolve.
+	t.Run("an id from the wrong table is refused", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			kind  model.SubjectKind
+			id    string
+			table string
+		}{
+			{"a principal id under kind=role", model.SubjectRole, "alice", "apt_roles"},
+			{"a role id under kind=group", model.SubjectGroup, "r-admin", "apt_groups"},
+			{"a group id under kind=principal", model.SubjectPrincipal, "eng", "apt_principals"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := referentialWorld(t, newStore)
+				err := s.PutGrant(ctx(), model.Grant{
+					ID: "g-crossed", AccountID: "acme",
+					Subject:      model.Subject{Kind: tc.kind, ID: tc.id},
+					PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
+				})
+				mustConstraint(t, tc.name, err)
+				mustNameEdge(t, tc.name, err, tc.table)
+			})
+		}
+	})
+
+	// Anti-vacuity for both blocks above: each kind, pointed at a real row of its
+	// own table, goes through. Without this a backend that refused every grant
+	// would pass them.
+	t.Run("every valid subject kind is writable", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		for _, tc := range []struct {
+			id  string
+			sub model.Subject
+		}{
+			{"g-p", model.Subject{Kind: model.SubjectPrincipal, ID: "alice"}},
+			{"g-r", model.Subject{Kind: model.SubjectRole, ID: "r-admin"}},
+			{"g-g", model.Subject{Kind: model.SubjectGroup, ID: "eng"}},
+		} {
+			if err := s.PutGrant(ctx(), model.Grant{
+				ID: tc.id, AccountID: "acme", Subject: tc.sub,
+				PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
+			}); err != nil {
+				t.Fatalf("grant %s (%s %q) refused: %v", tc.id, tc.sub.Kind, tc.sub.ID, err)
+			}
+		}
+	})
+}
+
+// testDeletingAGrantSubjectIsRefused is CHECK 2's delete half: a principal, role
+// or group may not be deleted while a grant still names it as its subject. This
+// is the ON DELETE RESTRICT the polymorphic column could not declare, and without
+// it DeletePrincipal leaves grants pointing at nobody — authority no one can read
+// or revoke.
+func testDeletingAGrantSubjectIsRefused(t *testing.T, newStore Factory) {
+	for _, tc := range []struct {
+		name  string
+		kind  model.SubjectKind
+		id    string
+		table string
+		free  func(t *testing.T, s model.Storage)
+		del   func(s model.Storage) error
+	}{
+		{
+			name: "principal", kind: model.SubjectPrincipal, id: "alice", table: "apt_principals",
+			free: func(t *testing.T, s model.Storage) {
+				t.Helper()
+				if err := s.DeleteMembership(ctx(), "alice", "acme"); err != nil {
+					t.Fatalf("free the membership: %v", err)
+				}
+				if err := s.PutGroup(ctx(), model.Group{ID: "eng", Name: "Engineering"}); err != nil {
+					t.Fatalf("empty the group: %v", err)
+				}
+			},
+			del: func(s model.Storage) error { return s.DeletePrincipal(ctx(), "alice") },
+		},
+		{
+			name: "role", kind: model.SubjectRole, id: "r-admin", table: "apt_roles",
+			free: func(t *testing.T, s model.Storage) {
+				t.Helper()
+				// alice holds r-admin; drop the assignment so only the grant pins it.
+				if err := s.PutPrincipal(ctx(), model.Principal{
+					ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice",
+				}); err != nil {
+					t.Fatalf("drop alice's role assignment: %v", err)
+				}
+			},
+			del: func(s model.Storage) error { return s.DeleteRole(ctx(), "r-admin") },
+		},
+		{
+			name: "group", kind: model.SubjectGroup, id: "eng", table: "apt_groups",
+			free: func(t *testing.T, s model.Storage) {},
+			del:  func(s model.Storage) error { return s.DeleteGroup(ctx(), "eng") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := referentialWorld(t, newStore)
+			// Re-point the seeded grant at this subject.
+			if err := s.PutGrant(ctx(), model.Grant{
+				ID: "g1", AccountID: "acme",
+				Subject:      model.Subject{Kind: tc.kind, ID: tc.id},
+				PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
+			}); err != nil {
+				t.Fatalf("re-point the grant: %v", err)
+			}
+			tc.free(t, s)
+
+			what := "delete a " + tc.name + " a grant names"
+			err := tc.del(s)
+			mustConstraint(t, what, err)
+			mustNameEdge(t, what, err, tc.table)
+
+			// The refusal rolled back: repeating it is refused for the same reason,
+			// which it could not be if the first attempt had removed the row.
+			mustConstraint(t, what+" (again)", tc.del(s))
+
+			// Revoke the grant and the subject is free.
+			if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+				t.Fatalf("delete grant: %v", err)
+			}
+			if err := tc.del(s); err != nil {
+				t.Fatalf("nothing names the %s any more, yet: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// testAccountReferenceIsARowOrTheWildcard is CHECK 1's write half, on both
+// columns that carry it: apt_memberships.account_id and apt_grants.account_id
+// must name an apt_accounts row OR be exactly model.AccountWildcard.
+//
+// The wildcard half is the case a NAIVE implementation fails. The obvious check —
+// "does this account exist?", refuse when it does not — refuses "*" too, because
+// "*" is deliberately not an account row and cannot be made one. That would
+// reject every wildcard grant and every wildcard membership: the cross-account
+// super-admin, gone. So the premise is asserted first, and nobody can make this
+// pass by seeding a "*" account instead of writing the rule.
+func testAccountReferenceIsARowOrTheWildcard(t *testing.T, newStore Factory) {
+	t.Run("apt_memberships.account_id refuses an account that does not exist", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		err := s.PutMembership(ctx(), model.Membership{PrincipalID: "alice", AccountID: "ghost-co"})
+		mustConstraint(t, "membership stamped with an unknown account", err)
+		mustNameEdge(t, "membership stamped with an unknown account", err, "apt_memberships.account_id")
+		_, err = s.GetMembership(ctx(), "alice", "ghost-co")
+		mustNotExist(t, "get the refused membership", err)
+	})
+
+	t.Run("apt_grants.account_id refuses an account that does not exist", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		err := s.PutGrant(ctx(), model.Grant{
+			ID: "g-ghost-account", AccountID: "ghost-co",
+			Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+			PermissionID: "p-read", Object: "**", Effect: model.EffectAllow,
+		})
+		mustConstraint(t, "grant stamped with an unknown account", err)
+		mustNameEdge(t, "grant stamped with an unknown account", err, "apt_grants.account_id")
+		_, err = s.GetGrant(ctx(), "g-ghost-account")
+		mustNotExist(t, "get the refused grant", err)
+	})
+
+	t.Run("the wildcard is accepted on both columns", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+
+		// The premise: "*" is NOT an account, and the model refuses to make it one.
+		mustCode(t, s.PutAccount(ctx(), model.Account{ID: model.AccountWildcard, Name: "star"}),
+			aerr.APERTURE_INVALID_INPUT)
+		_, err := s.GetAccount(ctx(), model.AccountWildcard)
+		mustNotExist(t, "a "+model.AccountWildcard+" account row exists, so the wildcard check is vacuous", err)
+
+		// The rule: both columns take it anyway.
+		if err := s.PutGrant(ctx(), model.Grant{
+			ID: "g-star", AccountID: model.AccountWildcard,
+			Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+			PermissionID: "p-read", Object: "**", Effect: model.EffectAllow,
+		}); err != nil {
+			t.Fatalf("wildcard-stamped grant refused: %v\n"+
+				"a plain existence check on account_id breaks the cross-account grant", err)
+		}
+		if err := s.PutMembership(ctx(), model.Membership{
+			PrincipalID: "bob", AccountID: model.AccountWildcard,
+		}); err != nil {
+			t.Fatalf("wildcard-stamped membership refused: %v\n"+
+				"engine.requireMembership falls back to IsMember(principal, %q) before denying",
+				err, model.AccountWildcard)
+		}
+
+		// And both still FUNCTION: the wildcard grant is returned for an account it
+		// was never stamped with, and the wildcard membership reads back.
+		got, err := s.GrantsForSubjects(ctx(), "acme", []model.Subject{{Kind: model.SubjectPrincipal, ID: "alice"}})
+		if err != nil {
+			t.Fatalf("grants for subjects: %v", err)
+		}
+		var sawStar bool
+		for _, g := range got {
+			if g.ID == "g-star" {
+				sawStar = true
+			}
+		}
+		if !sawStar {
+			t.Fatalf("the wildcard grant did not span into acme: %+v", got)
+		}
+		if ok, err := s.IsMember(ctx(), "bob", model.AccountWildcard); err != nil || !ok {
+			t.Fatalf("IsMember(bob, %q) = %v, %v — the wildcard membership does not function",
+				model.AccountWildcard, ok, err)
+		}
+	})
+}
+
+// testDeletingAnAccountWithLiveChildrenIsRefused is CHECK 1's delete half: an
+// account may not be deleted while a membership or a grant is still stamped with
+// it. That is the ON DELETE RESTRICT those two columns could not declare, and
+// without it DeleteAccount silently strands every membership and grant in the
+// tenant it just removed.
+func testDeletingAnAccountWithLiveChildrenIsRefused(t *testing.T, newStore Factory) {
+	t.Run("a membership pins the account", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Revoke the grant so the memberships are the only thing holding acme.
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("free the grant: %v", err)
+		}
+		err := s.DeleteAccount(ctx(), "acme")
+		mustConstraint(t, "delete an account with members", err)
+		mustNameEdge(t, "delete an account with members", err, "apt_memberships.account_id")
+		_, err = s.GetAccount(ctx(), "acme")
+		mustExist(t, "get the account after the refusal", err)
+	})
+
+	t.Run("a grant pins the account", func(t *testing.T) {
+		s := referentialWorld(t, newStore)
+		// Clear the memberships so the grant is the only thing holding acme.
+		for _, p := range []string{"alice", "bob"} {
+			if err := s.DeleteMembership(ctx(), p, "acme"); err != nil {
+				t.Fatalf("free membership %s: %v", p, err)
+			}
+		}
+		err := s.DeleteAccount(ctx(), "acme")
+		mustConstraint(t, "delete an account a grant is stamped with", err)
+		mustNameEdge(t, "delete an account a grant is stamped with", err, "apt_grants.account_id")
+		_, err = s.GetAccount(ctx(), "acme")
+		mustExist(t, "get the account after the refusal", err)
+
+		// With the grant gone too, the account is free — the anti-vacuity half.
+		if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+			t.Fatalf("delete grant: %v", err)
+		}
+		if err := s.DeleteAccount(ctx(), "acme"); err != nil {
+			t.Fatalf("nothing references acme any more, yet: %v", err)
+		}
+	})
+}
+
+// testWildcardRowsDoNotPinARealAccount is the delete-side half of the wildcard
+// trap. A "*"-stamped membership or grant references NO account, so it must not
+// keep a real one alive. A check that treated "*" as an ordinary account id would
+// be wrong here in the opposite direction — it would make every account
+// undeletable for as long as any wildcard row existed anywhere.
+func testWildcardRowsDoNotPinARealAccount(t *testing.T, newStore Factory) {
+	s := referentialWorld(t, newStore)
+
+	if err := s.PutGrant(ctx(), model.Grant{
+		ID: "g-star", AccountID: model.AccountWildcard,
+		Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "alice"},
+		PermissionID: "p-read", Object: "**", Effect: model.EffectAllow,
+	}); err != nil {
+		t.Fatalf("seed the wildcard grant: %v", err)
+	}
+	if err := s.PutMembership(ctx(), model.Membership{
+		PrincipalID: "bob", AccountID: model.AccountWildcard,
+	}); err != nil {
+		t.Fatalf("seed the wildcard membership: %v", err)
+	}
+
+	// Clear only the acme-stamped children.
+	for _, p := range []string{"alice", "bob"} {
+		if err := s.DeleteMembership(ctx(), p, "acme"); err != nil {
+			t.Fatalf("free membership %s: %v", p, err)
+		}
+	}
+	if err := s.DeleteGrant(ctx(), "g1"); err != nil {
+		t.Fatalf("free the grant: %v", err)
+	}
+
+	if err := s.DeleteAccount(ctx(), "acme"); err != nil {
+		t.Fatalf("the wildcard rows pinned a real account they never referenced: %v", err)
+	}
+	// The wildcard rows themselves survived: they were never acme's children.
+	if _, err := s.GetGrant(ctx(), "g-star"); err != nil {
+		t.Fatalf("the wildcard grant was removed with an account it never named: %v", err)
+	}
+	if ok, err := s.IsMember(ctx(), "bob", model.AccountWildcard); err != nil || !ok {
+		t.Fatalf("IsMember(bob, %q) = %v, %v — the wildcard membership was removed with acme",
+			model.AccountWildcard, ok, err)
+	}
+}
+
 // ---- normalization helpers ----
 //
-// Backends persist timestamps verbatim, but the SQLite backend round-trips them
-// through RFC3339Nano text, which canonicalizes the location to UTC. Normalize
-// both sides through .UTC().Round(0) so reflect.DeepEqual compares instants, not
-// location pointers or monotonic clock readings.
+// Backends persist instants verbatim, but a backend that encodes to int64
+// nanoseconds hands the value back in UTC with no monotonic reading, while the
+// in-memory backend returns the time.Time it was given. Normalize both sides
+// through .UTC().Round(0) so reflect.DeepEqual compares instants, not location
+// pointers or monotonic clock readings.
+//
+// Round(0) strips the monotonic reading. It does NOT truncate, and it must never
+// be changed to do so: rounding here would let a backend that loses precision
+// pass the whole suite. storage/storagetest/contract_test.go parses this file
+// and fails if this function is anything other than what it is below.
 
 func normTime(t time.Time) time.Time { return t.UTC().Round(0) }
 

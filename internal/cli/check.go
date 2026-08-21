@@ -31,7 +31,7 @@ func checkCommand() *ucli.Command {
 			},
 			&ucli.StringFlag{
 				Name:  "store",
-				Usage: "sqlite DSN for the backing store (defaults to in-memory)",
+				Usage: "DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path",
 			},
 			&ucli.StringFlag{
 				Name:  "account",
@@ -119,7 +119,7 @@ func enumerateCommand() *ucli.Command {
 			"tellable apart. Restriction, like filtering, happens before --limit.",
 		Flags: append(append([]ucli.Flag{
 			&ucli.StringFlag{Name: "seed", Usage: "path to a JSON/YAML seed model (defaults to the embedded example)"},
-			&ucli.StringFlag{Name: "store", Usage: "sqlite DSN for the backing store (defaults to in-memory)"},
+			&ucli.StringFlag{Name: "store", Usage: "DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path"},
 			&ucli.StringFlag{Name: "account", Usage: "active account the enumeration is scoped to", Value: seed.ExampleAccount},
 			&ucli.IntFlag{Name: "limit", Usage: "cap the number of returned object ids (<=0 means the default)"},
 		}, metadataFilterFlags()...), referenceEdgeFlags()...),
@@ -186,7 +186,7 @@ func identifiersCommand() *ucli.Command {
 		ArgsUsage: "<object_type>",
 		Flags: []ucli.Flag{
 			&ucli.StringFlag{Name: "seed", Usage: "path to a JSON/YAML seed model (defaults to the embedded example)"},
-			&ucli.StringFlag{Name: "store", Usage: "sqlite DSN for the backing store (defaults to in-memory)"},
+			&ucli.StringFlag{Name: "store", Usage: "DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path"},
 			&ucli.StringSliceFlag{Name: "exclude", Usage: "id to omit from the result (repeatable); expands an exclusive allowance"},
 		},
 		Action: runIdentifiers,
@@ -232,7 +232,7 @@ func explainCommand() *ucli.Command {
 		ArgsUsage: "<principal> <action> <object>",
 		Flags: []ucli.Flag{
 			&ucli.StringFlag{Name: "seed", Usage: "path to a JSON/YAML seed model (defaults to the embedded example)"},
-			&ucli.StringFlag{Name: "store", Usage: "sqlite DSN for the backing store (defaults to in-memory)"},
+			&ucli.StringFlag{Name: "store", Usage: "DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path"},
 			&ucli.StringFlag{Name: "account", Usage: "active account the decision is scoped to", Value: seed.ExampleAccount},
 		},
 		Action: runExplain,

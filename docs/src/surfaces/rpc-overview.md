@@ -127,10 +127,36 @@ Twirp error code (and thus an HTTP status) and attaches the canonical code as
 | `APERTURE_UNAUTHENTICATED`, `APERTURE_INVALID_TOKEN` | `unauthenticated` | 401 |
 | `APERTURE_AUTHZ_DENIED`, `APERTURE_DELEGATION_DENIED`, `APERTURE_IMPERSONATION_DENIED`, … | `permission_denied` | 403 |
 | `APERTURE_NOT_FOUND`, `APERTURE_RULE_NOT_FOUND`, `APERTURE_PROVIDER_UNREGISTERED` | `not_found` | 404 |
+| `APERTURE_ENTITY_UNMANAGED`, `APERTURE_STORAGE_CONSTRAINT` | `failed_precondition` | 412 |
 | `APERTURE_UNIMPLEMENTED` | `unimplemented` | 501 |
 | anything else | `internal` | 500 |
 
 See [Error Codes](../reference/error-codes.md) for the full registry.
+
+### Why those two are 412 and not 500
+
+Both are mapped out of the `internal` default **on purpose**, and the argument is
+the same in each case: nothing is broken, so nothing should page.
+
+`APERTURE_ENTITY_UNMANAGED` means the deployment does not manage the entity kind
+the write targeted — a switch an operator set, working exactly as configured.
+
+`APERTURE_STORAGE_CONSTRAINT` means the storage layer refused a write that would
+have broken referential integrity, overwhelmingly a **delete whose children are
+still there**: a role a principal still holds, a permission a role still bundles,
+an account with live memberships or grants. The caller is usually a fully
+privileged admin who took the teardown steps out of order. A 500 would page an
+on-call for a mistake the caller made and can fix, and would invite the one thing
+that can never work — retrying the identical request. A 400 would be closer but
+still wrong: the request is valid in isolation and becomes legal the moment the
+children are gone, so the fault is in the deployment's *state*, not in the
+message.
+
+412 says exactly that, and the canonical code still rides in `meta["code"]`, so a
+client dispatching on the code can look up the fixups — which enumerate the
+children to remove first. See
+[Error Codes](../reference/error-codes.md) and the
+[troubleshooting table](../operations/troubleshooting.md).
 
 ## A first call
 

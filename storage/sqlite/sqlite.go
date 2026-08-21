@@ -16,14 +16,19 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/storage/storagetime"
 
-	_ "modernc.org/sqlite"
+	// Aliased: this package is itself named sqlite, and an unqualified
+	// `sqlite.Error` in a file called sqlite.go reads as self-reference.
+	sqlitedrv "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed schema.sql
@@ -57,8 +62,19 @@ var _ model.Storage = (*Store)(nil)
 // "file:aperture.db?_pragma=busy_timeout(5000)". The connection pool is capped
 // at one connection so writes serialize cleanly under SQLite's single-writer
 // model.
+//
+// FOREIGN KEY ENFORCEMENT IS NOT NEGOTIABLE HERE. SQLite honours the foreign
+// keys in schema.sql only while PRAGMA foreign_keys is ON, and that pragma
+// defaults OFF and is scoped PER CONNECTION — so a caller-supplied DSN is, on
+// its own, an invitation to run Aperture against a database that silently
+// enforces nothing. Open therefore REWRITES the DSN: it drops any
+// _pragma=foreign_keys(...) the caller wrote, whatever value it asked for, and
+// appends its own. A DSN that explicitly disables the pragma does not produce an
+// unenforced Store; it produces an enforced one. Setup then verifies the
+// connection is actually enforcing and refuses it if not, so the guarantee does
+// not rest on DSN rewriting alone.
 func Open(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", forceForeignKeys(dsn))
 	if err != nil {
 		return nil, aerr.Wrap(aerr.APERTURE_STORAGE, "open sqlite database", err)
 	}
@@ -68,6 +84,69 @@ func Open(dsn string) (*Store, error) {
 	return &Store{pool: db, exec: db}, nil
 }
 
+// foreignKeysParam is the driver query parameter that turns foreign-key
+// enforcement on for every connection modernc.org/sqlite opens. The driver runs
+// each _pragma value as a PRAGMA statement at connection setup, which is exactly
+// the granularity the pragma needs: it is per-connection state, and the pool may
+// open a fresh connection at any time.
+const foreignKeysParam = "_pragma=foreign_keys(1)"
+
+// forceForeignKeys returns dsn with foreign-key enforcement guaranteed on: every
+// _pragma the caller supplied for foreign_keys is REMOVED and foreignKeysParam is
+// appended. Removing rather than merely appending is deliberate — it makes the
+// result independent of how the driver orders repeated parameters, so the
+// guarantee is a property of the string rather than of a driver behaviour that
+// could change under us.
+//
+// Everything else in the DSN is preserved verbatim, in order: the parameters are
+// split and rejoined textually rather than round-tripped through url.Values,
+// which would re-order and re-encode a caller's busy_timeout, journal_mode, vfs
+// or _txlock settings on the way through.
+func forceForeignKeys(dsn string) string {
+	base, query, hadQuery := strings.Cut(dsn, "?")
+	// The driver only reads a query string when '?' is at index >= 1, so an empty
+	// base would make the parameter invisible. "file:" with an empty path is
+	// SQLite's own spelling of the same (temporary) database and keeps it visible.
+	if base == "" {
+		base = "file:"
+	}
+	params := make([]string, 0, 4)
+	if hadQuery {
+		for _, p := range strings.Split(query, "&") {
+			if isForeignKeysPragma(p) {
+				continue
+			}
+			params = append(params, p)
+		}
+	}
+	params = append(params, foreignKeysParam)
+	return base + "?" + strings.Join(params, "&")
+}
+
+// isForeignKeysPragma reports whether one DSN query parameter is a _pragma
+// setting foreign_keys, in any of the spellings SQLite accepts:
+// foreign_keys(0), foreign_keys=off, "foreign_keys = FALSE". It matches the
+// pragma NAME, never the value, because every value — on or off — is overridden.
+func isForeignKeysPragma(param string) bool {
+	// The driver reads the parameter under the exact key "_pragma".
+	const key = "_pragma="
+	if !strings.HasPrefix(param, key) {
+		return false
+	}
+	v, err := url.QueryUnescape(param[len(key):])
+	if err != nil {
+		v = param[len(key):]
+	}
+	v = strings.ToLower(strings.TrimSpace(v))
+	const name = "foreign_keys"
+	if !strings.HasPrefix(v, name) {
+		return false
+	}
+	// Only a whole-word match: foreign_key_check is a different pragma.
+	rest := strings.TrimSpace(v[len(name):])
+	return rest == "" || strings.HasPrefix(rest, "(") || strings.HasPrefix(rest, "=")
+}
+
 // OpenMemory opens a private in-memory SQLite database. Useful for tests and
 // ephemeral seeding. The database lives only as long as the Store.
 func OpenMemory() (*Store, error) {
@@ -75,9 +154,51 @@ func OpenMemory() (*Store, error) {
 }
 
 // Setup creates the schema. It is idempotent (every statement is IF NOT EXISTS).
+//
+// Because it is idempotent it is also non-upgrading: on a database that already
+// carries Aperture's tables it creates nothing, and SQLite's dynamic typing
+// means an older build's text timestamps would sit unremarked in columns this
+// schema declares INTEGER. So Setup first inspects an existing database and
+// REFUSES one it cannot read, with APERTURE_STORAGE_SCHEMA_INCOMPATIBLE. That
+// is a detector, not a migrator — see schema_guard.go for why a schema break is
+// a hard break here, and why the declared column type alone is not proof.
+//
+// Setup also VERIFIES foreign-key enforcement before it creates anything. Open
+// forces the pragma into the DSN, but a Store can reach Setup on a connection
+// Open never rewrote — a hand-built *sql.DB in a future constructor, a driver
+// that changes how it applies query parameters — and an unenforced connection
+// looks exactly like an enforced one until the first orphan appears. Checking is
+// one PRAGMA read, and the alternative is a database whose foreign keys are
+// decoration.
 func (s *Store) Setup(ctx context.Context) error {
+	if err := verifyForeignKeysEnforced(ctx, s.exec); err != nil {
+		return err
+	}
+	if err := guardSchemaShape(ctx, s.exec); err != nil {
+		return err
+	}
 	if _, err := s.exec.ExecContext(ctx, schema); err != nil {
 		return aerr.Wrap(aerr.APERTURE_STORAGE, "apply schema", err)
+	}
+	return nil
+}
+
+// verifyForeignKeysEnforced refuses a connection that is not enforcing foreign
+// keys. The refusal is APERTURE_STORAGE_CONSTRAINT: the failure is that
+// Aperture's constraints cannot be enforced at all, which is the same subject as
+// a single violated one, and the fix is the same operator's.
+func verifyForeignKeysEnforced(ctx context.Context, exec sqlExec) error {
+	var on int
+	if err := exec.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&on); err != nil {
+		return aerr.Wrap(aerr.APERTURE_STORAGE, "read the foreign_keys pragma", err)
+	}
+	if on == 0 {
+		return aerr.New(aerr.APERTURE_STORAGE_CONSTRAINT,
+			"this SQLite connection is not enforcing foreign keys (PRAGMA foreign_keys is OFF), "+
+				"so the schema's referential integrity would be decoration: a delete could orphan "+
+				"memberships, role assignments and grants without any error — "+
+				"open the store with sqlite.Open, which forces _pragma=foreign_keys(1) into the DSN, "+
+				"rather than handing the Store a connection built elsewhere")
 	}
 	return nil
 }
@@ -96,24 +217,33 @@ func (s *Store) Close() error {
 
 // ---- timestamp + error helpers ----
 
-// encodeTime renders a time as RFC3339Nano, or "" for the zero value so zero
-// round-trips to zero rather than the year-0001 sentinel.
-func encodeTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
+// The unit for every stored instant is int64 NANOSECONDS since the Unix epoch,
+// UTC, encoded and decoded by storage/storagetime. That package owns the
+// zero mapping (time.Time{} <-> 0) and the representable-range rejection, and is
+// the only place in the storage layer where a time.Time becomes an integer —
+// never call UnixNano here. Every timestamp column in schema.sql is INTEGER;
+// there is no text timestamp left to parse.
+
+// encodeStamps encodes an entity's CreatedAt/UpdatedAt pair for the INSERT.
+// An instant outside the storable range comes back as APERTURE_INVALID_INPUT
+// from storagetime and is returned before any statement runs, so an
+// unrepresentable timestamp is refused rather than written as an overflow.
+func encodeStamps(created, updated time.Time) (int64, int64, error) {
+	c, err := storagetime.Encode(created)
+	if err != nil {
+		return 0, 0, err
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	u, err := storagetime.Encode(updated)
+	if err != nil {
+		return 0, 0, err
+	}
+	return c, u, nil
 }
 
-func decodeTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, aerr.Wrap(aerr.APERTURE_STORAGE, "decode timestamp", err)
-	}
-	return t.UTC(), nil
+// decodeStamps is the read-side counterpart. Decode cannot fail — every int64 is
+// a representable instant — so scanners assign the pair directly.
+func decodeStamps(created, updated int64) (time.Time, time.Time) {
+	return storagetime.Decode(created), storagetime.Decode(updated)
 }
 
 // encodeBool stores a Go bool as SQLite's integer 0/1 convention.
@@ -124,8 +254,34 @@ func encodeBool(b bool) int64 {
 	return 0
 }
 
+// wrapStorage is the single place a raw driver error becomes an Aperture-coded
+// one, so the constraint mapping below covers every statement this package runs
+// without each call site remembering it.
 func wrapStorage(op string, err error) error {
+	if isConstraintViolation(err) {
+		return aerr.Wrap(aerr.APERTURE_STORAGE_CONSTRAINT, op, err)
+	}
 	return aerr.Wrap(aerr.APERTURE_STORAGE, op, err)
+}
+
+// isConstraintViolation reports whether a driver error is SQLite refusing a
+// write because it would break a declared constraint — a foreign key above all,
+// but a primary-key, uniqueness, NOT NULL or CHECK violation just as much. All
+// of them mean the same thing to a caller: the database rejected the write on
+// its own terms, nothing is broken, and no retry will help.
+//
+// The test is on the PRIMARY result code (the low byte), not on the message.
+// SQLite's extended codes distinguish which constraint objected —
+// SQLITE_CONSTRAINT_FOREIGNKEY for a direct violation, SQLITE_CONSTRAINT_TRIGGER
+// when the same violation arrives via a REPLACE's implicit delete — and matching
+// the family catches both without enumerating them. The extended code is
+// preserved in the wrapped cause for anyone who needs the distinction.
+func isConstraintViolation(err error) bool {
+	var serr *sqlitedrv.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+	return serr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 }
 
 func notFound(kind, id string) error {
@@ -142,10 +298,24 @@ func (s *Store) PutAccount(ctx context.Context, a model.Account) error {
 	if err := model.ValidateAccount(a); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_accounts (id, name, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.Description, encodeTime(a.CreatedAt), encodeTime(a.UpdatedAt))
+	created, updated, err := encodeStamps(a.CreatedAt, a.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	// ON CONFLICT DO UPDATE, not INSERT OR REPLACE: an account is a PARENT row
+	// (memberships and grants point at it), and REPLACE would delete the existing
+	// row before re-inserting it, which fires the children's ON DELETE actions.
+	// Re-saving an account with members would be refused by their RESTRICT edge.
+	// See the "Referential integrity" note in schema.sql.
+	_, err = s.exec.ExecContext(ctx, `
+		INSERT INTO apt_accounts (id, name, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			name = excluded.name,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
+		a.ID, a.Name, a.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put account", err)
 	}
@@ -181,13 +351,27 @@ func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	return s.deleteByID(ctx, "account", "apt_accounts", "id", id)
+	return s.inTx(ctx, "delete account", func(tx sqlExec) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM apt_accounts WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return notFound("account", id)
+		}
+		// apt_memberships.account_id and apt_grants.account_id would be
+		// ON DELETE RESTRICT if they could be foreign keys at all. They cannot —
+		// both carry model.AccountWildcard — so the RESTRICT half is enforced
+		// here instead, inside the same transaction: refusing rolls the delete
+		// back, so an account with live children is never even briefly gone.
+		return checkAccountUncited(ctx, tx, "delete account", id)
+	})
 }
 
 func scanAccount(sc scanner) (model.Account, error) {
 	var (
 		a                model.Account
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&a.ID, &a.Name, &a.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -195,13 +379,7 @@ func scanAccount(sc scanner) (model.Account, error) {
 		}
 		return model.Account{}, wrapStorage("scan account", err)
 	}
-	var err error
-	if a.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Account{}, err
-	}
-	if a.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Account{}, err
-	}
+	a.CreatedAt, a.UpdatedAt = decodeStamps(created, updated)
 	return a, nil
 }
 
@@ -211,14 +389,26 @@ func (s *Store) PutMembership(ctx context.Context, m model.Membership) error {
 	if err := model.ValidateMembership(m); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?)`,
-		m.PrincipalID, m.AccountID, encodeTime(m.CreatedAt), encodeTime(m.UpdatedAt))
+	created, updated, err := encodeStamps(m.CreatedAt, m.UpdatedAt)
 	if err != nil {
-		return wrapStorage("put membership", err)
+		return err
 	}
-	return nil
+	// The principal_id edge is a real foreign key and fires on the INSERT below.
+	// account_id is not and cannot be one — a membership stamped "*" enrolls its
+	// principal in every account — so it is checked here, in the same transaction
+	// as the write. See integrity.go.
+	return s.inTx(ctx, "put membership", func(tx sqlExec) error {
+		if err := checkAccountRef(ctx, tx, "put membership", "apt_memberships.account_id", m.AccountID); err != nil {
+			return err
+		}
+		// REPLACE is safe on apt_memberships: it is a leaf, nothing references it,
+		// so the implicit delete fires no ON DELETE action.
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
+			VALUES (?, ?, ?, ?)`,
+			m.PrincipalID, m.AccountID, created, updated)
+		return err
+	})
 }
 
 func (s *Store) GetMembership(ctx context.Context, principalID, accountID string) (model.Membership, error) {
@@ -296,7 +486,7 @@ func collectMemberships(rows *sql.Rows) ([]model.Membership, error) {
 func scanMembership(sc scanner) (model.Membership, error) {
 	var (
 		m                model.Membership
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&m.PrincipalID, &m.AccountID, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -304,13 +494,7 @@ func scanMembership(sc scanner) (model.Membership, error) {
 		}
 		return model.Membership{}, wrapStorage("scan membership", err)
 	}
-	var err error
-	if m.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Membership{}, err
-	}
-	if m.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Membership{}, err
-	}
+	m.CreatedAt, m.UpdatedAt = decodeStamps(created, updated)
 	return m, nil
 }
 
@@ -324,10 +508,22 @@ func (s *Store) PutObjectType(ctx context.Context, ot model.ObjectType) error {
 	if err != nil {
 		return wrapStorage("marshal actions", err)
 	}
+	created, updated, err := encodeStamps(ot.CreatedAt, ot.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	// Upsert in place rather than REPLACE: apt_permissions.object_type points here
+	// under RESTRICT, so deleting-and-reinserting the row would refuse any object
+	// type that already has permissions. See PutAccount for the full reasoning.
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		ot.Name, string(actions), ot.Description, encodeTime(ot.CreatedAt), encodeTime(ot.UpdatedAt))
+		INSERT INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (name) DO UPDATE SET
+			apt_actions = excluded.apt_actions,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
+		ot.Name, string(actions), ot.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put object type", err)
 	}
@@ -374,7 +570,7 @@ func scanObjectType(sc scanner) (model.ObjectType, error) {
 	var (
 		ot               model.ObjectType
 		actions          string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&ot.Name, &actions, &ot.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -385,13 +581,7 @@ func scanObjectType(sc scanner) (model.ObjectType, error) {
 	if err := json.Unmarshal([]byte(actions), &ot.Actions); err != nil {
 		return model.ObjectType{}, wrapStorage("unmarshal actions", err)
 	}
-	var err error
-	if ot.CreatedAt, err = decodeTime(created); err != nil {
-		return model.ObjectType{}, err
-	}
-	if ot.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.ObjectType{}, err
-	}
+	ot.CreatedAt, ot.UpdatedAt = decodeStamps(created, updated)
 	return ot, nil
 }
 
@@ -405,10 +595,24 @@ func (s *Store) PutPermission(ctx context.Context, p model.Permission) error {
 	if err := model.ValidatePermission(p, ot); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	// Upsert in place rather than REPLACE: role assignments and grants point at a
+	// permission under RESTRICT. See PutAccount for the full reasoning.
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt))
+		INSERT INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			object_type = excluded.object_type,
+			apt_action = excluded.apt_action,
+			scope_strategy = excluded.scope_strategy,
+			delegatable = excluded.delegatable,
+			description = excluded.description,
+			created_at = excluded.created_at,
+			updated_at = excluded.updated_at`,
+		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put permission", err)
 	}
@@ -451,7 +655,7 @@ func scanPermission(sc scanner) (model.Permission, error) {
 	var (
 		p                model.Permission
 		delegatable      int64
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&p.ID, &p.ObjectType, &p.Action, &p.ScopeStrategy, &delegatable, &p.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -460,13 +664,7 @@ func scanPermission(sc scanner) (model.Permission, error) {
 		return model.Permission{}, wrapStorage("scan permission", err)
 	}
 	p.Delegatable = delegatable != 0
-	var err error
-	if p.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Permission{}, err
-	}
-	if p.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Permission{}, err
-	}
+	p.CreatedAt, p.UpdatedAt = decodeStamps(created, updated)
 	return p, nil
 }
 
@@ -476,11 +674,26 @@ func (s *Store) PutPrincipal(ctx context.Context, p model.Principal) error {
 	if err := model.ValidatePrincipal(p); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put principal", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE. REPLACE would delete the principal
+		// row first, which CASCADEs its role assignments away (harmless — they are
+		// rewritten two statements below) but also trips the RESTRICT edges from
+		// apt_memberships and apt_group_members, so re-saving a principal who is
+		// in an account or a group would be refused. See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-			p.ID, string(p.Kind), p.Identity, p.DisplayName, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt)); err != nil {
+			INSERT INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				kind = excluded.kind,
+				apt_identity = excluded.apt_identity,
+				display_name = excluded.display_name,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
+			p.ID, string(p.Kind), p.Identity, p.DisplayName, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, p.ID); err != nil {
@@ -553,8 +766,16 @@ func (s *Store) DeletePrincipal(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("principal", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, id)
-		return err
+		// apt_grants.subject_id -> apt_principals(id), for the grants whose
+		// subject_kind is "principal". Polymorphic, so no foreign key expresses
+		// it; the RESTRICT it would have carried is this check. See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete principal", model.SubjectPrincipal, id); err != nil {
+			return err
+		}
+		// apt_principal_roles.principal_id is ON DELETE CASCADE, so the role
+		// assignments went with the row above. There is no hand-written cleanup
+		// here on purpose -- see the note on DeleteGroup.
+		return nil
 	})
 }
 
@@ -562,7 +783,7 @@ func scanPrincipal(sc scanner) (model.Principal, error) {
 	var (
 		p                model.Principal
 		kind             string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&p.ID, &kind, &p.Identity, &p.DisplayName, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -571,13 +792,7 @@ func scanPrincipal(sc scanner) (model.Principal, error) {
 		return model.Principal{}, wrapStorage("scan principal", err)
 	}
 	p.Kind = model.PrincipalKind(kind)
-	var err error
-	if p.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Principal{}, err
-	}
-	if p.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Principal{}, err
-	}
+	p.CreatedAt, p.UpdatedAt = decodeStamps(created, updated)
 	return p, nil
 }
 
@@ -587,11 +802,23 @@ func (s *Store) PutRole(ctx context.Context, r model.Role) error {
 	if err := model.ValidateRole(r); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put role", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE: apt_principal_roles.role_id points
+		// here under RESTRICT, so re-saving an assigned role would be refused.
+		// See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_roles (id, name, description, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)`,
-			r.ID, r.Name, r.Description, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt)); err != nil {
+			INSERT INTO apt_roles (id, name, description, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				name = excluded.name,
+				description = excluded.description,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
+			r.ID, r.Name, r.Description, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, r.ID); err != nil {
@@ -664,15 +891,21 @@ func (s *Store) DeleteRole(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("role", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, id)
-		return err
+		// apt_grants.subject_id -> apt_roles(id), for the grants whose
+		// subject_kind is "role". See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete role", model.SubjectRole, id); err != nil {
+			return err
+		}
+		// apt_role_permissions.role_id is ON DELETE CASCADE, so the permission
+		// bundle went with the row above. See the note on DeleteGroup.
+		return nil
 	})
 }
 
 func scanRole(sc scanner) (model.Role, error) {
 	var (
 		r                model.Role
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&r.ID, &r.Name, &r.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -680,13 +913,7 @@ func scanRole(sc scanner) (model.Role, error) {
 		}
 		return model.Role{}, wrapStorage("scan role", err)
 	}
-	var err error
-	if r.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Role{}, err
-	}
-	if r.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Role{}, err
-	}
+	r.CreatedAt, r.UpdatedAt = decodeStamps(created, updated)
 	return r, nil
 }
 
@@ -696,11 +923,24 @@ func (s *Store) PutGroup(ctx context.Context, g model.Group) error {
 	if err := model.ValidateGroup(g); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(g.CreatedAt, g.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put group", func(tx sqlExec) error {
+		// Upsert in place rather than REPLACE: a group owns its member rows under
+		// CASCADE, and REPLACE would delete them out from under the rewrite below
+		// on a path that only LOOKS harmless. Consistency with the other four
+		// entity upserts is worth more than the coincidence. See PutAccount.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO apt_groups (id, name, description, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)`,
-			g.ID, g.Name, g.Description, encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt)); err != nil {
+			INSERT INTO apt_groups (id, name, description, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET
+				name = excluded.name,
+				description = excluded.description,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`,
+			g.ID, g.Name, g.Description, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, g.ID); err != nil {
@@ -777,15 +1017,29 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("group", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, id)
-		return err
+		// apt_grants.subject_id -> apt_groups(id), for the grants whose
+		// subject_kind is "group". See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete group", model.SubjectGroup, id); err != nil {
+			return err
+		}
+		// apt_group_members.group_id is ON DELETE CASCADE, so the member rows went
+		// with the row above.
+		//
+		// This used to be a hand-written DELETE alongside the key, and the two
+		// covered for each other: breaking EITHER half alone left the conformance
+		// suite green, so neither was actually proven. The Go half came out once
+		// the schema half was demonstrated to carry the behaviour on its own. If
+		// you add the DELETE back you re-create that blind spot -- the cascade is
+		// the schema's job, and storagetest's
+		// ReferentialCascadeRemovesTheJoinRowsWithTheirOwner is what holds it to it.
+		return nil
 	})
 }
 
 func scanGroup(sc scanner) (model.Group, error) {
 	var (
 		g                model.Group
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&g.ID, &g.Name, &g.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -793,13 +1047,7 @@ func scanGroup(sc scanner) (model.Group, error) {
 		}
 		return model.Group{}, wrapStorage("scan group", err)
 	}
-	var err error
-	if g.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Group{}, err
-	}
-	if g.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Group{}, err
-	}
+	g.CreatedAt, g.UpdatedAt = decodeStamps(created, updated)
 	return g, nil
 }
 
@@ -843,15 +1091,30 @@ func (s *Store) PutGrant(ctx context.Context, g model.Grant) error {
 	if err := model.ValidateGrant(g); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
-		encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt))
+	created, updated, err := encodeStamps(g.CreatedAt, g.UpdatedAt)
 	if err != nil {
-		return wrapStorage("put grant", err)
+		return err
 	}
-	return nil
+	// A grant makes three references. permission_id is a real foreign key and
+	// fires on the INSERT below. The other two cannot be foreign keys and are
+	// checked here, in the same transaction: account_id may carry the wildcard,
+	// and (subject_kind, subject_id) is polymorphic. See integrity.go.
+	return s.inTx(ctx, "put grant", func(tx sqlExec) error {
+		if err := checkAccountRef(ctx, tx, "put grant", "apt_grants.account_id", g.AccountID); err != nil {
+			return err
+		}
+		if err := checkGrantSubject(ctx, tx, "put grant", g.Subject); err != nil {
+			return err
+		}
+		// REPLACE is safe on apt_grants: it is a leaf, nothing references it, so
+		// the implicit delete fires no ON DELETE action.
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
+			created, updated)
+		return err
+	})
 }
 
 func (s *Store) GetGrant(ctx context.Context, id string) (model.Grant, error) {
@@ -962,7 +1225,7 @@ func scanGrant(sc scanner) (model.Grant, error) {
 	var (
 		g                       model.Grant
 		kind, effect            string
-		created, updated        string
+		created, updated        int64
 		subjectID, permissionID string
 	)
 	if err := sc.Scan(&g.ID, &g.AccountID, &kind, &subjectID, &permissionID, &g.Object, &effect, &created, &updated); err != nil {
@@ -974,13 +1237,7 @@ func scanGrant(sc scanner) (model.Grant, error) {
 	g.Subject = model.Subject{Kind: model.SubjectKind(kind), ID: subjectID}
 	g.PermissionID = permissionID
 	g.Effect = model.Effect(effect)
-	var err error
-	if g.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Grant{}, err
-	}
-	if g.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Grant{}, err
-	}
+	g.CreatedAt, g.UpdatedAt = decodeStamps(created, updated)
 	return g, nil
 }
 
@@ -1000,11 +1257,15 @@ func (s *Store) PutTemplate(ctx context.Context, t model.Template) error {
 	if err != nil {
 		return wrapStorage("marshal template grants", err)
 	}
+	created, updated, err := encodeStamps(t.CreatedAt, t.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_templates (name, version, description, params, apt_grants, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		t.Name, t.Version, t.Description, string(params), string(grants),
-		encodeTime(t.CreatedAt), encodeTime(t.UpdatedAt))
+		created, updated)
 	if err != nil {
 		return wrapStorage("put template", err)
 	}
@@ -1074,7 +1335,7 @@ func scanTemplate(sc scanner) (model.Template, error) {
 	var (
 		t                model.Template
 		params, grants   string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&t.Name, &t.Version, &t.Description, &params, &grants, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -1092,13 +1353,7 @@ func scanTemplate(sc scanner) (model.Template, error) {
 			return model.Template{}, wrapStorage("unmarshal template grants", err)
 		}
 	}
-	var err error
-	if t.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Template{}, err
-	}
-	if t.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Template{}, err
-	}
+	t.CreatedAt, t.UpdatedAt = decodeStamps(created, updated)
 	return t, nil
 }
 
@@ -1113,10 +1368,14 @@ func (s *Store) PutRule(ctx context.Context, r model.Rule) error {
 	if err := model.ValidateRule(r); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	created, updated, err := encodeStamps(r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_rules (name, description, ast, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
-		r.Name, r.Description, string(r.AST), encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt))
+		r.Name, r.Description, string(r.AST), created, updated)
 	if err != nil {
 		return wrapStorage("put rule", err)
 	}
@@ -1162,7 +1421,7 @@ func scanRule2(sc scanner) (model.Rule, error) {
 	var (
 		r                model.Rule
 		ast              string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&r.Name, &r.Description, &ast, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -1171,19 +1430,13 @@ func scanRule2(sc scanner) (model.Rule, error) {
 		return model.Rule{}, wrapStorage("scan rule", err)
 	}
 	r.AST = json.RawMessage(ast)
-	var err error
-	if r.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Rule{}, err
-	}
-	if r.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Rule{}, err
-	}
+	r.CreatedAt, r.UpdatedAt = decodeStamps(created, updated)
 	return r, nil
 }
 
 // ---- Audit trail (append-only) ----
 
-const auditColumns = `id, ts_nanos, event_type, apt_action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
+const auditColumns = `id, occurred_at, event_type, apt_action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
 
 func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 	details := ""
@@ -1194,10 +1447,14 @@ func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 		}
 		details = string(b)
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	ts, err := storagetime.Encode(ev.Timestamp)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_audit_log (`+auditColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.Timestamp.UTC().UnixNano(), string(ev.EventType), ev.Action, ev.Actor,
+		ev.ID, ts, string(ev.EventType), ev.Action, ev.Actor,
 		ev.EffectiveSubject, ev.ImpersonationMode, ev.Account, ev.Target, string(ev.Outcome),
 		ev.Reason, details)
 	if err != nil {
@@ -1232,18 +1489,26 @@ func (s *Store) QueryAudit(ctx context.Context, filter model.AuditFilter) ([]mod
 		args = append(args, string(filter.Outcome))
 	}
 	if !filter.Since.IsZero() {
-		where = append(where, "ts_nanos >= ?")
-		args = append(args, filter.Since.UTC().UnixNano())
+		since, err := storagetime.Encode(filter.Since)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "occurred_at >= ?")
+		args = append(args, since)
 	}
 	if !filter.Until.IsZero() {
-		where = append(where, "ts_nanos < ?")
-		args = append(args, filter.Until.UTC().UnixNano())
+		until, err := storagetime.Encode(filter.Until)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "occurred_at < ?")
+		args = append(args, until)
 	}
 	if len(where) > 0 {
 		b.WriteString(" WHERE ")
 		b.WriteString(strings.Join(where, " AND "))
 	}
-	b.WriteString(" ORDER BY ts_nanos DESC, id DESC")
+	b.WriteString(" ORDER BY occurred_at DESC, id DESC")
 	if filter.Limit > 0 {
 		b.WriteString(" LIMIT ?")
 		args = append(args, filter.Limit)
@@ -1271,8 +1536,12 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	var removed int
 	// Age bound: delete events strictly older than policy.Before.
 	if !policy.Before.IsZero() {
+		before, err := storagetime.Encode(policy.Before)
+		if err != nil {
+			return removed, err
+		}
 		res, err := s.exec.ExecContext(ctx,
-			`DELETE FROM apt_audit_log WHERE ts_nanos < ?`, policy.Before.UTC().UnixNano())
+			`DELETE FROM apt_audit_log WHERE occurred_at < ?`, before)
 		if err != nil {
 			return removed, wrapStorage("prune audit by age", err)
 		}
@@ -1284,7 +1553,7 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	if policy.MaxCount > 0 {
 		res, err := s.exec.ExecContext(ctx, `
 			DELETE FROM apt_audit_log WHERE id NOT IN (
-				SELECT id FROM apt_audit_log ORDER BY ts_nanos DESC, id DESC LIMIT ?
+				SELECT id FROM apt_audit_log ORDER BY occurred_at DESC, id DESC LIMIT ?
 			)`, policy.MaxCount)
 		if err != nil {
 			return removed, wrapStorage("prune audit by size", err)
@@ -1299,15 +1568,15 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 func scanAudit(sc scanner) (model.AuditEvent, error) {
 	var (
 		ev                          model.AuditEvent
-		tsNanos                     int64
+		occurredAt                  int64
 		eventType, outcome, details string
 	)
-	if err := sc.Scan(&ev.ID, &tsNanos, &eventType, &ev.Action, &ev.Actor,
+	if err := sc.Scan(&ev.ID, &occurredAt, &eventType, &ev.Action, &ev.Actor,
 		&ev.EffectiveSubject, &ev.ImpersonationMode, &ev.Account, &ev.Target, &outcome,
 		&ev.Reason, &details); err != nil {
 		return model.AuditEvent{}, wrapStorage("scan audit", err)
 	}
-	ev.Timestamp = time.Unix(0, tsNanos).UTC()
+	ev.Timestamp = storagetime.Decode(occurredAt)
 	ev.EventType = model.AuditEventType(eventType)
 	ev.Outcome = model.AuditOutcome(outcome)
 	if details != "" {

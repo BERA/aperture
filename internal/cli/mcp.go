@@ -43,7 +43,7 @@ func mcpCommand() *ucli.Command {
 			},
 			&ucli.StringFlag{
 				Name:  "store",
-				Usage: "sqlite DSN for the backing store (defaults to in-memory)",
+				Usage: "DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path",
 			},
 		},
 		Action: runMCP,

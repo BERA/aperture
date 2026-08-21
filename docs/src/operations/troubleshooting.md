@@ -49,7 +49,9 @@ A few codes you are likely to meet operating a service:
 | Code | Typical trigger | First move |
 |---|---|---|
 | `APERTURE_CONFIG_INVALID` | An unrecognised `APERTURE_AUTH_MODE` / `--auth`, or bad adapter config at boot. | Check the auth env vars against [Deployment](deployment.md); valid modes are `dev` \| `oidc` \| `parsec`. |
-| `APERTURE_BOOT` | `serve` failed to wire up — store open/`Setup`, seed load, provider build, or the listener. | Read the wrapped cause; verify `--store` DSN, `--seed` path, and the seed's `providers:` section. |
+| `APERTURE_BOOT` | `serve` failed to wire up for a reason no layer below classified — provider build, the auth adapter, or the listener. | Read the wrapped cause; verify `--store` DSN, `--seed` path, and the seed's `providers:` section. |
+| `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE` | The database at `--store` was written by an older build of Aperture. | Aperture ships no migration path. Move or delete the old database, let `Setup` create a fresh one, and re-seed it. |
+| `APERTURE_STORAGE_CONSTRAINT` | A delete would have orphaned rows, a write named something that does not exist, or the SQLite connection is not enforcing foreign keys. Over the RPC surface this is a **412**, not a 500 — it is a caller-order problem, not a broken server, so do not page on it. | Remove the children before the parent (or create what a record references first). From `Setup`, open the store with `sqlite.Open`, which forces `_pragma=foreign_keys(1)`. |
 | `APERTURE_UNAUTHENTICATED` / `APERTURE_INVALID_TOKEN` | A request carried no bearer, or a token that failed verification. | Confirm the client credential and the configured adapter (`dev` treats the bearer as the principal id). |
 | `APERTURE_AUTHZ_DENIED` | The caller lacks the admin tier for a gated mutation. | Expected for under-privileged callers; grant the tier or use an authorized principal. |
 | `APERTURE_NOT_FOUND` | A referenced grant, rule, object, or entity does not exist (or is out of the caller's account scope). | Re-check the id; remember cross-account lookups are scoped, so another account's entity reads as absent. |

@@ -43,6 +43,7 @@ func TestExampleLoads(t *testing.T) {
 // proving both formats share the field tags.
 func TestJSONEquivalent(t *testing.T) {
 	const doc = `{
+		"accounts": [{"id": "acme", "name": "Acme"}],
 		"object_types": [{"name": "document", "actions": ["read"]}],
 		"permissions": [{"id": "p1", "object_type": "document", "action": "read"}],
 		"principals": [{"id": "u1", "kind": "user", "identity": "user:u1"}],

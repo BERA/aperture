@@ -49,7 +49,16 @@ allow = 0, deny = non-zero, so checks compose in shell pipelines. Flags:
 - `--seed <file>` — JSON/YAML model to load (defaults to the embedded example).
   The file is also the source of the `providers:` / `objects:` object-metadata
   wiring, which rules and scope enumeration read.
-- `--store <dsn>` — sqlite DSN (defaults to in-memory).
+- `--store <dsn>` — backing store (defaults to in-memory). A `postgres://` or
+  `postgresql://` URL selects the PostgreSQL backend; any other value is a
+  SQLite path. Set `APERTURE_POSTGRES_SCHEMA` to place Aperture's tables in a
+  named PostgreSQL schema — unset means "use the connection's `search_path`",
+  which is safe in a shared database because every table Aperture owns is
+  prefixed `apt_`. The name is validated at boot against
+  `\A[A-Za-z_][A-Za-z0-9_]*\z` (max 63 bytes) and refused with
+  `APERTURE_CONFIG_INVALID` otherwise: a schema name cannot be a bind parameter,
+  so it is interpolated into SQL text and that pattern is the only thing
+  guarding it.
 - `--account <id>` — active account (defaults to the example's `acme`).
 
 ## HTTP: `POST /check`

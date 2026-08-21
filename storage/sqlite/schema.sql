@@ -14,6 +14,97 @@
 --   * This is a database-identifier convention only. Go types, struct fields,
 --     wire field names, and CLI flags are unaffected.
 --
+-- Time:
+--   * EVERY instant in this schema -- created_at, updated_at, and the audit
+--     log's occurred_at alike -- is an INTEGER count of NANOSECONDS since the
+--     Unix epoch (1970-01-01T00:00:00Z), in UTC. There is no text timestamp
+--     and no per-dialect timestamp type anywhere in Aperture's storage.
+--   * The representable window is the signed 64-bit nanosecond range:
+--     1677-09-21T00:12:43.145224192Z .. 2262-04-11T23:47:16.854775807Z.
+--     An instant outside it is refused with APERTURE_INVALID_INPUT before the
+--     write; it is never wrapped, clamped, or stored as an overflow value.
+--   * 0 means UNSET, not the Unix epoch. That is what lets every timestamp
+--     column stay NOT NULL DEFAULT 0 and still read back as the zero time.
+--     Aperture stamps from a real clock and never writes the epoch itself, so
+--     nothing in the model can collide with the sentinel.
+--   * storage/storagetime owns both mappings (time.Time{} <-> 0 and the range
+--     check) and is the ONLY place in the storage layer where a time.Time
+--     becomes an integer; storage/storagetime/exclusivity_test.go enforces it.
+--   * Integers rather than text because comparison is the point: range filters
+--     and newest-first ordering compare numerically, while RFC3339 text
+--     mis-sorts variable-length fractional seconds. The Postgres column type
+--     is BIGINT, carrying the same unit, for the same reason.
+--
+-- Referential integrity:
+--   * Nine relationship columns carry a REAL foreign key, declared as a table
+--     constraint next to the PRIMARY KEY, so a row can never name a parent that
+--     does not exist and a parent can never be deleted out from under a child
+--     that still points at it. Three columns deliberately carry none, each for a
+--     reason written down below: apt_grants.subject_id (polymorphic) and the two
+--     account_id columns (they carry a reserved sentinel). Those three are
+--     enforced in the application layer instead, on identical terms and in every
+--     backend -- see storage/sqlite/integrity.go. "No foreign key" does not mean
+--     "no integrity"; it means SQL could not express this one.
+--   * ON DELETE CASCADE appears on exactly THREE edges -- the ones where an
+--     entity owns its own join rows: apt_principal_roles.principal_id,
+--     apt_role_permissions.role_id, apt_group_members.group_id. There the join
+--     row has no meaning without its owner, so deleting the owner deletes it.
+--     The schema is the ONLY thing that performs this cleanup. The Go delete
+--     methods used to repeat it by hand in the same transaction, and the two
+--     halves covered for each other -- breaking either one alone left the
+--     conformance suite green, so neither was proven. The hand-written half is
+--     gone; do not put it back.
+--   * ON DELETE RESTRICT everywhere else (the other six edges). Deleting a
+--     permission a grant still cites, a role a principal still holds, or a
+--     principal that is still in a group is refused with
+--     APERTURE_STORAGE_CONSTRAINT. That refusal is the point: before these keys
+--     existed the same delete silently orphaned the child rows.
+--   * ON UPDATE RESTRICT throughout, without exception. An id in Aperture is
+--     immutable -- nothing in the model renames one -- so an UPDATE that moved a
+--     parent key would be a bug, and RESTRICT makes it a loud one rather than a
+--     quiet re-parenting.
+--   * These constraints are only real when PRAGMA foreign_keys is ON, which
+--     SQLite defaults OFF and scopes PER CONNECTION. sqlite.Open therefore
+--     forces _pragma=foreign_keys(1) into every DSN it opens, whatever the
+--     caller passed, and Setup verifies it and refuses a connection that is not
+--     enforcing. See Open/Setup in sqlite.go.
+--   * JSON value columns take no foreign keys: apt_object_types.apt_actions and
+--     apt_templates.apt_grants are value lists, not relationships.
+--
+-- The two account_id columns, and why they carry no foreign key:
+--   * apt_memberships.account_id and apt_grants.account_id look like plain
+--     references to apt_accounts(id), and they were planned as two of the
+--     eleven edges. They CANNOT be, and the reason is in the model, not here.
+--   * model.AccountWildcard is the reserved account id "*". A grant stamped "*"
+--     applies in EVERY account (model/model.go), and a MEMBERSHIP stamped "*"
+--     enrolls its principal in every account (engine.requireMembership, which
+--     falls back to IsMember(principal, "*") before denying). Both are shipped,
+--     documented features -- the cross-account super-admin depends on them.
+--   * And "*" is deliberately NOT an account row: ValidateAccount REFUSES it, so
+--     that no Account can ever shadow the wildcard (model/validate.go). So the
+--     parent these two columns would reference does not exist and may not be
+--     created.
+--   * A foreign key there would therefore reject every wildcard grant and every
+--     wildcard membership at the INSERT. SQL has no partial or conditional
+--     foreign key -- Postgres has none either, so this is not a SQLite gap -- and
+--     the only shapes that would work are model changes: NULL-encode the
+--     wildcard (changing what every account-scoped query binds, including the
+--     hot-path index below), or mint a real "*" account row (which the model
+--     explicitly forbids). Neither is a schema decision.
+--   * So account_id joins (subject_kind, subject_id) as a column checked in Go
+--     rather than by a constraint. The rule is "an apt_accounts row OR exactly
+--     model.AccountWildcard", enforced in BOTH directions and in every backend
+--     by storage/sqlite/integrity.go (and by hand in storage/memory) -- a write
+--     naming an account that does not exist is refused, and so is deleting an
+--     account a membership or a grant is still stamped with, which is the
+--     ON DELETE RESTRICT these two columns could not declare. A naive existence
+--     check there refuses "*" and breaks both shipped features; that trap has a
+--     test of its own in integrity_test.go.
+--   * Because a REPLACE deletes the conflicting row before inserting the new
+--     one -- firing ON DELETE actions as it goes -- no parent table is written
+--     with INSERT OR REPLACE. Every entity upsert is an ON CONFLICT DO UPDATE,
+--     which mutates the row in place and leaves the children alone.
+--
 -- Design notes:
 --   * Tables are explicit and extensible: timestamps live on every entity for
 --     forward-compatibility with audit (E4-S2); membership is normalized into
@@ -29,8 +120,8 @@ CREATE TABLE IF NOT EXISTS apt_accounts (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 -- apt_memberships rows are edges keyed by the (principal_id, account_id) pair:
@@ -39,9 +130,16 @@ CREATE TABLE IF NOT EXISTS apt_accounts (
 CREATE TABLE IF NOT EXISTS apt_memberships (
     principal_id TEXT NOT NULL,
     account_id   TEXT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (principal_id, account_id)
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (principal_id, account_id),
+    -- RESTRICT: a principal outlives the membership, so it may not be deleted
+    -- while the edge stands.
+    --
+    -- account_id carries NO foreign key -- see "The two account_id columns" in
+    -- the header. A membership stamped "*" enrolls a principal in EVERY account
+    -- (engine.requireMembership), and "*" is not an apt_accounts row.
+    FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_apt_memberships_account
@@ -51,19 +149,30 @@ CREATE TABLE IF NOT EXISTS apt_object_types (
     name        TEXT PRIMARY KEY,
     apt_actions TEXT NOT NULL,          -- JSON array of verb strings
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_permissions (
     id             TEXT PRIMARY KEY,
     object_type    TEXT NOT NULL,
     apt_action     TEXT NOT NULL,
+    -- scope_strategy carries NO foreign key, and could not. It is not an id at
+    -- all: it is an opaque scope reference in the scope package's own small
+    -- grammar -- "", "literal", "inclusive;ids=a,b", "inclusive;rule=quarantine"
+    -- (scope.ParseSpec). The strategy key resolves against an in-process
+    -- registry of resolvers, not a table, and hosts register their own. The rule
+    -- name that MAY appear inside one is a parameter buried in the string, not
+    -- the column's value. There is nothing for a key to point at.
     scope_strategy TEXT NOT NULL DEFAULT '',
     delegatable    INTEGER NOT NULL DEFAULT 0,  -- 0/1: may this permission be bestowed (E3-S2)
     description    TEXT NOT NULL DEFAULT '',
-    created_at     TEXT NOT NULL DEFAULT '',
-    updated_at     TEXT NOT NULL DEFAULT ''
+    created_at     INTEGER NOT NULL DEFAULT 0,
+    updated_at     INTEGER NOT NULL DEFAULT 0,
+    -- The object type is what makes a permission's action verb legal, so a
+    -- permission cannot outlive it: dropping the type would leave the
+    -- permission's typed-action validation with nothing to check against.
+    FOREIGN KEY (object_type) REFERENCES apt_object_types (name) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS apt_principals (
@@ -71,45 +180,61 @@ CREATE TABLE IF NOT EXISTS apt_principals (
     kind         TEXT NOT NULL,
     apt_identity TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT NOT NULL DEFAULT ''
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_principal_roles (
     principal_id TEXT NOT NULL,
     role_id      TEXT NOT NULL,
     seq          INTEGER NOT NULL,       -- preserves caller-supplied order
-    PRIMARY KEY (principal_id, role_id)
+    PRIMARY KEY (principal_id, role_id),
+    -- CASCADE on the OWNER (the principal owns its own role list, and this key
+    -- is the only thing that clears it -- DeletePrincipal writes no DELETE of
+    -- its own), RESTRICT on the role, which is a shared entity a principal
+    -- merely points at.
+    FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (role_id) REFERENCES apt_roles (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS apt_roles (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_role_permissions (
     role_id       TEXT NOT NULL,
     permission_id TEXT NOT NULL,
     seq           INTEGER NOT NULL,
-    PRIMARY KEY (role_id, permission_id)
+    PRIMARY KEY (role_id, permission_id),
+    -- CASCADE on the OWNER, and the only thing that clears the bundle --
+    -- DeleteRole writes no DELETE of its own. RESTRICT on the permission,
+    -- which many roles may cite.
+    FOREIGN KEY (role_id) REFERENCES apt_roles (id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (permission_id) REFERENCES apt_permissions (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS apt_groups (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_group_members (
     group_id     TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     seq          INTEGER NOT NULL,
-    PRIMARY KEY (group_id, principal_id)
+    PRIMARY KEY (group_id, principal_id),
+    -- CASCADE on the OWNER, and the only thing that clears the member rows --
+    -- DeleteGroup writes no DELETE of its own. RESTRICT on the principal,
+    -- which exists independently of any group.
+    FOREIGN KEY (group_id) REFERENCES apt_groups (id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_apt_group_members_principal
@@ -123,8 +248,24 @@ CREATE TABLE IF NOT EXISTS apt_grants (
     permission_id TEXT NOT NULL,
     apt_object    TEXT NOT NULL,         -- identity pattern, string form
     effect        TEXT NOT NULL,
-    created_at    TEXT NOT NULL DEFAULT '',
-    updated_at    TEXT NOT NULL DEFAULT ''
+    created_at    INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL DEFAULT 0,
+    -- RESTRICT: a grant is authority, and authority citing a permission that has
+    -- been deleted is authority nobody can read or revoke.
+    --
+    -- Note the TWO columns that carry no foreign key. (subject_kind, subject_id)
+    -- is POLYMORPHIC -- it points at a principal, a role, or a group depending
+    -- on the kind -- and no single-table foreign key can express that, so it is
+    -- checked in Go instead, in both directions and in every backend
+    -- (integrity.go): a grant may not name a subject that does not exist in the
+    -- table its kind selects, and that subject may not be deleted while the
+    -- grant names it. account_id carries the "*" sentinel and is checked the
+    -- same way; see "The two account_id columns" in the header.
+    --
+    -- The index below is why neither becomes a schema change: nullable columns
+    -- plus a CHECK would break idx_apt_grants_account_subject, the engine's
+    -- hot-path index for GrantsForSubjects.
+    FOREIGN KEY (permission_id) REFERENCES apt_permissions (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_apt_grants_account_subject
@@ -142,8 +283,8 @@ CREATE TABLE IF NOT EXISTS apt_templates (
     description TEXT NOT NULL DEFAULT '',
     params      TEXT NOT NULL DEFAULT '[]',   -- JSON array of {Name,Type,Description}
     apt_grants  TEXT NOT NULL DEFAULT '[]',   -- JSON array of template grants
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (name, version)
 );
 
@@ -156,20 +297,31 @@ CREATE TABLE IF NOT EXISTS apt_rules (
     name        TEXT PRIMARY KEY,
     description TEXT NOT NULL DEFAULT '',
     ast         TEXT NOT NULL,                -- rules.Node canonical JSON
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 -- Append-only audit trail (E4-S2, FR-25). Writes are inserts only; deletes
--- happen exclusively through bulk retention pruning. The timestamp is stored as
--- integer Unix nanoseconds so range filters and newest-first ordering compare
--- numerically (RFC3339 text would mis-sort variable-length fractional seconds).
+-- happen exclusively through bulk retention pruning. The event's instant is
+-- occurred_at (a bare compound name -- the apt_ prefix is only for columns whose
+-- WHOLE name is a reserved word), carrying the same integer nanoseconds as every
+-- other timestamp in this schema, which is what lets range filters and
+-- newest-first ordering compare numerically. Unlike the entity tables it has no
+-- DEFAULT: an audit record with no instant is not a record.
 -- A record made under impersonation carries both the real actor (actor) and the
 -- borrowed target (effective_subject + impersonation_mode). The details column
 -- is an optional JSON blob for event-specific context.
+--
+-- apt_audit_log carries NO FOREIGN KEYS AT ALL, and that is the point rather
+-- than an omission. actor, effective_subject, account and target name entities
+-- an audit record must OUTLIVE: the trail's whole purpose is to record what was
+-- done to a principal or an account that has since been deleted. A key on any
+-- of them would either refuse the delete (RESTRICT, making the trail a reason
+-- you cannot remove a user) or erase the evidence (CASCADE). Both defeat an
+-- append-only trail, so the columns hold plain identifier strings.
 CREATE TABLE IF NOT EXISTS apt_audit_log (
     id                 TEXT PRIMARY KEY,
-    ts_nanos           INTEGER NOT NULL,
+    occurred_at        INTEGER NOT NULL,
     event_type         TEXT NOT NULL,
     apt_action         TEXT NOT NULL DEFAULT '',
     actor              TEXT NOT NULL DEFAULT '',
@@ -182,7 +334,7 @@ CREATE TABLE IF NOT EXISTS apt_audit_log (
     details            TEXT NOT NULL DEFAULT ''     -- JSON object, '' when none
 );
 
-CREATE INDEX IF NOT EXISTS idx_apt_audit_ts ON apt_audit_log (ts_nanos);
+CREATE INDEX IF NOT EXISTS idx_apt_audit_occurred_at ON apt_audit_log (occurred_at);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_actor ON apt_audit_log (actor);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_account ON apt_audit_log (account);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_event_type ON apt_audit_log (event_type);

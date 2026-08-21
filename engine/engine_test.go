@@ -39,6 +39,12 @@ func newFixture(t *testing.T) *fixture {
 			t.Fatalf("seed: %v", err)
 		}
 	}
+	// Both accounts the tests stamp grants and memberships with are real rows:
+	// storage refuses an account_id that is neither an apt_accounts row nor
+	// model.AccountWildcard, in every backend. The wildcard needs no row — that
+	// is the point of it — so tests that stamp "*" seed nothing extra.
+	mustPut(store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
+	mustPut(store.PutAccount(ctx, model.Account{ID: acctOther, Name: acctOther}))
 	mustPut(store.PutObjectType(ctx, model.ObjectType{
 		Name:    "document",
 		Actions: []string{"read", "write", "delete"},
@@ -382,18 +388,50 @@ func TestCheck_MissingFieldsError(t *testing.T) {
 	}
 }
 
-// A grant whose permission has been deleted is inert, not a crash, and yields a
+// vanishingPermissionStore hides ONE permission from the engine while leaving
+// every grant that cites it in place.
+//
+// Storage no longer produces that state on its own: apt_grants.permission_id is
+// an enforced reference in both backends, so deleting a cited permission is
+// refused (the assertion below pins that). The engine's defence against an
+// unresolvable permission is still worth keeping — the store is an interface
+// anyone may implement, and a decision must never crash on a reference it cannot
+// follow — so the state is built at the seam the engine actually reads through.
+type vanishingPermissionStore struct {
+	model.Storage
+	hidden string
+}
+
+func (s vanishingPermissionStore) GetPermission(ctx context.Context, id string) (model.Permission, error) {
+	if id == s.hidden {
+		return model.Permission{}, aerr.New(aerr.APERTURE_NOT_FOUND, "permission not found")
+	}
+	return s.Storage.GetPermission(ctx, id)
+}
+
+// A grant whose permission cannot be resolved is inert, not a crash, and yields a
 // clean default-deny when it was the only candidate.
 func TestCheck_DanglingPermissionIsInert(t *testing.T) {
 	f := newFixture(t)
 	f.principal("alice")
 	f.grant("g1", acctAcme, subjPrincipal("alice"), model.EffectAllow, permRead, "document:42")
-	if err := f.store.DeletePermission(context.Background(), permRead); err != nil {
-		t.Fatalf("delete permission: %v", err)
+
+	// Storage refuses to orphan the grant in the first place.
+	err := f.store.DeletePermission(context.Background(), permRead)
+	if code := aerr.CodeOf(err); code != aerr.APERTURE_STORAGE_CONSTRAINT {
+		t.Fatalf("deleting a permission a grant still cites: code = %q, want %q",
+			code, aerr.APERTURE_STORAGE_CONSTRAINT)
 	}
-	d := f.check(acctAcme, "alice", "read", "document:42")
+
+	eng := New(vanishingPermissionStore{Storage: f.store, hidden: permRead})
+	d, err := eng.Check(context.Background(), Request{
+		Account: acctAcme, Principal: "alice", Action: "read", Object: "document:42",
+	})
+	if err != nil {
+		t.Fatalf("Check with an unresolvable permission: %v", err)
+	}
 	if d.Allow {
-		t.Fatalf("grant with a deleted permission must not authorize, got allow (%s)", d.Reason)
+		t.Fatalf("grant with an unresolvable permission must not authorize, got allow (%s)", d.Reason)
 	}
 }
 

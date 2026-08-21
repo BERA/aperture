@@ -39,6 +39,19 @@ func newTestServer(t *testing.T) (*httptest.Server, model.Storage) {
 // existing test keeps exercising the default (everything managed) path.
 func newTestServerManaged(t *testing.T, managed service.ManagedEntities) (*httptest.Server, model.Storage) {
 	t.Helper()
+	svc, store := newTestService(t, managed)
+	handler := server.Authenticate(auth.NewDev(), server.New(svc))
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv, store
+}
+
+// newTestService builds the admin-seeded store and the facade over it, without
+// deciding how the facade gets served. newTestServerManaged wraps it in the
+// default server; delete_order_test.go wraps it in one carrying a capturing
+// logger, so the Twirp error hook's own output can be asserted.
+func newTestService(t *testing.T, managed service.ManagedEntities) (*service.Service, model.Storage) {
+	t.Helper()
 	ctx := context.Background()
 	store := memory.New()
 	must(t, store.Setup(ctx))
@@ -69,10 +82,7 @@ func newTestServerManaged(t *testing.T, managed service.ManagedEntities) (*httpt
 		service.WithImpersonation(impersonation.New(store, eng)),
 		service.WithManagedEntities(managed),
 	)
-	handler := server.Authenticate(auth.NewDev(), server.New(svc))
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	return srv, store
+	return svc, store
 }
 
 // client returns a Twirp JSON client whose calls carry the given bearer (the
