@@ -101,30 +101,29 @@ func (s *Store) Close() error {
 // UTC, encoded and decoded by storage/storagetime. That package owns the
 // zero mapping (time.Time{} <-> 0) and the representable-range rejection, and is
 // the only place in the storage layer where a time.Time becomes an integer —
-// never call UnixNano here.
-//
-// encodeTime and decodeTime below are the remaining RFC3339Nano text pair, used
-// by the columns that are still TEXT. They are transitional: the columns move to
-// INTEGER and these two go away, leaving storagetime as the single encoding.
+// never call UnixNano here. Every timestamp column in schema.sql is INTEGER;
+// there is no text timestamp left to parse.
 
-// encodeTime renders a time as RFC3339Nano, or "" for the zero value so zero
-// round-trips to zero rather than the year-0001 sentinel.
-func encodeTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
+// encodeStamps encodes an entity's CreatedAt/UpdatedAt pair for the INSERT.
+// An instant outside the storable range comes back as APERTURE_INVALID_INPUT
+// from storagetime and is returned before any statement runs, so an
+// unrepresentable timestamp is refused rather than written as an overflow.
+func encodeStamps(created, updated time.Time) (int64, int64, error) {
+	c, err := storagetime.Encode(created)
+	if err != nil {
+		return 0, 0, err
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	u, err := storagetime.Encode(updated)
+	if err != nil {
+		return 0, 0, err
+	}
+	return c, u, nil
 }
 
-func decodeTime(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, aerr.Wrap(aerr.APERTURE_STORAGE, "decode timestamp", err)
-	}
-	return t.UTC(), nil
+// decodeStamps is the read-side counterpart. Decode cannot fail — every int64 is
+// a representable instant — so scanners assign the pair directly.
+func decodeStamps(created, updated int64) (time.Time, time.Time) {
+	return storagetime.Decode(created), storagetime.Decode(updated)
 }
 
 // encodeBool stores a Go bool as SQLite's integer 0/1 convention.
@@ -153,10 +152,14 @@ func (s *Store) PutAccount(ctx context.Context, a model.Account) error {
 	if err := model.ValidateAccount(a); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	created, updated, err := encodeStamps(a.CreatedAt, a.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_accounts (id, name, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
-		a.ID, a.Name, a.Description, encodeTime(a.CreatedAt), encodeTime(a.UpdatedAt))
+		a.ID, a.Name, a.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put account", err)
 	}
@@ -198,7 +201,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 func scanAccount(sc scanner) (model.Account, error) {
 	var (
 		a                model.Account
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&a.ID, &a.Name, &a.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -206,13 +209,7 @@ func scanAccount(sc scanner) (model.Account, error) {
 		}
 		return model.Account{}, wrapStorage("scan account", err)
 	}
-	var err error
-	if a.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Account{}, err
-	}
-	if a.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Account{}, err
-	}
+	a.CreatedAt, a.UpdatedAt = decodeStamps(created, updated)
 	return a, nil
 }
 
@@ -222,10 +219,14 @@ func (s *Store) PutMembership(ctx context.Context, m model.Membership) error {
 	if err := model.ValidateMembership(m); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	created, updated, err := encodeStamps(m.CreatedAt, m.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
 		VALUES (?, ?, ?, ?)`,
-		m.PrincipalID, m.AccountID, encodeTime(m.CreatedAt), encodeTime(m.UpdatedAt))
+		m.PrincipalID, m.AccountID, created, updated)
 	if err != nil {
 		return wrapStorage("put membership", err)
 	}
@@ -307,7 +308,7 @@ func collectMemberships(rows *sql.Rows) ([]model.Membership, error) {
 func scanMembership(sc scanner) (model.Membership, error) {
 	var (
 		m                model.Membership
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&m.PrincipalID, &m.AccountID, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -315,13 +316,7 @@ func scanMembership(sc scanner) (model.Membership, error) {
 		}
 		return model.Membership{}, wrapStorage("scan membership", err)
 	}
-	var err error
-	if m.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Membership{}, err
-	}
-	if m.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Membership{}, err
-	}
+	m.CreatedAt, m.UpdatedAt = decodeStamps(created, updated)
 	return m, nil
 }
 
@@ -335,10 +330,14 @@ func (s *Store) PutObjectType(ctx context.Context, ot model.ObjectType) error {
 	if err != nil {
 		return wrapStorage("marshal actions", err)
 	}
+	created, updated, err := encodeStamps(ot.CreatedAt, ot.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
-		ot.Name, string(actions), ot.Description, encodeTime(ot.CreatedAt), encodeTime(ot.UpdatedAt))
+		ot.Name, string(actions), ot.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put object type", err)
 	}
@@ -385,7 +384,7 @@ func scanObjectType(sc scanner) (model.ObjectType, error) {
 	var (
 		ot               model.ObjectType
 		actions          string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&ot.Name, &actions, &ot.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -396,13 +395,7 @@ func scanObjectType(sc scanner) (model.ObjectType, error) {
 	if err := json.Unmarshal([]byte(actions), &ot.Actions); err != nil {
 		return model.ObjectType{}, wrapStorage("unmarshal actions", err)
 	}
-	var err error
-	if ot.CreatedAt, err = decodeTime(created); err != nil {
-		return model.ObjectType{}, err
-	}
-	if ot.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.ObjectType{}, err
-	}
+	ot.CreatedAt, ot.UpdatedAt = decodeStamps(created, updated)
 	return ot, nil
 }
 
@@ -416,10 +409,14 @@ func (s *Store) PutPermission(ctx context.Context, p model.Permission) error {
 	if err := model.ValidatePermission(p, ot); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt))
+		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, created, updated)
 	if err != nil {
 		return wrapStorage("put permission", err)
 	}
@@ -462,7 +459,7 @@ func scanPermission(sc scanner) (model.Permission, error) {
 	var (
 		p                model.Permission
 		delegatable      int64
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&p.ID, &p.ObjectType, &p.Action, &p.ScopeStrategy, &delegatable, &p.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -471,13 +468,7 @@ func scanPermission(sc scanner) (model.Permission, error) {
 		return model.Permission{}, wrapStorage("scan permission", err)
 	}
 	p.Delegatable = delegatable != 0
-	var err error
-	if p.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Permission{}, err
-	}
-	if p.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Permission{}, err
-	}
+	p.CreatedAt, p.UpdatedAt = decodeStamps(created, updated)
 	return p, nil
 }
 
@@ -487,11 +478,15 @@ func (s *Store) PutPrincipal(ctx context.Context, p model.Principal) error {
 	if err := model.ValidatePrincipal(p); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put principal", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR REPLACE INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)`,
-			p.ID, string(p.Kind), p.Identity, p.DisplayName, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt)); err != nil {
+			p.ID, string(p.Kind), p.Identity, p.DisplayName, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, p.ID); err != nil {
@@ -573,7 +568,7 @@ func scanPrincipal(sc scanner) (model.Principal, error) {
 	var (
 		p                model.Principal
 		kind             string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&p.ID, &kind, &p.Identity, &p.DisplayName, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -582,13 +577,7 @@ func scanPrincipal(sc scanner) (model.Principal, error) {
 		return model.Principal{}, wrapStorage("scan principal", err)
 	}
 	p.Kind = model.PrincipalKind(kind)
-	var err error
-	if p.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Principal{}, err
-	}
-	if p.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Principal{}, err
-	}
+	p.CreatedAt, p.UpdatedAt = decodeStamps(created, updated)
 	return p, nil
 }
 
@@ -598,11 +587,15 @@ func (s *Store) PutRole(ctx context.Context, r model.Role) error {
 	if err := model.ValidateRole(r); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put role", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR REPLACE INTO apt_roles (id, name, description, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?)`,
-			r.ID, r.Name, r.Description, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt)); err != nil {
+			r.ID, r.Name, r.Description, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, r.ID); err != nil {
@@ -683,7 +676,7 @@ func (s *Store) DeleteRole(ctx context.Context, id string) error {
 func scanRole(sc scanner) (model.Role, error) {
 	var (
 		r                model.Role
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&r.ID, &r.Name, &r.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -691,13 +684,7 @@ func scanRole(sc scanner) (model.Role, error) {
 		}
 		return model.Role{}, wrapStorage("scan role", err)
 	}
-	var err error
-	if r.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Role{}, err
-	}
-	if r.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Role{}, err
-	}
+	r.CreatedAt, r.UpdatedAt = decodeStamps(created, updated)
 	return r, nil
 }
 
@@ -707,11 +694,15 @@ func (s *Store) PutGroup(ctx context.Context, g model.Group) error {
 	if err := model.ValidateGroup(g); err != nil {
 		return err
 	}
+	created, updated, err := encodeStamps(g.CreatedAt, g.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	return s.inTx(ctx, "put group", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR REPLACE INTO apt_groups (id, name, description, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?)`,
-			g.ID, g.Name, g.Description, encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt)); err != nil {
+			g.ID, g.Name, g.Description, created, updated); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, g.ID); err != nil {
@@ -796,7 +787,7 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 func scanGroup(sc scanner) (model.Group, error) {
 	var (
 		g                model.Group
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&g.ID, &g.Name, &g.Description, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -804,13 +795,7 @@ func scanGroup(sc scanner) (model.Group, error) {
 		}
 		return model.Group{}, wrapStorage("scan group", err)
 	}
-	var err error
-	if g.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Group{}, err
-	}
-	if g.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Group{}, err
-	}
+	g.CreatedAt, g.UpdatedAt = decodeStamps(created, updated)
 	return g, nil
 }
 
@@ -854,11 +839,15 @@ func (s *Store) PutGrant(ctx context.Context, g model.Grant) error {
 	if err := model.ValidateGrant(g); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	created, updated, err := encodeStamps(g.CreatedAt, g.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
-		encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt))
+		created, updated)
 	if err != nil {
 		return wrapStorage("put grant", err)
 	}
@@ -973,7 +962,7 @@ func scanGrant(sc scanner) (model.Grant, error) {
 	var (
 		g                       model.Grant
 		kind, effect            string
-		created, updated        string
+		created, updated        int64
 		subjectID, permissionID string
 	)
 	if err := sc.Scan(&g.ID, &g.AccountID, &kind, &subjectID, &permissionID, &g.Object, &effect, &created, &updated); err != nil {
@@ -985,13 +974,7 @@ func scanGrant(sc scanner) (model.Grant, error) {
 	g.Subject = model.Subject{Kind: model.SubjectKind(kind), ID: subjectID}
 	g.PermissionID = permissionID
 	g.Effect = model.Effect(effect)
-	var err error
-	if g.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Grant{}, err
-	}
-	if g.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Grant{}, err
-	}
+	g.CreatedAt, g.UpdatedAt = decodeStamps(created, updated)
 	return g, nil
 }
 
@@ -1011,11 +994,15 @@ func (s *Store) PutTemplate(ctx context.Context, t model.Template) error {
 	if err != nil {
 		return wrapStorage("marshal template grants", err)
 	}
+	created, updated, err := encodeStamps(t.CreatedAt, t.UpdatedAt)
+	if err != nil {
+		return err
+	}
 	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_templates (name, version, description, params, apt_grants, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		t.Name, t.Version, t.Description, string(params), string(grants),
-		encodeTime(t.CreatedAt), encodeTime(t.UpdatedAt))
+		created, updated)
 	if err != nil {
 		return wrapStorage("put template", err)
 	}
@@ -1085,7 +1072,7 @@ func scanTemplate(sc scanner) (model.Template, error) {
 	var (
 		t                model.Template
 		params, grants   string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&t.Name, &t.Version, &t.Description, &params, &grants, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -1103,13 +1090,7 @@ func scanTemplate(sc scanner) (model.Template, error) {
 			return model.Template{}, wrapStorage("unmarshal template grants", err)
 		}
 	}
-	var err error
-	if t.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Template{}, err
-	}
-	if t.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Template{}, err
-	}
+	t.CreatedAt, t.UpdatedAt = decodeStamps(created, updated)
 	return t, nil
 }
 
@@ -1124,10 +1105,14 @@ func (s *Store) PutRule(ctx context.Context, r model.Rule) error {
 	if err := model.ValidateRule(r); err != nil {
 		return err
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	created, updated, err := encodeStamps(r.CreatedAt, r.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_rules (name, description, ast, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
-		r.Name, r.Description, string(r.AST), encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt))
+		r.Name, r.Description, string(r.AST), created, updated)
 	if err != nil {
 		return wrapStorage("put rule", err)
 	}
@@ -1173,7 +1158,7 @@ func scanRule2(sc scanner) (model.Rule, error) {
 	var (
 		r                model.Rule
 		ast              string
-		created, updated string
+		created, updated int64
 	)
 	if err := sc.Scan(&r.Name, &r.Description, &ast, &created, &updated); err != nil {
 		if isNoRows(err) {
@@ -1182,19 +1167,13 @@ func scanRule2(sc scanner) (model.Rule, error) {
 		return model.Rule{}, wrapStorage("scan rule", err)
 	}
 	r.AST = json.RawMessage(ast)
-	var err error
-	if r.CreatedAt, err = decodeTime(created); err != nil {
-		return model.Rule{}, err
-	}
-	if r.UpdatedAt, err = decodeTime(updated); err != nil {
-		return model.Rule{}, err
-	}
+	r.CreatedAt, r.UpdatedAt = decodeStamps(created, updated)
 	return r, nil
 }
 
 // ---- Audit trail (append-only) ----
 
-const auditColumns = `id, ts_nanos, event_type, apt_action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
+const auditColumns = `id, occurred_at, event_type, apt_action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
 
 func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 	details := ""
@@ -1251,7 +1230,7 @@ func (s *Store) QueryAudit(ctx context.Context, filter model.AuditFilter) ([]mod
 		if err != nil {
 			return nil, err
 		}
-		where = append(where, "ts_nanos >= ?")
+		where = append(where, "occurred_at >= ?")
 		args = append(args, since)
 	}
 	if !filter.Until.IsZero() {
@@ -1259,14 +1238,14 @@ func (s *Store) QueryAudit(ctx context.Context, filter model.AuditFilter) ([]mod
 		if err != nil {
 			return nil, err
 		}
-		where = append(where, "ts_nanos < ?")
+		where = append(where, "occurred_at < ?")
 		args = append(args, until)
 	}
 	if len(where) > 0 {
 		b.WriteString(" WHERE ")
 		b.WriteString(strings.Join(where, " AND "))
 	}
-	b.WriteString(" ORDER BY ts_nanos DESC, id DESC")
+	b.WriteString(" ORDER BY occurred_at DESC, id DESC")
 	if filter.Limit > 0 {
 		b.WriteString(" LIMIT ?")
 		args = append(args, filter.Limit)
@@ -1299,7 +1278,7 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 			return removed, err
 		}
 		res, err := s.exec.ExecContext(ctx,
-			`DELETE FROM apt_audit_log WHERE ts_nanos < ?`, before)
+			`DELETE FROM apt_audit_log WHERE occurred_at < ?`, before)
 		if err != nil {
 			return removed, wrapStorage("prune audit by age", err)
 		}
@@ -1311,7 +1290,7 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	if policy.MaxCount > 0 {
 		res, err := s.exec.ExecContext(ctx, `
 			DELETE FROM apt_audit_log WHERE id NOT IN (
-				SELECT id FROM apt_audit_log ORDER BY ts_nanos DESC, id DESC LIMIT ?
+				SELECT id FROM apt_audit_log ORDER BY occurred_at DESC, id DESC LIMIT ?
 			)`, policy.MaxCount)
 		if err != nil {
 			return removed, wrapStorage("prune audit by size", err)
@@ -1326,15 +1305,15 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 func scanAudit(sc scanner) (model.AuditEvent, error) {
 	var (
 		ev                          model.AuditEvent
-		tsNanos                     int64
+		occurredAt                  int64
 		eventType, outcome, details string
 	)
-	if err := sc.Scan(&ev.ID, &tsNanos, &eventType, &ev.Action, &ev.Actor,
+	if err := sc.Scan(&ev.ID, &occurredAt, &eventType, &ev.Action, &ev.Actor,
 		&ev.EffectiveSubject, &ev.ImpersonationMode, &ev.Account, &ev.Target, &outcome,
 		&ev.Reason, &details); err != nil {
 		return model.AuditEvent{}, wrapStorage("scan audit", err)
 	}
-	ev.Timestamp = storagetime.Decode(tsNanos)
+	ev.Timestamp = storagetime.Decode(occurredAt)
 	ev.EventType = model.AuditEventType(eventType)
 	ev.Outcome = model.AuditOutcome(outcome)
 	if details != "" {

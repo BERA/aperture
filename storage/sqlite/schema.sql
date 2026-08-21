@@ -14,6 +14,27 @@
 --   * This is a database-identifier convention only. Go types, struct fields,
 --     wire field names, and CLI flags are unaffected.
 --
+-- Time:
+--   * EVERY instant in this schema -- created_at, updated_at, and the audit
+--     log's occurred_at alike -- is an INTEGER count of NANOSECONDS since the
+--     Unix epoch (1970-01-01T00:00:00Z), in UTC. There is no text timestamp
+--     and no per-dialect timestamp type anywhere in Aperture's storage.
+--   * The representable window is the signed 64-bit nanosecond range:
+--     1677-09-21T00:12:43.145224192Z .. 2262-04-11T23:47:16.854775807Z.
+--     An instant outside it is refused with APERTURE_INVALID_INPUT before the
+--     write; it is never wrapped, clamped, or stored as an overflow value.
+--   * 0 means UNSET, not the Unix epoch. That is what lets every timestamp
+--     column stay NOT NULL DEFAULT 0 and still read back as the zero time.
+--     Aperture stamps from a real clock and never writes the epoch itself, so
+--     nothing in the model can collide with the sentinel.
+--   * storage/storagetime owns both mappings (time.Time{} <-> 0 and the range
+--     check) and is the ONLY place in the storage layer where a time.Time
+--     becomes an integer; storage/storagetime/exclusivity_test.go enforces it.
+--   * Integers rather than text because comparison is the point: range filters
+--     and newest-first ordering compare numerically, while RFC3339 text
+--     mis-sorts variable-length fractional seconds. The Postgres column type
+--     is BIGINT, carrying the same unit, for the same reason.
+--
 -- Design notes:
 --   * Tables are explicit and extensible: timestamps live on every entity for
 --     forward-compatibility with audit (E4-S2); membership is normalized into
@@ -29,8 +50,8 @@ CREATE TABLE IF NOT EXISTS apt_accounts (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 -- apt_memberships rows are edges keyed by the (principal_id, account_id) pair:
@@ -39,8 +60,8 @@ CREATE TABLE IF NOT EXISTS apt_accounts (
 CREATE TABLE IF NOT EXISTS apt_memberships (
     principal_id TEXT NOT NULL,
     account_id   TEXT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (principal_id, account_id)
 );
 
@@ -51,8 +72,8 @@ CREATE TABLE IF NOT EXISTS apt_object_types (
     name        TEXT PRIMARY KEY,
     apt_actions TEXT NOT NULL,          -- JSON array of verb strings
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_permissions (
@@ -62,8 +83,8 @@ CREATE TABLE IF NOT EXISTS apt_permissions (
     scope_strategy TEXT NOT NULL DEFAULT '',
     delegatable    INTEGER NOT NULL DEFAULT 0,  -- 0/1: may this permission be bestowed (E3-S2)
     description    TEXT NOT NULL DEFAULT '',
-    created_at     TEXT NOT NULL DEFAULT '',
-    updated_at     TEXT NOT NULL DEFAULT ''
+    created_at     INTEGER NOT NULL DEFAULT 0,
+    updated_at     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_principals (
@@ -71,8 +92,8 @@ CREATE TABLE IF NOT EXISTS apt_principals (
     kind         TEXT NOT NULL,
     apt_identity TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL DEFAULT '',
-    updated_at   TEXT NOT NULL DEFAULT ''
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_principal_roles (
@@ -86,8 +107,8 @@ CREATE TABLE IF NOT EXISTS apt_roles (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_role_permissions (
@@ -101,8 +122,8 @@ CREATE TABLE IF NOT EXISTS apt_groups (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS apt_group_members (
@@ -123,8 +144,8 @@ CREATE TABLE IF NOT EXISTS apt_grants (
     permission_id TEXT NOT NULL,
     apt_object    TEXT NOT NULL,         -- identity pattern, string form
     effect        TEXT NOT NULL,
-    created_at    TEXT NOT NULL DEFAULT '',
-    updated_at    TEXT NOT NULL DEFAULT ''
+    created_at    INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_apt_grants_account_subject
@@ -142,8 +163,8 @@ CREATE TABLE IF NOT EXISTS apt_templates (
     description TEXT NOT NULL DEFAULT '',
     params      TEXT NOT NULL DEFAULT '[]',   -- JSON array of {Name,Type,Description}
     apt_grants  TEXT NOT NULL DEFAULT '[]',   -- JSON array of template grants
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (name, version)
 );
 
@@ -156,20 +177,23 @@ CREATE TABLE IF NOT EXISTS apt_rules (
     name        TEXT PRIMARY KEY,
     description TEXT NOT NULL DEFAULT '',
     ast         TEXT NOT NULL,                -- rules.Node canonical JSON
-    created_at  TEXT NOT NULL DEFAULT '',
-    updated_at  TEXT NOT NULL DEFAULT ''
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );
 
 -- Append-only audit trail (E4-S2, FR-25). Writes are inserts only; deletes
--- happen exclusively through bulk retention pruning. The timestamp is stored as
--- integer Unix nanoseconds so range filters and newest-first ordering compare
--- numerically (RFC3339 text would mis-sort variable-length fractional seconds).
+-- happen exclusively through bulk retention pruning. The event's instant is
+-- occurred_at (a bare compound name -- the apt_ prefix is only for columns whose
+-- WHOLE name is a reserved word), carrying the same integer nanoseconds as every
+-- other timestamp in this schema, which is what lets range filters and
+-- newest-first ordering compare numerically. Unlike the entity tables it has no
+-- DEFAULT: an audit record with no instant is not a record.
 -- A record made under impersonation carries both the real actor (actor) and the
 -- borrowed target (effective_subject + impersonation_mode). The details column
 -- is an optional JSON blob for event-specific context.
 CREATE TABLE IF NOT EXISTS apt_audit_log (
     id                 TEXT PRIMARY KEY,
-    ts_nanos           INTEGER NOT NULL,
+    occurred_at        INTEGER NOT NULL,
     event_type         TEXT NOT NULL,
     apt_action         TEXT NOT NULL DEFAULT '',
     actor              TEXT NOT NULL DEFAULT '',
@@ -182,7 +206,7 @@ CREATE TABLE IF NOT EXISTS apt_audit_log (
     details            TEXT NOT NULL DEFAULT ''     -- JSON object, '' when none
 );
 
-CREATE INDEX IF NOT EXISTS idx_apt_audit_ts ON apt_audit_log (ts_nanos);
+CREATE INDEX IF NOT EXISTS idx_apt_audit_occurred_at ON apt_audit_log (occurred_at);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_actor ON apt_audit_log (actor);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_account ON apt_audit_log (account);
 CREATE INDEX IF NOT EXISTS idx_apt_audit_event_type ON apt_audit_log (event_type);

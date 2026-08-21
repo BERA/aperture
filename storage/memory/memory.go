@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
@@ -81,10 +82,30 @@ func notFound(kind, id string) error {
 		map[string]any{"kind": kind, "id": id})
 }
 
+// validateStamps refuses a CreatedAt/UpdatedAt pair that the storage layer could
+// not represent, with the same APERTURE_INVALID_INPUT the SQLite backend returns.
+//
+// SQLite gets this check for free: its created_at/updated_at columns are INTEGER
+// nanoseconds, so every write runs through storagetime.Encode. This backend keeps
+// the time.Time as handed to it and would happily store year 3000 — so it applies
+// the identical rule by hand. The storable range is a property of the storage
+// CONTRACT, not of one dialect's encoding, and storage/storagetest allows no
+// backend-conditional assertions: if only one backend refused an out-of-range
+// CreatedAt, the two would have diverged.
+func validateStamps(created, updated time.Time) error {
+	if err := storagetime.Validate(created); err != nil {
+		return err
+	}
+	return storagetime.Validate(updated)
+}
+
 // ---- Account ----
 
 func (s *Store) PutAccount(_ context.Context, a model.Account) error {
 	if err := model.ValidateAccount(a); err != nil {
+		return err
+	}
+	if err := validateStamps(a.CreatedAt, a.UpdatedAt); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -127,6 +148,9 @@ func (s *Store) DeleteAccount(_ context.Context, id string) error {
 
 func (s *Store) PutMembership(_ context.Context, m model.Membership) error {
 	if err := model.ValidateMembership(m); err != nil {
+		return err
+	}
+	if err := validateStamps(m.CreatedAt, m.UpdatedAt); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -193,6 +217,9 @@ func (s *Store) PutObjectType(_ context.Context, ot model.ObjectType) error {
 	if err := model.ValidateObjectType(ot); err != nil {
 		return err
 	}
+	if err := validateStamps(ot.CreatedAt, ot.UpdatedAt); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ot.Actions = cloneStrings(ot.Actions)
@@ -244,6 +271,9 @@ func (s *Store) PutPermission(_ context.Context, p model.Permission) error {
 	if err := model.ValidatePermission(p, ot); err != nil {
 		return err
 	}
+	if err := validateStamps(p.CreatedAt, p.UpdatedAt); err != nil {
+		return err
+	}
 	s.permissions[p.ID] = p
 	return nil
 }
@@ -282,6 +312,9 @@ func (s *Store) DeletePermission(_ context.Context, id string) error {
 
 func (s *Store) PutPrincipal(_ context.Context, p model.Principal) error {
 	if err := model.ValidatePrincipal(p); err != nil {
+		return err
+	}
+	if err := validateStamps(p.CreatedAt, p.UpdatedAt); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -329,6 +362,9 @@ func (s *Store) PutRole(_ context.Context, r model.Role) error {
 	if err := model.ValidateRole(r); err != nil {
 		return err
 	}
+	if err := validateStamps(r.CreatedAt, r.UpdatedAt); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r.PermissionIDs = cloneStrings(r.PermissionIDs)
@@ -374,6 +410,9 @@ func (s *Store) PutGroup(_ context.Context, g model.Group) error {
 	if err := model.ValidateGroup(g); err != nil {
 		return err
 	}
+	if err := validateStamps(g.CreatedAt, g.UpdatedAt); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g.MemberPrincipalIDs = cloneStrings(g.MemberPrincipalIDs)
@@ -417,6 +456,9 @@ func (s *Store) DeleteGroup(_ context.Context, id string) error {
 
 func (s *Store) PutGrant(_ context.Context, g model.Grant) error {
 	if err := model.ValidateGrant(g); err != nil {
+		return err
+	}
+	if err := validateStamps(g.CreatedAt, g.UpdatedAt); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -541,6 +583,9 @@ func (s *Store) PutTemplate(_ context.Context, t model.Template) error {
 	if err := model.ValidateTemplate(t); err != nil {
 		return err
 	}
+	if err := validateStamps(t.CreatedAt, t.UpdatedAt); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.templates[templateKey{t.Name, t.Version}] = cloneTemplate(t)
@@ -612,6 +657,9 @@ func (s *Store) DeleteTemplate(_ context.Context, name string, version int) erro
 
 func (s *Store) PutRule(_ context.Context, r model.Rule) error {
 	if err := model.ValidateRule(r); err != nil {
+		return err
+	}
+	if err := validateStamps(r.CreatedAt, r.UpdatedAt); err != nil {
 		return err
 	}
 	s.mu.Lock()

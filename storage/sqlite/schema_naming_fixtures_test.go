@@ -212,7 +212,7 @@ func TestSchemaNamingGateAcceptsLegitimateNames(t *testing.T) {
 			name: "the real schema's own column vocabulary is clean",
 			sql: `CREATE TABLE apt_audit_log (
 			          id                 TEXT PRIMARY KEY,
-			          ts_nanos           INTEGER NOT NULL,
+			          occurred_at        INTEGER NOT NULL,
 			          event_type         TEXT NOT NULL,
 			          actor              TEXT NOT NULL DEFAULT '',
 			          effective_subject  TEXT NOT NULL DEFAULT '',
