@@ -95,6 +95,26 @@ func (h *twirpHandler) Check(ctx context.Context, req *rpc.CheckRequest) (*rpc.D
 	return &rpc.Decision{Allow: res.Allow, Reason: res.Reason, DecidingGrantIds: res.DecidingGrantIDs}, nil
 }
 
+// Capabilities reports which entity kinds this deployment manages. It is OPEN,
+// like the decision RPCs above and like the Check probe the admin shell already
+// issues on load: it never calls h.principal, so an anonymous request is
+// answered rather than rejected.
+//
+// That is safe because of what the facade returns — three booleans of boot-time
+// operator configuration. No storage is read, no actor is consulted, and no
+// account id, principal id, or count can reach the response, so there is nothing
+// here to scope to a caller and no identity that would change the answer. The
+// translation below is deliberately total: it names the three fields and can
+// neither fail nor grow a model value by accident.
+func (h *twirpHandler) Capabilities(_ context.Context, _ *rpc.Empty) (*rpc.CapabilitiesResponse, error) {
+	c := h.svc.Capabilities()
+	return &rpc.CapabilitiesResponse{
+		ManageAccounts:    c.ManageAccounts,
+		ManagePrincipals:  c.ManagePrincipals,
+		ManageMemberships: c.ManageMemberships,
+	}, nil
+}
+
 func (h *twirpHandler) CheckBatch(ctx context.Context, req *rpc.CheckBatchRequest) (*rpc.CheckBatchResponse, error) {
 	qs := make([]service.Query, len(req.Queries))
 	for i, q := range req.Queries {

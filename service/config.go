@@ -100,6 +100,47 @@ type ManagedEntities struct {
 	Memberships Managed
 }
 
+// Capabilities is what a client may DO with this deployment's entity model,
+// flattened to plain booleans: one per gated entity kind, true when Aperture
+// manages the kind and false when an operator has declared it mastered
+// elsewhere. It is the shape a surface hands a caller so the caller can render
+// the controls it is allowed to use, instead of discovering the lock by
+// attempting a write and reading APERTURE_ENTITY_UNMANAGED back.
+//
+// It deliberately collapses Managed's third state. ManagedDefault and
+// ManagedYes differ only in whether an operator typed the value; both mean the
+// kind is writable, and no client can act on the distinction. Reporting it would
+// also disclose more of an operator's configuration than the question asked.
+//
+// It carries booleans and nothing else — no ids, no counts, no model data — so
+// that a surface can answer the question without authenticating the caller.
+type Capabilities struct {
+	// ManageAccounts reports whether PutAccount and DeleteAccount are available.
+	ManageAccounts bool
+	// ManagePrincipals reports whether PutPrincipal and DeletePrincipal are
+	// available.
+	ManagePrincipals bool
+	// ManageMemberships reports whether PutMembership and DeleteMembership are
+	// available. Independent of the other two.
+	ManageMemberships bool
+}
+
+// Capabilities reports what this deployment lets a client do to the gated entity
+// kinds. It reads immutable boot-time configuration, touches no storage, needs
+// no actor, and cannot fail — which is what lets every surface expose it as an
+// open, unauthenticated call.
+//
+// The zero-value posture (a Service built without WithManagedEntities) reports
+// all three true, Aperture's historical behaviour.
+func (s *Service) Capabilities() Capabilities {
+	m := s.ManagedEntities()
+	return Capabilities{
+		ManageAccounts:    m.Accounts.Enabled(),
+		ManagePrincipals:  m.Principals.Enabled(),
+		ManageMemberships: m.Memberships.Enabled(),
+	}
+}
+
 // Environment variable names. All under the APERTURE_ namespace per convention,
 // all positive polarity, and all defaulting to enabled when unset or empty.
 const (

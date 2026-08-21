@@ -28,6 +28,27 @@ service ApertureService {
   rpc Explain(CheckRequest) returns (ExplainResponse);
   rpc ExplainBatch(CheckBatchRequest) returns (ExplainBatchResponse);
 
+  // ---- Deployment posture (open: no auth required) ----
+  // Capabilities reports which entity kinds THIS DEPLOYMENT manages, so a client
+  // can render the controls it is allowed to use before it touches them. Without
+  // it the only way to learn that a kind is locked is to attempt a write and read
+  // the APERTURE_ENTITY_UNMANAGED refusal back — the admin UI would offer a
+  // Create button, take the operator through a whole form, and fail on save.
+  //
+  // It is OPEN — deliberately unauthenticated, like the decision RPCs above and
+  // like the open Check the admin shell already probes with on load. The reason
+  // it can be: the response is three booleans of BOOT-TIME OPERATOR
+  // CONFIGURATION and nothing else. No account ids, no principal ids, no counts,
+  // no model data of any kind passes through it, so there is nothing here to
+  // scope to a caller and no authenticated identity that would change the answer.
+  // Every caller gets the same three booleans, which is exactly why requiring a
+  // credential would buy nothing.
+  //
+  // What it does disclose is deployment posture: that this Aperture does or does
+  // not master (say) its own accounts. That is the same class of fact as the
+  // service being reachable at all, and it is knowingly public.
+  rpc Capabilities(Empty) returns (CapabilitiesResponse);
+
   // ---- Schema entities (reads require auth; writes require system-admin) ----
   rpc PutObjectType(EntityRequest) returns (Empty);
   rpc GetObjectType(GetRequest) returns (EntityResponse);
@@ -139,6 +160,37 @@ service ApertureService {
 }
 
 message Empty {}
+
+// ---- Deployment posture ----
+//
+// CapabilitiesResponse is the whole answer of the Capabilities RPC: three
+// booleans naming the entity kinds this deployment manages the lifecycle of.
+// Each is TRUE when Aperture owns the kind (the default, and what every
+// deployment did before the switches existed) and FALSE when an operator has
+// declared the kind mastered elsewhere, in which case Aperture refuses every
+// create, update, and delete of it with APERTURE_ENTITY_UNMANAGED.
+//
+// Three named fields rather than a map<string, bool>: the set of gated kinds is
+// closed and defined in Go (service.ManagedEntities), so a map would invent a
+// second, unchecked entity vocabulary on the wire — and a map's missing key is
+// indistinguishable from a false value, which on a switch whose documented
+// default is TRUE is the wrong way to be ambiguous. A named field is present in
+// the JSON with an explicit true/false, and a future gated kind is a new field
+// that old clients ignore.
+//
+// The response carries NO message strings. What to tell a human about a locked
+// control is a client-side decision (the admin shell's tooltips), kept off the
+// wire so it can be reworded without a proto change.
+message CapabilitiesResponse {
+  // manage_accounts: Service.PutAccount / DeleteAccount are available.
+  bool manage_accounts = 1;
+  // manage_principals: Service.PutPrincipal / DeletePrincipal are available.
+  bool manage_principals = 2;
+  // manage_memberships: Service.PutMembership / DeleteMembership are available.
+  // Independent of the other two — a deployment can master accounts and
+  // principals upstream while still deciding who belongs to what.
+  bool manage_memberships = 3;
+}
 
 // ---- Server-side list filtering ----
 //
