@@ -46,6 +46,18 @@ import (
 // both types -- it was already INTEGER before the change, so only its name
 // betrays it.
 //
+// The break BEFORE this one
+//
+// Signals (1)-(3) all read apt_-prefixed tables, so on their own they miss the
+// oldest databases entirely: v0.5.0 predates the apt_ prefix and named its
+// tables accounts, grants, audit_log. Such a database has no apt_ table at all,
+// so the checks above find nothing, Setup happily creates the full apt_ schema
+// beside the old tables, and Aperture starts up EMPTY while every account, role
+// and grant sits untouched and unread a few tables away. That is the quietest
+// failure of the three and the one an operator is least equipped to diagnose,
+// so unprefixedShape looks for it too -- see there for how it avoids mistaking
+// a host's own `accounts` table for Aperture's.
+//
 // Cost on the happy path is bounded: one sqlite_master query, one PRAGMA per
 // Aperture table, and one single-row probe per table. No full scan; a healthy
 // database pays microseconds.
@@ -78,6 +90,14 @@ const tablePrefix = "apt_"
 // returns nil. Anything else returns APERTURE_STORAGE_SCHEMA_INCOMPATIBLE
 // naming the offending column, what is wrong with it, and the remedy.
 func guardSchemaShape(ctx context.Context, exec sqlExec) error {
+	// Oldest break first. It is checked even when apt_ tables are already
+	// present, because "ran the new build once against a v0.5.0 database" is a
+	// real state: it leaves empty apt_ tables next to the full old ones, and
+	// that database must be refused, not blessed on the second run.
+	if err := unprefixedShape(ctx, exec); err != nil {
+		return err
+	}
+
 	tables, err := apertureTables(ctx, exec)
 	if err != nil {
 		return err
@@ -137,6 +157,84 @@ func guardSchemaShape(ctx context.Context, exec sqlExec) error {
 		}
 	}
 	return nil
+}
+
+// prePrefixFingerprint identifies a database from before the apt_ table prefix.
+//
+// The table NAMES alone cannot do it. `accounts`, `roles`, `groups` and
+// `permissions` are among the most common table names in software, and the apt_
+// prefix exists precisely so Aperture can share a database with a host schema
+// (see schema.sql's header). Refusing to start because the host happens to own a
+// table called `roles` would be a worse bug than the one being guarded against.
+//
+// So each entry pairs an old table name with columns that, together, are
+// Aperture's own shape rather than a generic one: the join tables' exact
+// (left_id, right_id, seq) triples, the audit log's ts_nanos, the grant's
+// subject_kind/effect pair. A table matches only if it carries EVERY column
+// listed for it.
+var prePrefixFingerprint = []struct {
+	table   string
+	columns []string
+}{
+	{"principal_roles", []string{"principal_id", "role_id", "seq"}},
+	{"role_permissions", []string{"role_id", "permission_id", "seq"}},
+	{"group_members", []string{"group_id", "principal_id", "seq"}},
+	{"grants", []string{"account_id", "subject_kind", "subject_id", "permission_id", "object", "effect"}},
+	{"object_types", []string{"name", "actions"}},
+	{"audit_log", []string{"id", "ts_nanos", "event_type"}},
+}
+
+// prePrefixQuorum is how many fingerprint tables must match before the database
+// is called Aperture's. A real pre-prefix database always has all six, because
+// one Setup created them together -- so the quorum costs no detection at all. It
+// buys the margin: a host schema would have to reproduce three distinct
+// Aperture-shaped tables, column set included, by coincidence.
+const prePrefixQuorum = 3
+
+// unprefixedShape refuses a database written before Aperture's tables gained the
+// apt_ prefix (v0.5.0 and earlier). Left undetected this is the quietest failure
+// of all: no apt_ table exists, so Setup creates the whole schema fresh and
+// Aperture comes up empty while the operator's data sits in the unprefixed
+// tables, unread and unmentioned.
+func unprefixedShape(ctx context.Context, exec sqlExec) error {
+	var matched []string
+	for _, want := range prePrefixFingerprint {
+		cols, err := tableColumns(ctx, exec, want.table)
+		if err != nil {
+			return err
+		}
+		if len(cols) == 0 {
+			continue // no such table; PRAGMA on a missing table returns no rows
+		}
+		present := make(map[string]bool, len(cols))
+		for _, c := range cols {
+			present[c.name] = true
+		}
+		if hasAll(present, want.columns) {
+			matched = append(matched, want.table)
+		}
+	}
+	if len(matched) < prePrefixQuorum {
+		return nil
+	}
+	// Same opening stem as incompatible(), so every refusal this guard can
+	// produce is one recognizable sentence in a startup log.
+	return aerr.Newf(aerr.APERTURE_STORAGE_SCHEMA_INCOMPATIBLE,
+		"this database was written by an incompatible build of Aperture: it predates the %s table prefix "+
+			"and carries the old unprefixed tables (%s), which this build does not read -- "+
+			"starting against it would come up EMPTY while that data sat unread beside the new tables; "+
+			"Aperture has no migration path (no schema versioning, no upgrade step) -- "+
+			"move or delete the old database, let Setup create a fresh one, and re-seed it",
+		tablePrefix, strings.Join(matched, ", "))
+}
+
+func hasAll(present map[string]bool, want []string) bool {
+	for _, c := range want {
+		if !present[c] {
+			return false
+		}
+	}
+	return true
 }
 
 // incompatible builds the refusal. It names WHERE the problem is, WHAT is wrong

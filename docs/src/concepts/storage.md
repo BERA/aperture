@@ -116,10 +116,21 @@ objection, and the mistake would surface much later, as a scan error or a wrong
 timestamp, far from its cause.
 
 So the SQLite backend's `Setup` **inspects an existing database first and refuses
-one it cannot read**, returning `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE` naming the
-offending column and the remedy. It checks both the declared column types and the
-values actually stored (SQLite lets those disagree), plus retired column names. A
-fresh database and an up-to-date one both proceed normally.
+one it cannot read**, returning `APERTURE_STORAGE_SCHEMA_INCOMPATIBLE` naming
+what it found and the remedy. It looks for:
+
+- **declared column types** — a timestamp column not declared `INTEGER`;
+- **stored value types** — a column declared `INTEGER` whose rows still hold
+  text, which SQLite permits and which a type declaration alone would miss;
+- **retired column names** — `ts_nanos`, which was `INTEGER` before the change,
+  so only its name gives it away;
+- **the older, unprefixed schema** — databases predating the `apt_` table prefix
+  have no `apt_` table at all, so nothing above would notice them and Aperture
+  would come up *empty* beside the operator's data. These are recognized by
+  fingerprinting Aperture's own column sets, not by table name, so a host schema
+  that merely owns a table called `accounts` or `roles` is left alone.
+
+A fresh database and an up-to-date one both proceed normally.
 
 The remedy is always the same: move or delete the old database, let `Setup`
 create a fresh one, and re-seed it. Export first with the

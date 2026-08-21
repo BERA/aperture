@@ -20,6 +20,11 @@ import (
 // real upgrade would never contain.
 const preChangeSchema = "testdata/schema_pre_nanoseconds.sql"
 
+// prePrefixSchema is the schema as v0.5.0 actually shipped it: BEFORE the apt_
+// table prefix as well as before integer nanoseconds. It is the older of the two
+// breaks and the one the acceptance criterion names by version.
+const prePrefixSchema = "testdata/schema_pre_prefix.sql"
+
 // TestSetupRefusesAPreChangeDatabase is the story: a database written by the
 // previous release must fail at Setup, not hours later at the first read.
 func TestSetupRefusesAPreChangeDatabase(t *testing.T) {
@@ -45,6 +50,102 @@ func TestSetupRefusesAPreChangeDatabase(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("refusal does not name %q:\n%s", want, msg)
 		}
+	}
+}
+
+// TestSetupRefusesAV050Database is the acceptance criterion stated by version.
+// v0.5.0 predates the apt_ table prefix, so NONE of its tables are ones this
+// build looks at by name. Left undetected that is the quietest failure of all:
+// Setup finds no apt_ table, creates the entire schema fresh, and Aperture comes
+// up EMPTY while every account, role and grant sits unread in the unprefixed
+// tables a few names away.
+func TestSetupRefusesAV050Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aperture.db")
+	withRawDB(t, path, func(db *sql.DB) {
+		mustExec(t, db, string(mustReadFixture(t, prePrefixSchema)))
+
+		const stamp = "2024-07-01T00:00:00.123456789Z"
+		mustExec(t, db, `INSERT INTO accounts (id, name, description, created_at, updated_at) VALUES ('acme', 'Acme', '', ?, ?)`, stamp, stamp)
+		mustExec(t, db, `INSERT INTO grants (id, account_id, subject_kind, subject_id, permission_id, object, effect, created_at, updated_at)
+			VALUES ('g1', 'acme', 'principal', 'p1', 'perm1', 'account:acme/document:*', 'allow', ?, ?)`, stamp, stamp)
+	})
+
+	err := setupAt(t, path)
+	if err == nil {
+		t.Fatal("Setup accepted a v0.5.0 database; it would have started up empty beside the operator's data")
+	}
+	assertRefusal(t, err)
+	// The message lists the fingerprint tables it matched, not every old table:
+	// `accounts` has no column set distinctive enough to fingerprint on, so it
+	// is deliberately absent. `grants` and the join tables are the evidence.
+	for _, want := range []string{"apt_", "unprefixed tables", "EMPTY", "grants", "principal_roles"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %q:\n%s", want, err.Error())
+		}
+	}
+
+	// Refusing must be stable. Running again against the same database -- the
+	// state an operator reaches by retrying -- must refuse identically, not
+	// bless it because the first run left some tables behind.
+	again := setupAt(t, path)
+	if again == nil {
+		t.Fatal("second Setup accepted the v0.5.0 database the first one refused")
+	}
+	assertRefusal(t, again)
+}
+
+// TestSetupRefusesAHalfUpgradedV050Database is the state an operator reaches by
+// running a build without this guard: empty apt_ tables created beside the full
+// old ones. It must still be refused.
+func TestSetupRefusesAHalfUpgradedV050Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aperture.db")
+	withRawDB(t, path, func(db *sql.DB) {
+		mustExec(t, db, string(mustReadFixture(t, prePrefixSchema)))
+		mustExec(t, db, `INSERT INTO accounts (id, name, description, created_at, updated_at) VALUES ('acme', 'Acme', '', '2024-07-01T00:00:00Z', '2024-07-01T00:00:00Z')`)
+		// What a guardless Setup would have done: the current schema, created
+		// clean, alongside the old tables.
+		mustExec(t, db, currentSchemaSQL(t))
+	})
+
+	err := setupAt(t, path)
+	if err == nil {
+		t.Fatal("Setup accepted a database holding BOTH the v0.5.0 tables and empty current ones")
+	}
+	assertRefusal(t, err)
+}
+
+// TestSetupIgnoresAHostSchemaWithGenericNames is the false-positive guard on the
+// pre-prefix check, and it is why that check fingerprints COLUMNS rather than
+// trusting table names. `accounts`, `roles`, `groups` and `permissions` are among
+// the most common table names in software, and the apt_ prefix exists precisely
+// so Aperture can share a database with a host schema. Refusing to start because
+// the host owns a table called `roles` would be a worse bug than the one being
+// guarded against.
+func TestSetupIgnoresAHostSchemaWithGenericNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aperture.db")
+	withRawDB(t, path, func(db *sql.DB) {
+		// A plausible host schema: the same generic names, none of Aperture's
+		// shape. Note `group_members` and `role_permissions` are here too --
+		// the names match, the column sets do not, so neither counts toward the
+		// quorum.
+		mustExec(t, db, `CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT, created_at TEXT)`)
+		mustExec(t, db, `CREATE TABLE roles (id TEXT PRIMARY KEY, label TEXT)`)
+		mustExec(t, db, `CREATE TABLE groups (id TEXT PRIMARY KEY, label TEXT)`)
+		mustExec(t, db, `CREATE TABLE permissions (id TEXT PRIMARY KEY, label TEXT)`)
+		mustExec(t, db, `CREATE TABLE group_members (group_id TEXT, user_id TEXT)`)
+		mustExec(t, db, `CREATE TABLE role_permissions (role_id TEXT, perm TEXT)`)
+		mustExec(t, db, `CREATE TABLE object_types (name TEXT, kind TEXT)`)
+		mustExec(t, db, `CREATE TABLE audit_log (id TEXT, at TEXT, message TEXT)`)
+		mustExec(t, db, `INSERT INTO accounts (id, email, created_at) VALUES ('u1', 'a@example.com', '2024-07-01T00:00:00Z')`)
+	})
+
+	if err := setupAt(t, path); err != nil {
+		t.Fatalf("Setup refused a host schema that merely shares generic table names: %v", err)
+	}
+	// And it must keep working afterwards: the host tables are none of
+	// Aperture's business on the second run either.
+	if err := setupAt(t, path); err != nil {
+		t.Fatalf("second Setup alongside a host schema: %v", err)
 	}
 }
 
@@ -174,11 +275,7 @@ func TestSetupIgnoresForeignTables(t *testing.T) {
 func buildPreChangeDatabase(t *testing.T) string {
 	t.Helper()
 
-	src, err := os.ReadFile(preChangeSchema)
-	if err != nil {
-		// FAIL, never skip: a missing fixture means this test proves nothing.
-		t.Fatalf("read %s: %v", preChangeSchema, err)
-	}
+	src := mustReadFixture(t, preChangeSchema)
 
 	path := filepath.Join(t.TempDir(), "aperture.db")
 	withRawDB(t, path, func(db *sql.DB) {
@@ -191,6 +288,24 @@ func buildPreChangeDatabase(t *testing.T) string {
 		mustExec(t, db, `INSERT INTO apt_audit_log (id, ts_nanos, event_type) VALUES ('e1', 1719792000000000000, 'check')`)
 	})
 	return path
+}
+
+// mustReadFixture reads an archived historical schema. It FAILS, never skips: a
+// missing fixture means the test that wanted it proves nothing.
+func mustReadFixture(t *testing.T, path string) []byte {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return src
+}
+
+// currentSchemaSQL is the live schema.sql, read from disk rather than copied, so
+// a test that needs to create the current tables by hand cannot drift from it.
+func currentSchemaSQL(t *testing.T) string {
+	t.Helper()
+	return string(mustReadFixture(t, "schema.sql"))
 }
 
 // setupAt opens the database at path through the real Store and runs Setup,
