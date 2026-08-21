@@ -143,7 +143,7 @@ func (s *Store) PutAccount(ctx context.Context, a model.Account) error {
 		return err
 	}
 	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO accounts (id, name, description, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_accounts (id, name, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
 		a.ID, a.Name, a.Description, encodeTime(a.CreatedAt), encodeTime(a.UpdatedAt))
 	if err != nil {
@@ -154,7 +154,7 @@ func (s *Store) PutAccount(ctx context.Context, a model.Account) error {
 
 func (s *Store) GetAccount(ctx context.Context, id string) (model.Account, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM accounts WHERE id = ?`, id)
+		`SELECT id, name, description, created_at, updated_at FROM apt_accounts WHERE id = ?`, id)
 	a, err := scanAccount(row)
 	if isNoRows(err) {
 		return model.Account{}, notFound("account", id)
@@ -164,7 +164,7 @@ func (s *Store) GetAccount(ctx context.Context, id string) (model.Account, error
 
 func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM accounts ORDER BY id`)
+		`SELECT id, name, description, created_at, updated_at FROM apt_accounts ORDER BY id`)
 	if err != nil {
 		return nil, wrapStorage("list accounts", err)
 	}
@@ -181,7 +181,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	return s.deleteByID(ctx, "account", "accounts", "id", id)
+	return s.deleteByID(ctx, "account", "apt_accounts", "id", id)
 }
 
 func scanAccount(sc scanner) (model.Account, error) {
@@ -212,7 +212,7 @@ func (s *Store) PutMembership(ctx context.Context, m model.Membership) error {
 		return err
 	}
 	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO memberships (principal_id, account_id, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
 		VALUES (?, ?, ?, ?)`,
 		m.PrincipalID, m.AccountID, encodeTime(m.CreatedAt), encodeTime(m.UpdatedAt))
 	if err != nil {
@@ -233,7 +233,7 @@ func (s *Store) GetMembership(ctx context.Context, principalID, accountID string
 
 func (s *Store) DeleteMembership(ctx context.Context, principalID, accountID string) error {
 	res, err := s.exec.ExecContext(ctx,
-		`DELETE FROM memberships WHERE principal_id = ? AND account_id = ?`, principalID, accountID)
+		`DELETE FROM apt_memberships WHERE principal_id = ? AND account_id = ?`, principalID, accountID)
 	if err != nil {
 		return wrapStorage("delete membership", err)
 	}
@@ -263,7 +263,7 @@ func (s *Store) MembershipsForAccount(ctx context.Context, accountID string) ([]
 
 func (s *Store) IsMember(ctx context.Context, principalID, accountID string) (bool, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT 1 FROM memberships WHERE principal_id = ? AND account_id = ?`, principalID, accountID)
+		`SELECT 1 FROM apt_memberships WHERE principal_id = ? AND account_id = ?`, principalID, accountID)
 	var one int
 	switch err := row.Scan(&one); {
 	case isNoRows(err):
@@ -275,7 +275,7 @@ func (s *Store) IsMember(ctx context.Context, principalID, accountID string) (bo
 	}
 }
 
-const membershipSelect = `SELECT principal_id, account_id, created_at, updated_at FROM memberships`
+const membershipSelect = `SELECT principal_id, account_id, created_at, updated_at FROM apt_memberships`
 
 func collectMemberships(rows *sql.Rows) ([]model.Membership, error) {
 	defer rows.Close()
@@ -325,7 +325,7 @@ func (s *Store) PutObjectType(ctx context.Context, ot model.ObjectType) error {
 		return wrapStorage("marshal actions", err)
 	}
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO object_types (name, actions, description, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_object_types (name, apt_actions, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
 		ot.Name, string(actions), ot.Description, encodeTime(ot.CreatedAt), encodeTime(ot.UpdatedAt))
 	if err != nil {
@@ -336,7 +336,7 @@ func (s *Store) PutObjectType(ctx context.Context, ot model.ObjectType) error {
 
 func (s *Store) GetObjectType(ctx context.Context, name string) (model.ObjectType, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT name, actions, description, created_at, updated_at FROM object_types WHERE name = ?`, name)
+		`SELECT name, apt_actions, description, created_at, updated_at FROM apt_object_types WHERE name = ?`, name)
 	ot, err := scanObjectType(row)
 	if isNoRows(err) {
 		return model.ObjectType{}, notFound("object type", name)
@@ -346,7 +346,7 @@ func (s *Store) GetObjectType(ctx context.Context, name string) (model.ObjectTyp
 
 func (s *Store) ListObjectTypes(ctx context.Context) ([]model.ObjectType, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT name, actions, description, created_at, updated_at FROM object_types ORDER BY name`)
+		`SELECT name, apt_actions, description, created_at, updated_at FROM apt_object_types ORDER BY name`)
 	if err != nil {
 		return nil, wrapStorage("list object types", err)
 	}
@@ -363,7 +363,7 @@ func (s *Store) ListObjectTypes(ctx context.Context) ([]model.ObjectType, error)
 }
 
 func (s *Store) DeleteObjectType(ctx context.Context, name string) error {
-	return s.deleteByID(ctx, "object type", "object_types", "name", name)
+	return s.deleteByID(ctx, "object type", "apt_object_types", "name", name)
 }
 
 type scanner interface {
@@ -406,7 +406,7 @@ func (s *Store) PutPermission(ctx context.Context, p model.Permission) error {
 		return err
 	}
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO permissions (id, object_type, action, scope_strategy, delegatable, description, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_permissions (id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.ObjectType, p.Action, p.ScopeStrategy, encodeBool(p.Delegatable), p.Description, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt))
 	if err != nil {
@@ -417,7 +417,7 @@ func (s *Store) PutPermission(ctx context.Context, p model.Permission) error {
 
 func (s *Store) GetPermission(ctx context.Context, id string) (model.Permission, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT id, object_type, action, scope_strategy, delegatable, description, created_at, updated_at FROM permissions WHERE id = ?`, id)
+		`SELECT id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at FROM apt_permissions WHERE id = ?`, id)
 	p, err := scanPermission(row)
 	if isNoRows(err) {
 		return model.Permission{}, notFound("permission", id)
@@ -427,7 +427,7 @@ func (s *Store) GetPermission(ctx context.Context, id string) (model.Permission,
 
 func (s *Store) ListPermissions(ctx context.Context) ([]model.Permission, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT id, object_type, action, scope_strategy, delegatable, description, created_at, updated_at FROM permissions ORDER BY id`)
+		`SELECT id, object_type, apt_action, scope_strategy, delegatable, description, created_at, updated_at FROM apt_permissions ORDER BY id`)
 	if err != nil {
 		return nil, wrapStorage("list permissions", err)
 	}
@@ -444,7 +444,7 @@ func (s *Store) ListPermissions(ctx context.Context) ([]model.Permission, error)
 }
 
 func (s *Store) DeletePermission(ctx context.Context, id string) error {
-	return s.deleteByID(ctx, "permission", "permissions", "id", id)
+	return s.deleteByID(ctx, "permission", "apt_permissions", "id", id)
 }
 
 func scanPermission(sc scanner) (model.Permission, error) {
@@ -478,17 +478,17 @@ func (s *Store) PutPrincipal(ctx context.Context, p model.Principal) error {
 	}
 	return s.inTx(ctx, "put principal", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO principals (id, kind, identity, display_name, created_at, updated_at)
+			INSERT OR REPLACE INTO apt_principals (id, kind, apt_identity, display_name, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?)`,
 			p.ID, string(p.Kind), p.Identity, p.DisplayName, encodeTime(p.CreatedAt), encodeTime(p.UpdatedAt)); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM principal_roles WHERE principal_id = ?`, p.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, p.ID); err != nil {
 			return err
 		}
 		for i, roleID := range p.RoleIDs {
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO principal_roles (principal_id, role_id, seq) VALUES (?, ?, ?)`,
+				`INSERT INTO apt_principal_roles (principal_id, role_id, seq) VALUES (?, ?, ?)`,
 				p.ID, roleID, i); err != nil {
 				return err
 			}
@@ -499,7 +499,7 @@ func (s *Store) PutPrincipal(ctx context.Context, p model.Principal) error {
 
 func (s *Store) GetPrincipal(ctx context.Context, id string) (model.Principal, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT id, kind, identity, display_name, created_at, updated_at FROM principals WHERE id = ?`, id)
+		`SELECT id, kind, apt_identity, display_name, created_at, updated_at FROM apt_principals WHERE id = ?`, id)
 	p, err := scanPrincipal(row)
 	if isNoRows(err) {
 		return model.Principal{}, notFound("principal", id)
@@ -507,7 +507,7 @@ func (s *Store) GetPrincipal(ctx context.Context, id string) (model.Principal, e
 	if err != nil {
 		return model.Principal{}, err
 	}
-	p.RoleIDs, err = s.childIDs(ctx, `SELECT role_id FROM principal_roles WHERE principal_id = ? ORDER BY seq`, id)
+	p.RoleIDs, err = s.childIDs(ctx, `SELECT role_id FROM apt_principal_roles WHERE principal_id = ? ORDER BY seq`, id)
 	if err != nil {
 		return model.Principal{}, err
 	}
@@ -516,7 +516,7 @@ func (s *Store) GetPrincipal(ctx context.Context, id string) (model.Principal, e
 
 func (s *Store) ListPrincipals(ctx context.Context) ([]model.Principal, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT id, kind, identity, display_name, created_at, updated_at FROM principals ORDER BY id`)
+		`SELECT id, kind, apt_identity, display_name, created_at, updated_at FROM apt_principals ORDER BY id`)
 	if err != nil {
 		return nil, wrapStorage("list principals", err)
 	}
@@ -536,7 +536,7 @@ func (s *Store) ListPrincipals(ctx context.Context) ([]model.Principal, error) {
 	}
 	for i := range out {
 		out[i].RoleIDs, err = s.childIDs(ctx,
-			`SELECT role_id FROM principal_roles WHERE principal_id = ? ORDER BY seq`, ids[i])
+			`SELECT role_id FROM apt_principal_roles WHERE principal_id = ? ORDER BY seq`, ids[i])
 		if err != nil {
 			return nil, err
 		}
@@ -546,14 +546,14 @@ func (s *Store) ListPrincipals(ctx context.Context) ([]model.Principal, error) {
 
 func (s *Store) DeletePrincipal(ctx context.Context, id string) error {
 	return s.inTx(ctx, "delete principal", func(tx sqlExec) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM principals WHERE id = ?`, id)
+		res, err := tx.ExecContext(ctx, `DELETE FROM apt_principals WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("principal", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM principal_roles WHERE principal_id = ?`, id)
+		_, err = tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, id)
 		return err
 	})
 }
@@ -589,17 +589,17 @@ func (s *Store) PutRole(ctx context.Context, r model.Role) error {
 	}
 	return s.inTx(ctx, "put role", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO roles (id, name, description, created_at, updated_at)
+			INSERT OR REPLACE INTO apt_roles (id, name, description, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?)`,
 			r.ID, r.Name, r.Description, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt)); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM role_permissions WHERE role_id = ?`, r.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, r.ID); err != nil {
 			return err
 		}
 		for i, permID := range r.PermissionIDs {
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO role_permissions (role_id, permission_id, seq) VALUES (?, ?, ?)`,
+				`INSERT INTO apt_role_permissions (role_id, permission_id, seq) VALUES (?, ?, ?)`,
 				r.ID, permID, i); err != nil {
 				return err
 			}
@@ -610,7 +610,7 @@ func (s *Store) PutRole(ctx context.Context, r model.Role) error {
 
 func (s *Store) GetRole(ctx context.Context, id string) (model.Role, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM roles WHERE id = ?`, id)
+		`SELECT id, name, description, created_at, updated_at FROM apt_roles WHERE id = ?`, id)
 	r, err := scanRole(row)
 	if isNoRows(err) {
 		return model.Role{}, notFound("role", id)
@@ -618,7 +618,7 @@ func (s *Store) GetRole(ctx context.Context, id string) (model.Role, error) {
 	if err != nil {
 		return model.Role{}, err
 	}
-	r.PermissionIDs, err = s.childIDs(ctx, `SELECT permission_id FROM role_permissions WHERE role_id = ? ORDER BY seq`, id)
+	r.PermissionIDs, err = s.childIDs(ctx, `SELECT permission_id FROM apt_role_permissions WHERE role_id = ? ORDER BY seq`, id)
 	if err != nil {
 		return model.Role{}, err
 	}
@@ -627,7 +627,7 @@ func (s *Store) GetRole(ctx context.Context, id string) (model.Role, error) {
 
 func (s *Store) ListRoles(ctx context.Context) ([]model.Role, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM roles ORDER BY id`)
+		`SELECT id, name, description, created_at, updated_at FROM apt_roles ORDER BY id`)
 	if err != nil {
 		return nil, wrapStorage("list roles", err)
 	}
@@ -647,7 +647,7 @@ func (s *Store) ListRoles(ctx context.Context) ([]model.Role, error) {
 	}
 	for i := range out {
 		out[i].PermissionIDs, err = s.childIDs(ctx,
-			`SELECT permission_id FROM role_permissions WHERE role_id = ? ORDER BY seq`, ids[i])
+			`SELECT permission_id FROM apt_role_permissions WHERE role_id = ? ORDER BY seq`, ids[i])
 		if err != nil {
 			return nil, err
 		}
@@ -657,14 +657,14 @@ func (s *Store) ListRoles(ctx context.Context) ([]model.Role, error) {
 
 func (s *Store) DeleteRole(ctx context.Context, id string) error {
 	return s.inTx(ctx, "delete role", func(tx sqlExec) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM roles WHERE id = ?`, id)
+		res, err := tx.ExecContext(ctx, `DELETE FROM apt_roles WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("role", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM role_permissions WHERE role_id = ?`, id)
+		_, err = tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, id)
 		return err
 	})
 }
@@ -698,17 +698,17 @@ func (s *Store) PutGroup(ctx context.Context, g model.Group) error {
 	}
 	return s.inTx(ctx, "put group", func(tx sqlExec) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR REPLACE INTO groups (id, name, description, created_at, updated_at)
+			INSERT OR REPLACE INTO apt_groups (id, name, description, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?)`,
 			g.ID, g.Name, g.Description, encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt)); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM group_members WHERE group_id = ?`, g.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, g.ID); err != nil {
 			return err
 		}
 		for i, principalID := range g.MemberPrincipalIDs {
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO group_members (group_id, principal_id, seq) VALUES (?, ?, ?)`,
+				`INSERT INTO apt_group_members (group_id, principal_id, seq) VALUES (?, ?, ?)`,
 				g.ID, principalID, i); err != nil {
 				return err
 			}
@@ -725,7 +725,7 @@ func (s *Store) GetGroup(ctx context.Context, id string) (model.Group, error) {
 	if err != nil {
 		return model.Group{}, err
 	}
-	g.MemberPrincipalIDs, err = s.childIDs(ctx, `SELECT principal_id FROM group_members WHERE group_id = ? ORDER BY seq`, id)
+	g.MemberPrincipalIDs, err = s.childIDs(ctx, `SELECT principal_id FROM apt_group_members WHERE group_id = ? ORDER BY seq`, id)
 	if err != nil {
 		return model.Group{}, err
 	}
@@ -734,13 +734,13 @@ func (s *Store) GetGroup(ctx context.Context, id string) (model.Group, error) {
 
 func (s *Store) getGroupRow(ctx context.Context, id string) (model.Group, error) {
 	row := s.exec.QueryRowContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM groups WHERE id = ?`, id)
+		`SELECT id, name, description, created_at, updated_at FROM apt_groups WHERE id = ?`, id)
 	return scanGroup(row)
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]model.Group, error) {
 	rows, err := s.exec.QueryContext(ctx,
-		`SELECT id, name, description, created_at, updated_at FROM groups ORDER BY id`)
+		`SELECT id, name, description, created_at, updated_at FROM apt_groups ORDER BY id`)
 	if err != nil {
 		return nil, wrapStorage("list groups", err)
 	}
@@ -760,7 +760,7 @@ func (s *Store) ListGroups(ctx context.Context) ([]model.Group, error) {
 	}
 	for i := range out {
 		out[i].MemberPrincipalIDs, err = s.childIDs(ctx,
-			`SELECT principal_id FROM group_members WHERE group_id = ? ORDER BY seq`, ids[i])
+			`SELECT principal_id FROM apt_group_members WHERE group_id = ? ORDER BY seq`, ids[i])
 		if err != nil {
 			return nil, err
 		}
@@ -770,14 +770,14 @@ func (s *Store) ListGroups(ctx context.Context) ([]model.Group, error) {
 
 func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 	return s.inTx(ctx, "delete group", func(tx sqlExec) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM groups WHERE id = ?`, id)
+		res, err := tx.ExecContext(ctx, `DELETE FROM apt_groups WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("group", id)
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM group_members WHERE group_id = ?`, id)
+		_, err = tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, id)
 		return err
 	})
 }
@@ -806,8 +806,8 @@ func scanGroup(sc scanner) (model.Group, error) {
 func (s *Store) GroupsForPrincipal(ctx context.Context, principalID string) ([]model.Group, error) {
 	rows, err := s.exec.QueryContext(ctx, `
 		SELECT g.id, g.name, g.description, g.created_at, g.updated_at
-		FROM groups g
-		JOIN group_members m ON m.group_id = g.id
+		FROM apt_groups g
+		JOIN apt_group_members m ON m.group_id = g.id
 		WHERE m.principal_id = ?
 		ORDER BY g.id`, principalID)
 	if err != nil {
@@ -829,7 +829,7 @@ func (s *Store) GroupsForPrincipal(ctx context.Context, principalID string) ([]m
 	}
 	for i := range out {
 		out[i].MemberPrincipalIDs, err = s.childIDs(ctx,
-			`SELECT principal_id FROM group_members WHERE group_id = ? ORDER BY seq`, ids[i])
+			`SELECT principal_id FROM apt_group_members WHERE group_id = ? ORDER BY seq`, ids[i])
 		if err != nil {
 			return nil, err
 		}
@@ -844,7 +844,7 @@ func (s *Store) PutGrant(ctx context.Context, g model.Grant) error {
 		return err
 	}
 	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO grants (id, account_id, subject_kind, subject_id, permission_id, object, effect, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
 		encodeTime(g.CreatedAt), encodeTime(g.UpdatedAt))
@@ -891,7 +891,7 @@ func (s *Store) ListGrantsPage(ctx context.Context, accountID string, offset, li
 
 	var total int
 	if err := s.exec.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM grants`+where, countArgs...).Scan(&total); err != nil {
+		`SELECT COUNT(*) FROM apt_grants`+where, countArgs...).Scan(&total); err != nil {
 		return nil, 0, wrapStorage("count grants", err)
 	}
 
@@ -910,7 +910,7 @@ func (s *Store) ListGrantsPage(ctx context.Context, accountID string, offset, li
 }
 
 func (s *Store) DeleteGrant(ctx context.Context, id string) error {
-	return s.deleteByID(ctx, "grant", "grants", "id", id)
+	return s.deleteByID(ctx, "grant", "apt_grants", "id", id)
 }
 
 func (s *Store) GrantsForSubjects(ctx context.Context, accountID string, subjects []model.Subject) ([]model.Grant, error) {
@@ -940,7 +940,7 @@ func (s *Store) GrantsForSubjects(ctx context.Context, accountID string, subject
 	return collectGrants(rows)
 }
 
-const grantSelect = `SELECT id, account_id, subject_kind, subject_id, permission_id, object, effect, created_at, updated_at FROM grants`
+const grantSelect = `SELECT id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at FROM apt_grants`
 
 func collectGrants(rows *sql.Rows) ([]model.Grant, error) {
 	defer rows.Close()
@@ -986,7 +986,7 @@ func scanGrant(sc scanner) (model.Grant, error) {
 
 // ---- Template (named, versioned) ----
 
-const templateSelect = `SELECT name, version, description, params, grants, created_at, updated_at FROM templates`
+const templateSelect = `SELECT name, version, description, params, apt_grants, created_at, updated_at FROM apt_templates`
 
 func (s *Store) PutTemplate(ctx context.Context, t model.Template) error {
 	if err := model.ValidateTemplate(t); err != nil {
@@ -1001,7 +1001,7 @@ func (s *Store) PutTemplate(ctx context.Context, t model.Template) error {
 		return wrapStorage("marshal template grants", err)
 	}
 	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO templates (name, version, description, params, grants, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_templates (name, version, description, params, apt_grants, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		t.Name, t.Version, t.Description, string(params), string(grants),
 		encodeTime(t.CreatedAt), encodeTime(t.UpdatedAt))
@@ -1051,7 +1051,7 @@ func (s *Store) ListTemplates(ctx context.Context) ([]model.Template, error) {
 
 func (s *Store) DeleteTemplate(ctx context.Context, name string, version int) error {
 	if version > 0 {
-		res, err := s.exec.ExecContext(ctx, `DELETE FROM templates WHERE name = ? AND version = ?`, name, version)
+		res, err := s.exec.ExecContext(ctx, `DELETE FROM apt_templates WHERE name = ? AND version = ?`, name, version)
 		if err != nil {
 			return wrapStorage("delete template", err)
 		}
@@ -1060,7 +1060,7 @@ func (s *Store) DeleteTemplate(ctx context.Context, name string, version int) er
 		}
 		return nil
 	}
-	res, err := s.exec.ExecContext(ctx, `DELETE FROM templates WHERE name = ?`, name)
+	res, err := s.exec.ExecContext(ctx, `DELETE FROM apt_templates WHERE name = ?`, name)
 	if err != nil {
 		return wrapStorage("delete template", err)
 	}
@@ -1107,14 +1107,14 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 // ---- Rule (named) ----
 
-const ruleSelect = `SELECT name, description, ast, created_at, updated_at FROM rules`
+const ruleSelect = `SELECT name, description, ast, created_at, updated_at FROM apt_rules`
 
 func (s *Store) PutRule(ctx context.Context, r model.Rule) error {
 	if err := model.ValidateRule(r); err != nil {
 		return err
 	}
 	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO rules (name, description, ast, created_at, updated_at)
+		INSERT OR REPLACE INTO apt_rules (name, description, ast, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)`,
 		r.Name, r.Description, string(r.AST), encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt))
 	if err != nil {
@@ -1153,7 +1153,7 @@ func (s *Store) ListRules(ctx context.Context) ([]model.Rule, error) {
 }
 
 func (s *Store) DeleteRule(ctx context.Context, name string) error {
-	return s.deleteByID(ctx, "rule", "rules", "name", name)
+	return s.deleteByID(ctx, "rule", "apt_rules", "name", name)
 }
 
 // scanRule2 scans a rules row. It is named scanRule2 to avoid colliding with the
@@ -1183,7 +1183,7 @@ func scanRule2(sc scanner) (model.Rule, error) {
 
 // ---- Audit trail (append-only) ----
 
-const auditColumns = `id, ts_nanos, event_type, action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
+const auditColumns = `id, ts_nanos, event_type, apt_action, actor, effective_subject, impersonation_mode, account, target, outcome, reason, details`
 
 func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 	details := ""
@@ -1195,7 +1195,7 @@ func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 		details = string(b)
 	}
 	_, err := s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO audit_log (`+auditColumns+`)
+		INSERT OR REPLACE INTO apt_audit_log (`+auditColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.ID, ev.Timestamp.UTC().UnixNano(), string(ev.EventType), ev.Action, ev.Actor,
 		ev.EffectiveSubject, ev.ImpersonationMode, ev.Account, ev.Target, string(ev.Outcome),
@@ -1210,7 +1210,7 @@ func (s *Store) QueryAudit(ctx context.Context, filter model.AuditFilter) ([]mod
 	var b strings.Builder
 	b.WriteString(`SELECT `)
 	b.WriteString(auditColumns)
-	b.WriteString(` FROM audit_log`)
+	b.WriteString(` FROM apt_audit_log`)
 	var (
 		where []string
 		args  []any
@@ -1272,7 +1272,7 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	// Age bound: delete events strictly older than policy.Before.
 	if !policy.Before.IsZero() {
 		res, err := s.exec.ExecContext(ctx,
-			`DELETE FROM audit_log WHERE ts_nanos < ?`, policy.Before.UTC().UnixNano())
+			`DELETE FROM apt_audit_log WHERE ts_nanos < ?`, policy.Before.UTC().UnixNano())
 		if err != nil {
 			return removed, wrapStorage("prune audit by age", err)
 		}
@@ -1283,8 +1283,8 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	// Size bound: keep only the newest MaxCount events.
 	if policy.MaxCount > 0 {
 		res, err := s.exec.ExecContext(ctx, `
-			DELETE FROM audit_log WHERE id NOT IN (
-				SELECT id FROM audit_log ORDER BY ts_nanos DESC, id DESC LIMIT ?
+			DELETE FROM apt_audit_log WHERE id NOT IN (
+				SELECT id FROM apt_audit_log ORDER BY ts_nanos DESC, id DESC LIMIT ?
 			)`, policy.MaxCount)
 		if err != nil {
 			return removed, wrapStorage("prune audit by size", err)
