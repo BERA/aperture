@@ -1,8 +1,14 @@
-// Package schemagate holds the gate that keeps Aperture's database-identifier
-// convention from rotting, for EVERY dialect schema the project ships rather
-// than for one of them.
+// Package schemagate holds the gates that keep Aperture's dialect schemas
+// honest, for EVERY dialect schema the project ships rather than for one of
+// them. There are two, built on one parser:
 //
-// The gate itself, the rule, and the small SQL parser it is built on live in
+//   - the NAMING gate (schema_naming_test.go), which asks whether each dialect
+//     obeys Aperture's database-identifier convention on its own; and
+//   - the PARITY gate (schema_parity_test.go), which asks whether the dialects
+//     still describe the same database — the same tables, the same columns, and
+//     the same foreign-key edges with the same ON DELETE / ON UPDATE actions.
+//
+// The gates, the rules, and the small SQL parser they are built on live in
 // this package's _test.go files — they are test support and nothing in the
 // shipping binary calls them. This file exists so the package has a home for
 // the prose, and so `go build ./...` has something to build.
@@ -71,6 +77,29 @@
 // dialect, and a dialect schema on disk that is NOT registered fails too — a
 // gate that governs whichever files somebody remembered to list is a gate with a
 // hole in it.
+//
+// # What the parity gate adds
+//
+// Two hand-written schema files with nothing forcing them to agree is the drift
+// this repo legislates against everywhere else (TestEditorOperatorTablesAgree,
+// TestDriverValueMappingTableMatchesTheTypeSwitch). The parity gate diffs the
+// parsed dialects against each other, symmetrically — there is no reference
+// dialect whose spelling the others must match — so adding a table, a column or
+// an edge to one file and not the other is build-red.
+//
+// It is the standing mitigation for an accepted risk: CI runs no containers, so
+// nothing in `make test` proves the Postgres backend BEHAVES. The parity gate
+// cannot prove that either. What it proves is that Postgres has not silently
+// fallen BEHIND its twin.
+//
+// The dialects legitimately differ, and the gate refuses to express that as a
+// blanket exemption — "types don't count" would also stop it noticing a
+// created_at that had become TEXT in one backend. Instead each dialect declares
+// an explicit map from a physical type SPELLING to the logical type it means
+// (SQLite INTEGER and Postgres BIGINT both mean int64), and a spelling the map
+// does not know is a failure rather than a pass. Declaration ORDER is not a fact
+// the gate collects, because Postgres resolves REFERENCES at CREATE time and
+// must declare parents first.
 //
 // # Where the embed check lives
 //

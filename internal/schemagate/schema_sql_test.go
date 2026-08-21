@@ -84,9 +84,26 @@ type tableDef struct {
 	foreignKeys []foreignKey
 }
 
+// columnDef is one column as DECLARED: its name, where it is, and the two halves
+// of what follows the name. The halves are kept apart because the parity gate
+// (schema_parity_test.go) treats them differently — the physical type goes
+// through an explicit per-dialect mapping (SQLite INTEGER means what Postgres
+// BIGINT means), while everything else must match verbatim across dialects.
 type columnDef struct {
 	name string
 	line int
+	// typeName is the declared physical type, upper-cased, with any
+	// parenthesised arguments kept and internal spacing collapsed:
+	// TEXT, BIGINT, VARCHAR(255), DOUBLE PRECISION. It is "" when the
+	// definition names no type, which SQLite permits and this schema never does.
+	typeName string
+	// constraints is everything after the type, normalized: keywords
+	// upper-cased, literals kept as written, spacing collapsed. An inline
+	// REFERENCES clause is EXCISED — it is recorded as a foreignKey and compared
+	// as an edge, and leaving it here as well would report one divergence twice
+	// and would make a key spelled inline in one dialect and as a table
+	// constraint in the other look like a column difference.
+	constraints string
 }
 
 // foreignKey is one REFERENCES relationship, however it was spelled: as a table
@@ -323,14 +340,25 @@ func parseCreateTable(stmt []token) (tableDef, bool, error) {
 		if !first.isIdent() {
 			return tableDef{}, false, fmt.Errorf("line %d: CREATE TABLE %s: expected a column name, got %q", first.line, tbl.name, first.text)
 		}
-		tbl.columns = append(tbl.columns, columnDef{name: first.identName(), line: first.line})
-		fk, ok, err := parseColumnForeignKey(item, tbl.name)
+		fk, start, end, ok, err := parseColumnForeignKey(item, tbl.name)
 		if err != nil {
 			return tableDef{}, false, err
 		}
+		rest := item[1:]
 		if ok {
 			tbl.foreignKeys = append(tbl.foreignKeys, fk)
+			// Excise the clause rather than truncating at it: a REFERENCES may
+			// sit in the middle of a column definition (`a TEXT REFERENCES t (id)
+			// NOT NULL`), and truncating would silently drop the NOT NULL.
+			rest = append(append([]token{}, item[1:start]...), item[end:]...)
 		}
+		typeToks, n := readColumnType(rest)
+		tbl.columns = append(tbl.columns, columnDef{
+			name:        first.identName(),
+			line:        first.line,
+			typeName:    renderTokens(typeToks),
+			constraints: renderTokens(rest[n:]),
+		})
 	}
 	if len(tbl.columns) == 0 {
 		return tableDef{}, false, fmt.Errorf("line %d: CREATE TABLE %s: no column definitions", nameTok.line, tbl.name)
@@ -439,7 +467,11 @@ func parseTableForeignKey(item []token, table string) (foreignKey, bool, error) 
 // column definition. Trailing tokens are NOT an error here — NOT NULL, DEFAULT
 // and the rest of a column definition legitimately follow — but a REFERENCES
 // clause the parser cannot read still is.
-func parseColumnForeignKey(item []token, table string) (foreignKey, bool, error) {
+//
+// The two ints are the half-open token span the clause occupies, so the caller
+// can lift the edge out of the column definition and keep the two comparable
+// things separate: the edge, and the rest of the definition.
+func parseColumnForeignKey(item []token, table string) (fk foreignKey, start, end int, ok bool, err error) {
 	depth := 0
 	for i, t := range item {
 		switch {
@@ -449,13 +481,92 @@ func parseColumnForeignKey(item []token, table string) (foreignKey, bool, error)
 			depth--
 		case depth == 0 && t.isWord("REFERENCES"):
 			fk := foreignKey{columns: []string{item[0].identName()}, line: item[0].line, inline: true}
-			if _, err := parseReferences(item, i, &fk, table); err != nil {
-				return foreignKey{}, false, err
+			end, err := parseReferences(item, i, &fk, table)
+			if err != nil {
+				return foreignKey{}, 0, 0, false, err
 			}
-			return fk, true, nil
+			return fk, i, end, true, nil
 		}
 	}
-	return foreignKey{}, false, nil
+	return foreignKey{}, 0, 0, false, nil
+}
+
+// typeStoppers are the bare keywords that END a column's physical type and open
+// a column constraint. Everything before the first of them is the type, which is
+// what lets a multi-word spelling (DOUBLE PRECISION, TIMESTAMP WITH TIME ZONE)
+// arrive whole rather than as its first word. Neither dialect schema uses one
+// today; the reader covers them so that adopting one is not a silent truncation.
+var typeStoppers = map[string]bool{
+	"CONSTRAINT": true, "NOT": true, "NULL": true, "PRIMARY": true,
+	"UNIQUE": true, "CHECK": true, "DEFAULT": true, "COLLATE": true,
+	"REFERENCES": true, "GENERATED": true, "AS": true, "AUTOINCREMENT": true,
+	"DEFERRABLE": true, "STORED": true, "IDENTITY": true,
+}
+
+// readColumnType returns the leading tokens that spell the column's physical
+// type and how many were consumed, including a parenthesised argument list.
+func readColumnType(toks []token) ([]token, int) {
+	i := 0
+	for i < len(toks) {
+		t := toks[i]
+		if t.kind != tokWord || typeStoppers[strings.ToUpper(t.text)] {
+			break
+		}
+		i++
+	}
+	if i > 0 && i < len(toks) && toks[i].isPunct("(") {
+		depth := 0
+		for j := i; j < len(toks); j++ {
+			switch {
+			case toks[j].isPunct("("):
+				depth++
+			case toks[j].isPunct(")"):
+				depth--
+				if depth == 0 {
+					return toks[:j+1], j + 1
+				}
+			}
+		}
+	}
+	return toks[:i], i
+}
+
+// renderTokens writes a token run back out in a normalized form: bare words
+// upper-cased (SQL keywords are case-insensitive, so `not null` and `NOT NULL`
+// are the same declaration), literals kept exactly as written and re-delimited
+// so a string can never be confused with an identifier, and spacing collapsed.
+// Two dialects that declared a column the same way produce the same string.
+func renderTokens(toks []token) string {
+	var b strings.Builder
+	for i, t := range toks {
+		if i > 0 && needsSpaceBefore(toks[i-1], t) {
+			b.WriteByte(' ')
+		}
+		switch t.kind {
+		case tokWord:
+			b.WriteString(strings.ToUpper(t.text))
+		case tokQuoted:
+			b.WriteString(`"` + t.text + `"`)
+		case tokString:
+			b.WriteString("'" + t.text + "'")
+		default:
+			b.WriteString(t.text)
+		}
+	}
+	return b.String()
+}
+
+// needsSpaceBefore keeps the rendered form readable — DEFAULT ” and
+// VARCHAR(255) rather than DEFAULT” and VARCHAR ( 255 ). It affects only
+// legibility: both sides of every comparison go through the same renderer.
+func needsSpaceBefore(prev, cur token) bool {
+	if prev.isPunct("(") {
+		return false
+	}
+	if cur.isPunct(")") || cur.isPunct(",") || cur.isPunct("(") {
+		return false
+	}
+	return true
 }
 
 // parseReferences reads REFERENCES <table> [(cols)] followed by any number of

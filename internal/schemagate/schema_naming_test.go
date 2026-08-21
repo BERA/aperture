@@ -181,8 +181,9 @@ func TestEveryDialectSchemaIsGoverned(t *testing.T) {
 
 // TestSchemaForeignKeysAreReadable proves the REFERENCES / ON DELETE / ON UPDATE
 // half of the parser against the real files, per dialect. It is not the parity
-// gate — nothing here compares one dialect to another, which is E5-S2's job —
-// it is the anti-vacuity check for the clause reader: the naming rule never
+// gate — nothing here compares one dialect to another; that is
+// schema_parity_test.go's job — it is the anti-vacuity check for the clause
+// reader, which the parity gate depends on: the naming rule never
 // looks at a foreign key, so a parser that quietly stepped over all nine of them
 // would keep passing.
 func TestSchemaForeignKeysAreReadable(t *testing.T) {
