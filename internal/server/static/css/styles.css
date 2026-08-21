@@ -361,6 +361,17 @@ body {
 .a-locked { display: inline-flex; }
 .a-locked:has(:disabled) { cursor: not-allowed; }
 
+/* .a-locked--block (E2-S3): the same wrapper around a whole GROUP rather than
+   one button — the two membership checklists. The base wrapper shrink-wraps,
+   which would lay a wrapping .a-checks out at max-content width and overflow
+   the field; block keeps the group's own layout untouched. */
+.a-locked--block { display: block; }
+
+/* A disabled checkbox does NOT set pointer-events: none, so the group wrapper's
+   title still reaches the cursor over a locked row; this only has to read as
+   inert. */
+.a-check:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+
 /* ---------- Status pill / badge (§6.7) ---------- */
 .a-badge {
   display: inline-flex; align-items: center; height: 20px; padding: 0 8px;

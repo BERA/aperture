@@ -58,8 +58,8 @@ const LOCKED_HINTS = {
   accounts: "Account management is disabled in this deployment.",
   principals: "Principal management is disabled in this deployment.",
   // Memberships has two entry points of its own (the account members editor and
-  // the principal form's Accounts checklist); they are wired in E2-S3 through
-  // the same manages() / hintFor() helpers.
+  // the principal form's Accounts checklist); both read this one string through
+  // membershipHint(), which is hintFor("memberships").
   memberships: "Membership management is disabled in this deployment.",
 };
 
@@ -402,6 +402,10 @@ function crud() {
     // would show a title of its own. Handlers guard themselves too
     // (openCreate / openEdit / askDelete), so a locked control is inert even if
     // its :disabled binding is ever lost.
+    //
+    // A whole GROUP of controls (either membership checklist) wraps the same
+    // way but adds .a-locked--block: the plain wrapper is inline-flex and would
+    // shrink-wrap a wrapping checklist to max-content width.
 
     // manages reports whether the deployment manages a Capabilities key
     // ("accounts" | "principals" | "memberships"). Unknown keys are manageable.
@@ -426,6 +430,42 @@ function crud() {
     lockHint(type) {
       const key = type && type.managedKey;
       return key ? this.hintFor(key) : "";
+    },
+
+    // ---- membership: an edge, not an entity descriptor ----
+    //
+    // Membership has no TYPES row of its own — it is a (principal, account)
+    // edge reachable from two places — so it cannot ride entityManaged(type).
+    // These are the membership spellings of manages() / hintFor(), and they
+    // read APERTURE_MANAGE_MEMBERSHIPS **alone**: a locked accounts or
+    // principals kind must not grey out a membership control, and a membership
+    // lock must leave account and principal editing completely alone. Mixing
+    // the three would make the posture unreadable — an operator who locked one
+    // kind would see three kinds go inert.
+    //
+    // What a membership lock turns off is WRITE only. Both editors keep
+    // rendering the edges they already found, because "who belongs to what" is
+    // a read, and the read RPC (Export) is not gated. A locked deployment gets
+    // a read-only membership view, not a blank one.
+    //
+    // The two entry points, both gated:
+    //
+    //   1. the account-centric members editor (openMembers/toggleMember/
+    //      saveMembers) — the obvious one; its checklist and Save go disabled.
+    //   2. the principal form's Accounts checklist (toggleModalAccount) — the
+    //      one that hides. Its writes are a SIDE EFFECT of saving a principal,
+    //      not a control anyone would think to disable, so the checklist going
+    //      inert is not enough: save() must skip the reconciliation too.
+    //
+    // reconcileMemberships() is the single write chokepoint under both, and it
+    // guards itself. That is the guarantee worth having — a future third caller
+    // is gated by construction, not by remembering.
+    membershipsManaged() {
+      return this.manages("memberships");
+    },
+
+    membershipHint() {
+      return this.hintFor("memberships");
     },
 
     async loadRefs() {
@@ -729,7 +769,16 @@ function crud() {
 
     // reconcile persists the difference between a desired membership set and the
     // set present at open. `pairs` are { principal, account } objects.
+    //
+    // This is the ONE place either membership editor writes, which is why the
+    // deployment lock is enforced here and not only at the call sites: with
+    // memberships locked, no PutMembership and no DeleteMembership leaves the
+    // browser, whichever path asked. The server refuses them anyway
+    // (APERTURE_ENTITY_UNMANAGED) — this just means a principal save on a
+    // locked deployment succeeds quietly instead of erroring on an edge the
+    // operator never touched.
     async reconcileMemberships(toAdd, toRemove) {
+      if (!this.membershipsManaged()) return;
       for (const p of toAdd) {
         await rpc("PutMembership", { actor: this.actor(), entity_json: JSON.stringify({ PrincipalID: p.principal, AccountID: p.account }) });
       }
@@ -756,6 +805,9 @@ function crud() {
     },
 
     toggleMember(principalID) {
+      // Inert on a locked deployment even if the :disabled binding is lost —
+      // same belt-and-braces contract as openCreate / openEdit / askDelete.
+      if (!this.membershipsManaged()) return;
       const cur = { ...this.members.selected };
       if (cur[principalID]) delete cur[principalID];
       else cur[principalID] = true;
@@ -763,6 +815,7 @@ function crud() {
     },
 
     async saveMembers() {
+      if (!this.membershipsManaged()) return;
       const acct = this.members.account.ID;
       const sel = this.members.selected;
       const orig = this.members.original;
@@ -805,6 +858,7 @@ function crud() {
     },
 
     toggleModalAccount(accountID) {
+      if (!this.membershipsManaged()) return;
       const cur = { ...this.modal.memberSel };
       if (cur[accountID]) delete cur[accountID];
       else cur[accountID] = true;
@@ -858,7 +912,14 @@ function crud() {
         await rpc(type.rpc.put, { actor: this.actor(), entity_json: JSON.stringify(this.modal.form) });
         // Reconcile account membership after the principal itself is saved, so a
         // brand-new principal exists before any PutMembership references it.
-        if (type.membership) {
+        //
+        // Skipped outright when the deployment does not manage memberships:
+        // this is the write path that does not look like one, so it is gated on
+        // its own membership flag and NOT on whatever gated the principal.
+        // Principals open + memberships locked is a real posture, and it must
+        // save the principal and touch not one edge. reconcileMemberships()
+        // refuses again below; the two together are deliberate.
+        if (type.membership && this.membershipsManaged()) {
           const pid = this.modal.form[type.idField];
           const sel = this.modal.memberSel || {};
           const orig = this.modal.memberOrig || {};
