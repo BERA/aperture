@@ -21,8 +21,9 @@ import (
 //   - seedPath == ""  -> load the embedded example fixture (account "acme").
 //   - seedPath != ""  -> load the file, format inferred from its extension.
 //
-// On any failure the caller gets an APERTURE_BOOT error and the partially
-// constructed store is closed.
+// On any failure the partially constructed store is closed and the caller gets a
+// coded error: the failure's OWN code when it has one, and APERTURE_BOOT only
+// when it does not. See bootError for why that distinction is not cosmetic.
 func buildStore(ctx context.Context, storeDSN, seedPath string) (model.Storage, error) {
 	store, err := openStore(storeDSN)
 	if err != nil {
@@ -30,13 +31,42 @@ func buildStore(ctx context.Context, storeDSN, seedPath string) (model.Storage, 
 	}
 	if err := store.Setup(ctx); err != nil {
 		_ = store.Close()
-		return nil, aerr.Wrap(aerr.APERTURE_BOOT, "cli: storage setup failed", err)
+		return nil, bootError("cli: storage setup failed", err)
 	}
 	if err := loadSeed(ctx, store, seedPath); err != nil {
 		_ = store.Close()
-		return nil, aerr.Wrap(aerr.APERTURE_BOOT, "cli: seeding the model failed", err)
+		return nil, bootError("cli: seeding the model failed", err)
 	}
 	return store, nil
+}
+
+// bootError codes a startup failure as APERTURE_BOOT — but only when the failure
+// does not already carry a code of its own.
+//
+// aerr.Wrap does NOT pass an existing code through: it builds a fresh CodedError
+// with whatever code it is handed, and aerr.CodeOf reports the OUTERMOST one. So
+// wrapping unconditionally re-stamps, and the pass-through is a property of the
+// call site, not of the wrapper (the same idiom lives in provider/registry.go,
+// storage/sqlite/sqlite.go, and delegation/delegation.go).
+//
+// Storage startup is exactly where that matters. Setup returns two specific,
+// actionable refusals — APERTURE_STORAGE_SCHEMA_INCOMPATIBLE for a database
+// written by an older build, and APERTURE_STORAGE_CONSTRAINT for a connection
+// that is not enforcing foreign keys — and seeding surfaces the coded rejection
+// of whichever entity the document got wrong. Re-stamping all of them
+// APERTURE_BOOT replaces that with "aperture failed to start", whose registry
+// fixups are "check your environment variables" and "confirm the backend is
+// reachable": true of every startup failure there is, and no help with any of
+// these. The CLI is the surface an operator meets an unreadable database
+// through, so burying the code here is burying it everywhere it would be read.
+//
+// A bare error still gets APERTURE_BOOT, which is what the code is for: it says
+// the process could not start, for a reason no layer below classified.
+func bootError(msg string, err error) error {
+	if aerr.CodeOf(err) != "" {
+		return err
+	}
+	return aerr.Wrap(aerr.APERTURE_BOOT, msg, err)
 }
 
 // openStore selects the storage backend from the DSN.
@@ -46,7 +76,7 @@ func openStore(storeDSN string) (model.Storage, error) {
 	}
 	store, err := sqlite.Open(storeDSN)
 	if err != nil {
-		return nil, aerr.Wrap(aerr.APERTURE_BOOT, "cli: open sqlite store", err)
+		return nil, bootError("cli: open sqlite store", err)
 	}
 	return store, nil
 }
