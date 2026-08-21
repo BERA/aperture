@@ -1,12 +1,21 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/frankbardon/aperture/auth"
 	aerr "github.com/frankbardon/aperture/errors"
+	"github.com/frankbardon/aperture/internal/server"
 	"github.com/frankbardon/aperture/internal/wire/rpc"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/service"
 
 	"github.com/twitchtv/twirp"
 )
@@ -47,6 +56,13 @@ func twirpCode(err error) string {
 // wantConstraint asserts one RPC error is the referential-integrity refusal,
 // with the specific code intact — not merely that the call failed. "It errored"
 // would pass against a handler that flattened every failure to Internal.
+//
+// E3-S3 adds the two assertions that make the refusal ACTIONABLE rather than
+// merely attributable: the transport class is FailedPrecondition (412), so an
+// alert rule keyed on 5xx does not fire and a retrying client does not retry;
+// and the code the client reads back actually keys a Registry entry carrying
+// fixups, since the code surviving is only worth anything if the guidance behind
+// it exists.
 func wantConstraint(t *testing.T, what string, err error) {
 	t.Helper()
 	if err == nil {
@@ -55,6 +71,21 @@ func wantConstraint(t *testing.T, what string, err error) {
 	if got := twirpCode(err); got != string(aerr.APERTURE_STORAGE_CONSTRAINT) {
 		t.Fatalf("%s: meta[\"code\"] = %q, want %q (err: %v)",
 			what, got, aerr.APERTURE_STORAGE_CONSTRAINT, err)
+	}
+	te, ok := err.(twirp.Error)
+	if !ok {
+		t.Fatalf("%s: not a twirp error: %v", what, err)
+	}
+	if te.Code() != twirp.FailedPrecondition {
+		t.Fatalf("%s: twirp code = %q, want %q — a constraint refusal is the caller's "+
+			"ordering mistake, not a broken server, and %d pages an on-call for it",
+			what, te.Code(), twirp.FailedPrecondition,
+			twirp.ServerHTTPStatusFromErrorCode(te.Code()))
+	}
+	entry, ok := aerr.Registry[aerr.APERTURE_STORAGE_CONSTRAINT]
+	if !ok || len(entry.Fixups) == 0 {
+		t.Fatalf("%s: APERTURE_STORAGE_CONSTRAINT must carry Registry fixup guidance — "+
+			"the code is the client's index into it", what)
 	}
 }
 
@@ -100,13 +131,25 @@ func TestTwirpDeleteRefusesAParentWithLiveChildren(t *testing.T) {
 // whose grant named a real account would lose the ability to continue here, and
 // the failure would be AUTHZ_DENIED rather than a constraint — a different bug
 // with a different fix.
+//
+// E3-S3 extends the teardown to a SECOND object type and permission ("doc" /
+// "p-read"). The reserved "system" type and "perm-admin" deliberately survive —
+// root's own wildcard admin grant cites the permission, and root needs that grant
+// to authorize every step below — so without a second pair, DeleteObjectType and
+// DeletePermission had no end-to-end SUCCESS on this surface at all, only the
+// refusals above. The pair is bundled into role "editor" so the role still has to
+// go first: the ordering is proven, not sidestepped.
 func TestTwirpTeardownChildrenFirstSucceeds(t *testing.T) {
 	srv, _ := newTestServer(t)
 	c := client(srv)
 	ctx := asPrincipal(context.Background(), t, "root")
 	actor := &rpc.Actor{Principal: "root", Account: acct}
 
-	must(t, putRole(t, ctx, c, actor, model.Role{ID: "editor", Name: "Editor", PermissionIDs: []string{"perm-admin"}}))
+	must(t, putObjectType(t, ctx, c, actor, model.ObjectType{Name: "doc", Actions: []string{"read"}}))
+	must(t, putPermission(t, ctx, c, actor, model.Permission{ID: "p-read", ObjectType: "doc", Action: "read"}))
+	must(t, putRole(t, ctx, c, actor, model.Role{
+		ID: "editor", Name: "Editor", PermissionIDs: []string{"perm-admin", "p-read"},
+	}))
 	must(t, putPrincipal(t, ctx, c, actor, model.Principal{
 		ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice", RoleIDs: []string{"editor"},
 	}))
@@ -156,6 +199,17 @@ func TestTwirpTeardownChildrenFirstSucceeds(t *testing.T) {
 			_, err := c.DeleteRole(ctx, &rpc.DeleteRequest{Actor: actor, Id: "editor"})
 			return err
 		}},
+		// Only now is p-read unreferenced: the role bundled it until the line
+		// above, and no grant ever cited it.
+		{"DeletePermission p-read", func() error {
+			_, err := c.DeletePermission(ctx, &rpc.DeleteRequest{Actor: actor, Id: "p-read"})
+			return err
+		}},
+		// And only now is the type it hung off unreferenced.
+		{"DeleteObjectType doc", func() error {
+			_, err := c.DeleteObjectType(ctx, &rpc.DeleteRequest{Actor: actor, Id: "doc"})
+			return err
+		}},
 		// root's own admin grant is stamped to "*", so it is not a child of acme;
 		// only root's membership is.
 		{"DeleteMembership root@acme", func() error {
@@ -198,4 +252,145 @@ func putGrant(t *testing.T, ctx context.Context, c rpc.ApertureService, actor *r
 	t.Helper()
 	_, err := c.PutGrant(ctx, &rpc.EntityRequest{Actor: actor, EntityJson: mustJSON(t, g)})
 	return err
+}
+
+func putObjectType(t *testing.T, ctx context.Context, c rpc.ApertureService, actor *rpc.Actor, ot model.ObjectType) error {
+	t.Helper()
+	_, err := c.PutObjectType(ctx, &rpc.EntityRequest{Actor: actor, EntityJson: mustJSON(t, ot)})
+	return err
+}
+
+func putPermission(t *testing.T, ctx context.Context, c rpc.ApertureService, actor *rpc.Actor, p model.Permission) error {
+	t.Helper()
+	_, err := c.PutPermission(ctx, &rpc.EntityRequest{Actor: actor, EntityJson: mustJSON(t, p)})
+	return err
+}
+
+// E3-S3: the status a blocked delete gets on the wire, and what the server says
+// about it in its own logs.
+//
+// codeToTwirp used to have no case for APERTURE_STORAGE_CONSTRAINT, so it fell
+// through to twirp.Internal and a blocked delete came back 500. That is wrong in
+// both directions a status is read. A client library treats 5xx as the retryable
+// class, and this is the one refusal a retry of the identical request can NEVER
+// clear. And the Twirp error hook logs at WARN with the twirp code attached, so
+// every alert rule keyed on internal errors fired — paging an on-call because an
+// admin deleted a role somebody still held.
+//
+// Both assertions below are here rather than folded into wantConstraint because
+// neither is visible through the generated client's error value: the HTTP status
+// needs a raw request, and the log line needs a server built with a logger the
+// test can read back.
+
+// TestBlockedDeleteIsA412OnTheWire drives one blocked delete as a RAW HTTP
+// request — no generated client in the way — and reads the status line. This is
+// the byte a load balancer, a retry policy, and an SLO dashboard all key on, and
+// it is the one thing a twirp.Error value assertion cannot show.
+func TestBlockedDeleteIsA412OnTheWire(t *testing.T) {
+	srv, _ := newTestServer(t)
+	c := client(srv)
+	ctx := asPrincipal(context.Background(), t, "root")
+	actor := &rpc.Actor{Principal: "root", Account: acct}
+
+	must(t, putRole(t, ctx, c, actor, model.Role{ID: "editor", Name: "Editor", PermissionIDs: []string{"perm-admin"}}))
+	must(t, putPrincipal(t, ctx, c, actor, model.Principal{
+		ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice", RoleIDs: []string{"editor"},
+	}))
+
+	body := `{"actor":{"principal":"root","account":"` + acct + `"},"id":"editor"}`
+	req, err := http.NewRequest(http.MethodPost,
+		srv.URL+"/twirp/aperture.ApertureService/DeleteRole", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer root")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var payload struct {
+		Code string            `json:"code"`
+		Msg  string            `json:"msg"`
+		Meta map[string]string `json:"meta"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode twirp error body: %v", err)
+	}
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("HTTP status = %d, want %d — a delete refused for referential integrity "+
+			"is the caller's ordering mistake and must not land in the retryable 5xx class "+
+			"(twirp code %q, msg %q)",
+			resp.StatusCode, http.StatusPreconditionFailed, payload.Code, payload.Msg)
+	}
+	if payload.Code != string(twirp.FailedPrecondition) {
+		t.Fatalf("twirp code in body = %q, want %q", payload.Code, twirp.FailedPrecondition)
+	}
+	// The status is the coarse transport class; meta["code"] is the only channel
+	// carrying the code that keys the fixups, and it must survive the remap.
+	if got := payload.Meta["code"]; got != string(aerr.APERTURE_STORAGE_CONSTRAINT) {
+		t.Fatalf("meta[\"code\"] = %q, want %q", got, aerr.APERTURE_STORAGE_CONSTRAINT)
+	}
+}
+
+// TestBlockedDeleteIsNotLoggedAsAnInternalError reads the server's OWN log line
+// for a blocked delete. loggingHooks writes the twirp code as a structured
+// field, and that field is what an alert rule matches on, so "internal" appearing
+// there is the paging incident this story exists to stop — regardless of what the
+// client was told.
+func TestBlockedDeleteIsNotLoggedAsAnInternalError(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	svc, _ := newTestService(t, service.ManagedEntities{})
+	srv := httptest.NewServer(server.Authenticate(auth.NewDev(), server.New(svc, logger)))
+	t.Cleanup(srv.Close)
+
+	c := client(srv)
+	ctx := asPrincipal(context.Background(), t, "root")
+	actor := &rpc.Actor{Principal: "root", Account: acct}
+
+	must(t, putRole(t, ctx, c, actor, model.Role{ID: "editor", Name: "Editor", PermissionIDs: []string{"perm-admin"}}))
+	must(t, putPrincipal(t, ctx, c, actor, model.Principal{
+		ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice", RoleIDs: []string{"editor"},
+	}))
+	logs.Reset()
+
+	if _, err := c.DeleteRole(ctx, &rpc.DeleteRequest{Actor: actor, Id: "editor"}); err == nil {
+		t.Fatal("DeleteRole with a principal still holding it must be refused")
+	}
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not JSON: %q", line)
+		}
+		// Matched on the "code" attribute rather than on msg: loggingHooks passes
+		// an attribute also named "msg" (the error text), and slog's JSON handler
+		// emits BOTH keys, so decoding into a map keeps the last one. "code" is
+		// the field an alert rule matches anyway, and only the error hook sets it.
+		code, ok := rec["code"].(string)
+		if !ok {
+			continue
+		}
+		found = true
+		if code == string(twirp.Internal) {
+			t.Fatalf("the refused delete was logged as an internal error: %q\n"+
+				"every alert rule keyed on internal errors now pages for an admin's "+
+				"ordering mistake", line)
+		}
+		if code != string(twirp.FailedPrecondition) {
+			t.Fatalf("logged twirp code = %q, want %q (line %q)", code, twirp.FailedPrecondition, line)
+		}
+	}
+	if !found {
+		t.Fatalf("the refusal produced no \"rpc error\" log line at all; captured:\n%s", logs.String())
+	}
 }

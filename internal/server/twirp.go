@@ -1183,7 +1183,7 @@ func mapErr(err error) error {
 
 // codeToTwirp maps an Aperture code to a Twirp error code (and thus an HTTP
 // status): InvalidArgument→400, Unauthenticated→401, PermissionDenied→403,
-// NotFound→404, Unimplemented→501, Internal→500.
+// NotFound→404, FailedPrecondition→412, Unimplemented→501, Internal→500.
 //
 // APERTURE_PROVIDER_REFERENCE_INVALID is deliberately a 400 rather than the
 // default 500. The only way it reaches a client is an enumerate reference edge
@@ -1205,6 +1205,21 @@ func mapErr(err error) error {
 // operator switched it off. 412 says what happened: the request is well-formed
 // and the caller may be fully privileged, but the deployment is not in a state
 // that accepts it, and retrying unchanged never will be.
+//
+// APERTURE_STORAGE_CONSTRAINT shares that 412 for the same reason, one layer
+// down. It is the storage layer refusing a write that would break referential
+// integrity — overwhelmingly a delete whose children the caller has not removed
+// yet. Nothing is broken: the database is behaving exactly as designed, the
+// request is well-formed, and the caller is usually a fully privileged admin who
+// simply took the steps out of order. The default 500 would page an on-call for
+// a mistake the caller made and can fix, and it would invite the one thing that
+// can never work here — a retry of the identical request. A 400 would be closer
+// but still wrong: the request is valid in isolation and becomes legal the
+// moment the children are gone, so the fault is in the deployment's STATE, not
+// in the message. 412 says precisely that, and the six registry fixups behind
+// APERTURE_STORAGE_CONSTRAINT — which ride to the client in meta["code"] —
+// enumerate the children to remove first. The code is new in this effort, so
+// this picks its status rather than changing one any client already depends on.
 func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 	switch code {
 	case aerr.APERTURE_INVALID_INPUT, aerr.APERTURE_IDENTITY_INVALID,
@@ -1223,7 +1238,7 @@ func codeToTwirp(code aerr.Code) twirp.ErrorCode {
 		aerr.APERTURE_DELEGATION_NOT_DELEGATABLE, aerr.APERTURE_IMPERSONATION_DENIED,
 		aerr.APERTURE_IMPERSONATION_EXPIRED:
 		return twirp.PermissionDenied
-	case aerr.APERTURE_ENTITY_UNMANAGED:
+	case aerr.APERTURE_ENTITY_UNMANAGED, aerr.APERTURE_STORAGE_CONSTRAINT:
 		return twirp.FailedPrecondition
 	case aerr.APERTURE_UNIMPLEMENTED:
 		return twirp.Unimplemented

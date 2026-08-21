@@ -55,13 +55,20 @@ object_types:
   - name: system
     description: The reserved type admin authority is modelled on.
     actions: [aperture.admin]
+  - name: doc
+    description: A second type, so DELETING one can be proven end to end.
+    actions: [read]
 permissions:
   - id: perm-admin
     object_type: system
     action: aperture.admin
     description: Administer the deployment.
+  - id: p-read
+    object_type: doc
+    action: read
+    description: Read a doc. Cited by a role and nothing else.
 roles:
-  - {id: editor, name: Editor, description: Bundles the admin permission., permissions: [perm-admin]}
+  - {id: editor, name: Editor, description: Bundles both permissions., permissions: [perm-admin, p-read]}
 groups:
   - {id: writers, name: Writers, description: Holds alice., members: [alice]}
 grants:
@@ -136,6 +143,13 @@ func wantCLIConstraint(t *testing.T, what, out string, err error) {
 	if !strings.Contains(err.Error(), string(aerr.APERTURE_STORAGE_CONSTRAINT)) {
 		t.Fatalf("%s: the printed error must name the code, got %q", what, err.Error())
 	}
+	// The CLI renders no fixups itself — the code IS the operator's index into
+	// them, via `docs/src/reference/error-codes.md` and the registry behind it. A
+	// surviving code with an empty registry entry would be a dead end.
+	entry, ok := aerr.Registry[aerr.APERTURE_STORAGE_CONSTRAINT]
+	if !ok || len(entry.Fixups) == 0 {
+		t.Fatalf("%s: APERTURE_STORAGE_CONSTRAINT must carry Registry fixup guidance", what)
+	}
 }
 
 // TestCLIDeleteRefusesAParentWithLiveChildren walks every RESTRICT edge
@@ -197,8 +211,12 @@ func TestCLITeardownChildrenFirstSucceeds(t *testing.T) {
 
 	// perm-admin and the system object type deliberately survive this teardown:
 	// root's own wildcard admin grant cites the permission, and root needs that
-	// grant to authorize the steps below it. Deleting a permission is covered by
-	// the refusal test above and by service/'s own sweep.
+	// grant to authorize the steps below it.
+	//
+	// E3-S3 adds the SECOND pair (p-read on doc) precisely so those two kinds get
+	// an end-to-end success on this surface rather than only a refusal. p-read is
+	// bundled into role editor, so it cannot come off until the role does — the
+	// ordering is proven, not sidestepped.
 	steps := []struct {
 		what string
 		argv []string
@@ -217,6 +235,9 @@ func TestCLITeardownChildrenFirstSucceeds(t *testing.T) {
 		{"delete principal alice", step(empty, "delete", "principal", "alice")},
 		// A role's permission bundle cascades from the role, so the role goes now.
 		{"delete role editor", step(empty, "delete", "role", "editor")},
+		// Only now is p-read unreferenced, and only then the type it hangs off.
+		{"delete permission p-read", step(empty, "delete", "permission", "p-read")},
+		{"delete object-type doc", step(empty, "delete", "object-type", "doc")},
 		{"delete membership root@acme", step(empty, "delete", "--principal-id", "root", "--account-id", "acme", "membership")},
 		{"delete account acme", step(empty, "delete", "account", "acme")},
 	}
