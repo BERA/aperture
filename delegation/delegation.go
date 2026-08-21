@@ -149,6 +149,16 @@ func (s *Service) authorize(ctx context.Context, delegator string, grant model.G
 	// a non-member up front gives a precise, defence-in-depth error.
 	member, err := s.store.IsMember(ctx, delegator, grant.AccountID)
 	if err != nil {
+		// An error that already carries an APERTURE_* code is returned VERBATIM.
+		// aerr.Wrap does not do that for us — it stamps the code it is handed onto
+		// a fresh CodedError, so wrapping unconditionally would flatten the
+		// storage layer's own code to APERTURE_STORAGE and bury its fixups. This
+		// is the only wrap on either delegation mutation's path, and it is shared
+		// by Bestow and Revoke, so it is the one place a coded storage failure
+		// could lose its identity on the way to a caller.
+		if aerr.CodeOf(err) != "" {
+			return model.Permission{}, err
+		}
 		return model.Permission{}, aerr.Wrap(aerr.APERTURE_STORAGE,
 			"delegation: failed to check delegator membership", err)
 	}
