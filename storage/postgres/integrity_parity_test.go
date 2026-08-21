@@ -22,7 +22,7 @@ import (
 //
 // This gate diffs the two SQL backends' copies at the source level, in the house
 // style — parse with a real parser, never grep (the precedent is
-// sqlprovider/values_test.go and storage/sqlite/schema_naming_test.go). It
+// sqlprovider/values_test.go and internal/schemagate). It
 // compares only the parts that MUST be identical:
 //
 //   - every constraint(op, format, ...) format string, keyed by the function it

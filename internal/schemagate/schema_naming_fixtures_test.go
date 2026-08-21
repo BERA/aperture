@@ -1,6 +1,8 @@
-package sqlite
+package schemagate
 
 import (
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -10,9 +12,15 @@ import (
 // exercised here against a deliberately-broken fixture, and every name the rule
 // must NOT flag is exercised against a clean one.
 //
-// The fixtures are strings. The real schema.sql is never mutated to test the
+// The fixtures are strings. A real schema.sql is never mutated to test the
 // gate — a test that edits the file it audits can leave the repository broken
 // when it fails partway through, and it cannot run in parallel with anything.
+//
+// These cases came across from storage/sqlite unchanged when the parser moved
+// here, which is the point of them: they are the safety net for the move, and a
+// net that was re-knitted on the way over is not one. What is NEW below is the
+// coverage the move made necessary — REFERENCES / ON DELETE / ON UPDATE, and the
+// Postgres file's schema qualifier — grouped at the bottom.
 
 // mustParse parses a fixture and fails the test if it will not parse.
 func mustParse(t *testing.T, src string) []tableDef {
@@ -22,6 +30,23 @@ func mustParse(t *testing.T, src string) []tableDef {
 		t.Fatalf("parse fixture: %v", err)
 	}
 	return tables
+}
+
+// fixtureDialect is the dialect the message assertions below are written
+// against. The failure message names per-dialect files (the schema and the Go
+// files holding its SQL string literals), so the fixtures have to pick one; they
+// pick SQLite because that is where these cases were written and what their
+// expected strings say. Looking it up rather than hardcoding a literal means a
+// registry that loses the row fails here too, loudly.
+func fixtureDialect(t *testing.T) dialect {
+	t.Helper()
+	for _, d := range dialects {
+		if d.name == "sqlite" {
+			return d
+		}
+	}
+	t.Fatal(`no "sqlite" dialect in the registry; the fixtures below assert on its file names`)
+	return dialect{}
 }
 
 // TestSchemaNamingGateFlagsBrokenSchemas feeds the gate schemas that break the
@@ -129,7 +154,7 @@ func TestSchemaNamingGateFlagsBrokenSchemas(t *testing.T) {
 			if len(vs) == 0 {
 				t.Fatalf("gate found nothing wrong with:\n%s\nA gate that does not bite is worse than no gate.", tc.sql)
 			}
-			msg := report(vs)
+			msg := report(fixtureDialect(t), vs)
 			for _, want := range tc.want {
 				if !strings.Contains(msg, want) {
 					t.Errorf("failure message is missing %q; a maintainer cannot act on it.\n--- message ---\n%s", want, msg)
@@ -246,7 +271,7 @@ func TestSchemaNamingGateAcceptsLegitimateNames(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if vs := checkNaming(mustParse(t, tc.sql)); len(vs) > 0 {
-				t.Errorf("gate flagged a legitimate schema:\n%s", report(vs))
+				t.Errorf("gate flagged a legitimate schema:\n%s", report(fixtureDialect(t), vs))
 			}
 		})
 	}
@@ -263,7 +288,7 @@ func TestSchemaParserSeparatesTableAndColumnPositions(t *testing.T) {
 	             );`
 	vs := checkNaming(mustParse(t, sql))
 	if len(vs) != 2 {
-		t.Fatalf("got %d violations, want 2 (one table, one column):\n%s", len(vs), report(vs))
+		t.Fatalf("got %d violations, want 2 (one table, one column):\n%s", len(vs), report(fixtureDialect(t), vs))
 	}
 	if vs[0].kind != "table" || vs[0].name != "grants" || vs[0].table != "" {
 		t.Errorf("first violation = %+v, want the TABLE grants", vs[0])
@@ -276,7 +301,7 @@ func TestSchemaParserSeparatesTableAndColumnPositions(t *testing.T) {
 	const fixed = `CREATE TABLE apt_grants (id TEXT PRIMARY KEY);
 	               CREATE TABLE apt_templates (name TEXT NOT NULL, apt_grants TEXT NOT NULL DEFAULT '[]');`
 	if got := checkNaming(mustParse(t, fixed)); len(got) > 0 {
-		t.Errorf("gate flagged the schema as it actually ships:\n%s", report(got))
+		t.Errorf("gate flagged the schema as it actually ships:\n%s", report(fixtureDialect(t), got))
 	}
 }
 
@@ -352,8 +377,9 @@ func TestSchemaParserRejectsMalformedSQL(t *testing.T) {
 
 // TestSchemaGateRefusesAVacuousParse covers the subtlest failure mode: a schema
 // the parser reads without complaint but understands as empty. The gate would
-// have nothing to check and would pass. knownTableFloor is what stops that, so
-// prove the floor is above what an empty parse produces.
+// have nothing to check and would pass. The per-dialect floors are what stop
+// that, so prove EVERY floor is above what an empty parse produces — a registry
+// row that ships a zero floor is a dialect that is registered and ungoverned.
 func TestSchemaGateRefusesAVacuousParse(t *testing.T) {
 	tables, err := parseCreateTables("-- only a comment, no statements at all\n")
 	if err != nil {
@@ -362,11 +388,16 @@ func TestSchemaGateRefusesAVacuousParse(t *testing.T) {
 	if len(tables) != 0 {
 		t.Fatalf("parsed %d tables from a comment-only file, want 0", len(tables))
 	}
-	if len(tables) >= knownTableFloor {
-		t.Fatalf("knownTableFloor is %d, which an empty parse satisfies; the anti-vacuity tripwire is disarmed", knownTableFloor)
-	}
 	if checkNaming(tables) != nil {
 		t.Fatal("checkNaming found violations in an empty parse")
+	}
+	for _, d := range dialects {
+		if len(tables) >= d.tableFloor {
+			t.Errorf("%s: tableFloor is %d, which an empty parse satisfies; the anti-vacuity tripwire is disarmed", d.name, d.tableFloor)
+		}
+		if d.foreignKeyFloor <= 0 {
+			t.Errorf("%s: foreignKeyFloor is %d; a schema that declares foreign keys needs a floor above zero or the clause reader can stop working unnoticed", d.name, d.foreignKeyFloor)
+		}
 	}
 }
 
@@ -401,5 +432,241 @@ func TestSingularFamilyStopsWhereItShould(t *testing.T) {
 		if hit, ok := reservedMatch(name); ok {
 			t.Errorf("reservedMatch(%q) flagged it as %s; compound names never qualify", name, hit.word)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// New with the move: REFERENCES clauses and the schema qualifier
+//
+// Everything above came from storage/sqlite unchanged. Everything below is the
+// syntax the second dialect brought with it. The two are kept apart so a
+// reviewer can see at a glance which assertions are the safety net for the move
+// and which are new ground.
+// ---------------------------------------------------------------------------
+
+// fkKey renders one parsed edge in a comparable form, so a test can assert on
+// the whole set rather than on fields one at a time.
+func fkKey(from string, fk foreignKey) string {
+	return fmt.Sprintf("%s(%s) -> %s(%s) ON DELETE %s ON UPDATE %s",
+		from, strings.Join(fk.columns, ","), fk.table, strings.Join(fk.refColumns, ","),
+		fk.onDelete, fk.onUpdate)
+}
+
+// allForeignKeys flattens a parse into fkKey strings, sorted.
+func allForeignKeys(tables []tableDef) []string {
+	var out []string
+	for _, tbl := range tables {
+		for _, fk := range tbl.foreignKeys {
+			out = append(out, fkKey(tbl.name, fk))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestParserReadsForeignKeyClauses is the REFERENCES / ON DELETE / ON UPDATE
+// criterion. Before the move the parser stepped over a table constraint the
+// moment it saw FOREIGN, which was correct while nothing needed the edges and
+// became a hole the moment nine of them landed in two files that have to agree.
+func TestParserReadsForeignKeyClauses(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "a table constraint with both actions",
+			sql: `CREATE TABLE apt_principal_roles (
+			          principal_id TEXT NOT NULL,
+			          role_id      TEXT NOT NULL,
+			          PRIMARY KEY (principal_id, role_id),
+			          FOREIGN KEY (principal_id) REFERENCES apt_principals (id) ON DELETE CASCADE ON UPDATE RESTRICT,
+			          FOREIGN KEY (role_id) REFERENCES apt_roles (id) ON DELETE RESTRICT ON UPDATE RESTRICT
+			      );`,
+			want: []string{
+				"apt_principal_roles(principal_id) -> apt_principals(id) ON DELETE CASCADE ON UPDATE RESTRICT",
+				"apt_principal_roles(role_id) -> apt_roles(id) ON DELETE RESTRICT ON UPDATE RESTRICT",
+			},
+		},
+		{
+			name: "the Postgres spelling: every identifier schema-qualified",
+			sql: `CREATE TABLE IF NOT EXISTS apt_schema.apt_group_members (
+			          group_id     TEXT NOT NULL,
+			          principal_id TEXT NOT NULL,
+			          PRIMARY KEY (group_id, principal_id),
+			          FOREIGN KEY (group_id) REFERENCES apt_schema.apt_groups (id) ON DELETE CASCADE ON UPDATE RESTRICT,
+			          FOREIGN KEY (principal_id) REFERENCES apt_schema.apt_principals (id) ON DELETE RESTRICT ON UPDATE RESTRICT
+			      );`,
+			// The qualifier is dropped on BOTH sides, which is what makes an edge
+			// read out of the Postgres file comparable with the SQLite one.
+			want: []string{
+				"apt_group_members(group_id) -> apt_groups(id) ON DELETE CASCADE ON UPDATE RESTRICT",
+				"apt_group_members(principal_id) -> apt_principals(id) ON DELETE RESTRICT ON UPDATE RESTRICT",
+			},
+		},
+		{
+			name: "a named constraint",
+			sql: `CREATE TABLE apt_grants (
+			          permission_id TEXT NOT NULL,
+			          CONSTRAINT fk_grant_permission FOREIGN KEY (permission_id)
+			              REFERENCES apt_permissions (id) ON DELETE RESTRICT ON UPDATE RESTRICT
+			      );`,
+			want: []string{"apt_grants(permission_id) -> apt_permissions(id) ON DELETE RESTRICT ON UPDATE RESTRICT"},
+		},
+		{
+			name: "the inline column form is a foreign key too",
+			sql: `CREATE TABLE apt_permissions (
+			          id          TEXT PRIMARY KEY,
+			          object_type TEXT NOT NULL REFERENCES apt_object_types (name) ON DELETE RESTRICT ON UPDATE RESTRICT
+			      );`,
+			want: []string{"apt_permissions(object_type) -> apt_object_types(name) ON DELETE RESTRICT ON UPDATE RESTRICT"},
+		},
+		{
+			name: "compound keys, no referenced column list, and the clauses in the other order",
+			sql: `CREATE TABLE apt_x (
+			          a TEXT NOT NULL,
+			          b TEXT NOT NULL,
+			          FOREIGN KEY (a, b) REFERENCES apt_y ON UPDATE NO ACTION ON DELETE SET NULL
+			      );`,
+			want: []string{"apt_x(a,b) -> apt_y() ON DELETE SET NULL ON UPDATE NO ACTION"},
+		},
+		{
+			name: "MATCH and DEFERRABLE are stepped over, not choked on",
+			sql: `CREATE TABLE apt_x (
+			          a TEXT NOT NULL,
+			          FOREIGN KEY (a) REFERENCES apt_y (id) MATCH FULL
+			              ON DELETE SET DEFAULT ON UPDATE CASCADE
+			              DEFERRABLE INITIALLY DEFERRED
+			      );`,
+			want: []string{"apt_x(a) -> apt_y(id) ON DELETE SET DEFAULT ON UPDATE CASCADE"},
+		},
+		{
+			name: "PRIMARY KEY, UNIQUE and CHECK are not foreign keys",
+			sql: `CREATE TABLE apt_x (
+			          a TEXT NOT NULL,
+			          PRIMARY KEY (a),
+			          UNIQUE (a),
+			          CHECK (a <> ''),
+			          CONSTRAINT a_is_set CHECK (a <> '')
+			      );`,
+			want: nil,
+		},
+		{
+			name: "a column literally named references is not a clause",
+			sql: `CREATE TABLE apt_x (
+			          a            TEXT NOT NULL,
+			          "references" TEXT NOT NULL DEFAULT ''
+			      );`,
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := allForeignKeys(mustParse(t, tc.sql))
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Errorf("foreign keys =\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(tc.want, "\n  "))
+			}
+		})
+	}
+}
+
+// TestParserRejectsForeignKeySyntaxItCannotRead is the fail-don't-skip posture
+// carried into the clause reader. A FOREIGN KEY the parser gives up on must be
+// an error, because the alternative — treating it as "not a foreign key" — is a
+// key that silently leaves the edge set.
+func TestParserRejectsForeignKeySyntaxItCannotRead(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"FOREIGN without KEY", "CREATE TABLE apt_x (a TEXT, FOREIGN (a) REFERENCES apt_y (id));", "FOREIGN is not followed by KEY"},
+		{"no key column list", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY REFERENCES apt_y (id));", "expected '(' and a column list"},
+		{"no REFERENCES", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a));", "expected REFERENCES after the key columns"},
+		{"REFERENCES nothing", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES);", "REFERENCES without a target table"},
+		{"unknown ON DELETE action", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) ON DELETE MAYBE);", `unknown referential action "MAYBE"`},
+		{"unknown ON UPDATE action", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) ON UPDATE SET FIRE);", `unknown referential action "SET"`},
+		{"ON DELETE with nothing after it", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) ON DELETE);", "missing referential action"},
+		{"ON DELETE twice", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) ON DELETE CASCADE ON DELETE RESTRICT);", "ON DELETE given twice"},
+		{"MATCH with no mode", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) MATCH ON DELETE CASCADE);", "MATCH must be FULL, PARTIAL or SIMPLE"},
+		{"INITIALLY with no mode", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) DEFERRABLE INITIALLY);", "INITIALLY must be DEFERRED or IMMEDIATE"},
+		{"trailing syntax the parser has not been taught", "CREATE TABLE apt_x (a TEXT, FOREIGN KEY (a) REFERENCES apt_y (id) ENFORCED);", `unexpected "ENFORCED" after the clause`},
+		{"an inline clause the parser cannot read", "CREATE TABLE apt_x (a TEXT REFERENCES apt_y (id) ON DELETE WHENEVER);", `unknown referential action "WHENEVER"`},
+		{"CONSTRAINT without a name", "CREATE TABLE apt_x (a TEXT, CONSTRAINT FOREIGN KEY (a) REFERENCES apt_y (id));", "CONSTRAINT without a name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tables, err := parseCreateTables(tc.sql)
+			if err == nil {
+				t.Fatalf("parsed %d tables with no error; a foreign key the parser cannot read must fail, not vanish", len(tables))
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestQualifiedNamesAreCheckedThroughTheQualifier is the qualifier criterion at
+// the rule level rather than the parser level: apt_schema.apt_grants is a legal
+// table name and apt_schema.grants is not, and the gate has to be able to tell
+// them apart through a prefix it is otherwise discarding.
+func TestQualifiedNamesAreCheckedThroughTheQualifier(t *testing.T) {
+	const clean = `CREATE TABLE IF NOT EXISTS apt_schema.apt_templates (
+	                   name       TEXT NOT NULL,
+	                   apt_grants TEXT NOT NULL DEFAULT '[]'
+	               );`
+	if vs := checkNaming(mustParse(t, clean)); len(vs) > 0 {
+		t.Errorf("gate flagged the Postgres file's own spelling:\n%s", report(fixtureDialect(t), vs))
+	}
+
+	// The qualifier must not launder a violation. apt_schema. is a placeholder,
+	// not a namespace the convention accepts in place of apt_.
+	const broken = `CREATE TABLE IF NOT EXISTS apt_schema.grants (
+	                    id     TEXT PRIMARY KEY,
+	                    action TEXT NOT NULL
+	                );`
+	vs := checkNaming(mustParse(t, broken))
+	if len(vs) != 2 {
+		t.Fatalf("got %d violations, want 2 (the table and the column):\n%s", len(vs), report(fixtureDialect(t), vs))
+	}
+	if vs[0].kind != "table" || vs[0].name != "grants" {
+		t.Errorf("first violation = %+v, want the TABLE grants with the qualifier dropped", vs[0])
+	}
+	if vs[1].kind != "column" || vs[1].name != "action" || vs[1].table != "grants" {
+		t.Errorf("second violation = %+v, want the COLUMN action on grants", vs[1])
+	}
+}
+
+// TestReportNamesTheDialectItIsTalkingAbout pins the one thing that had to
+// change when the message stopped being about a single file: a Postgres failure
+// must send a maintainer to the Postgres files, and must not quietly keep
+// naming SQLite's.
+func TestReportNamesTheDialectItIsTalkingAbout(t *testing.T) {
+	vs := checkNaming(mustParse(t, `CREATE TABLE grants (id TEXT PRIMARY KEY);`))
+	if len(vs) == 0 {
+		t.Fatal("fixture produced no violations")
+	}
+	for _, d := range dialects {
+		t.Run(d.name, func(t *testing.T) {
+			msg := report(d, vs)
+			for _, want := range append([]string{d.path}, d.statementSources...) {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the %s failure message never mentions %q:\n%s", d.name, want, msg)
+				}
+			}
+			for _, other := range dialects {
+				if other.name == d.name {
+					continue
+				}
+				if strings.Contains(msg, other.path) {
+					t.Errorf("the %s failure message points at %s, which is the wrong file to edit:\n%s", d.name, other.path, msg)
+				}
+			}
+			if d.qualifier != "" && !strings.Contains(msg, d.qualifier) {
+				t.Errorf("the %s failure message never explains the %q qualifier its identifiers carry:\n%s", d.name, d.qualifier, msg)
+			}
+		})
 	}
 }

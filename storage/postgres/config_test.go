@@ -413,7 +413,7 @@ func TestQuotingIsTotal(t *testing.T) {
 // statements against one and resolve the catalog against the other.
 //
 // House shape: parse with a real parser, never grep — the same discipline
-// sqlprovider/values_test.go and storage/sqlite/schema_naming_test.go follow.
+// sqlprovider/values_test.go and internal/schemagate follow.
 func TestEverySchemaQualifierIsDerivedFromQualifierFor(t *testing.T) {
 	fset, files := parsePackageSource(t)
 
