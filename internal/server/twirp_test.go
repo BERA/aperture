@@ -31,6 +31,14 @@ const acct = "acme"
 // authenticated non-admin.
 func newTestServer(t *testing.T) (*httptest.Server, model.Storage) {
 	t.Helper()
+	return newTestServerManaged(t, service.ManagedEntities{})
+}
+
+// newTestServerManaged is newTestServer with an explicit entity-management
+// posture. The zero ManagedEntities is what newTestServer passes, so every
+// existing test keeps exercising the default (everything managed) path.
+func newTestServerManaged(t *testing.T, managed service.ManagedEntities) (*httptest.Server, model.Storage) {
+	t.Helper()
 	ctx := context.Background()
 	store := memory.New()
 	must(t, store.Setup(ctx))
@@ -59,6 +67,7 @@ func newTestServer(t *testing.T) (*httptest.Server, model.Storage) {
 		service.WithGate(authz.NewGate(eng)),
 		service.WithDelegation(delegation.New(store, eng)),
 		service.WithImpersonation(impersonation.New(store, eng)),
+		service.WithManagedEntities(managed),
 	)
 	handler := server.Authenticate(auth.NewDev(), server.New(svc))
 	srv := httptest.NewServer(handler)

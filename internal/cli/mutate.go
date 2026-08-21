@@ -32,7 +32,23 @@ import (
 
 // buildService constructs and seeds the fully-wired facade for a CLI command,
 // returning it plus the store to close. It mirrors serve's manual DI.
+//
+// That mirroring includes the deployment's entity-management posture. Which
+// entities Aperture manages is a property of the DEPLOYMENT, not of the surface
+// asking, so `aperture put account` has to observe the same APERTURE_MANAGE_*
+// switches the wire does — otherwise the CLI would be a local bypass of a lock
+// the Twirp surface honours, on the same store. Only the environment is read
+// here: the --manage-* flags are serve's, because they describe a long-running
+// process an operator configures once, and a per-invocation flag would let the
+// caller lift the lock by typing it.
 func buildService(ctx context.Context, storeDSN, seedPath string) (*service.Service, model.Storage, error) {
+	// Read the posture FIRST, before anything is opened: a malformed
+	// APERTURE_MANAGE_* value must fail the command outright rather than after a
+	// store file has been created.
+	managed, err := service.ManagedEntitiesFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
 	store, err := buildStore(ctx, storeDSN, seedPath)
 	if err != nil {
 		return nil, nil, err
@@ -43,6 +59,7 @@ func buildService(ctx context.Context, storeDSN, seedPath string) (*service.Serv
 		service.WithGate(authz.NewGate(eng)),
 		service.WithDelegation(delegation.New(store, eng)),
 		service.WithImpersonation(impersonation.New(store, eng)),
+		service.WithManagedEntities(managed),
 	)
 	return svc, store, nil
 }

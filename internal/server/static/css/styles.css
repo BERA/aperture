@@ -347,6 +347,30 @@ body {
 }
 .a-linkbtn:hover { color: var(--color-link-hover); text-decoration: underline; }
 .a-linkbtn--danger { color: var(--color-danger); }
+.a-linkbtn:disabled { opacity: .4; pointer-events: none; text-decoration: none; }
+
+/* Locked control (creation-gating E2-S2): a write control the DEPLOYMENT has
+   turned off stays visible and renders disabled, with the explanation carried
+   as a title on this wrapper. It has to be the wrapper — .a-btn:disabled and
+   .a-linkbtn:disabled both set pointer-events: none, so a disabled control
+   never receives the hover that would show a title of its own. Contrast the
+   authority gate (canEdit), which hides its controls outright; the two states
+   have different causes and must stay legible as different. Layout-neutral by
+   design: the wrapper is always present, so an unlocked deployment renders
+   exactly as it did before. */
+.a-locked { display: inline-flex; }
+.a-locked:has(:disabled) { cursor: not-allowed; }
+
+/* .a-locked--block (E2-S3): the same wrapper around a whole GROUP rather than
+   one button — the two membership checklists. The base wrapper shrink-wraps,
+   which would lay a wrapping .a-checks out at max-content width and overflow
+   the field; block keeps the group's own layout untouched. */
+.a-locked--block { display: block; }
+
+/* A disabled checkbox does NOT set pointer-events: none, so the group wrapper's
+   title still reaches the cursor over a locked row; this only has to read as
+   inert. */
+.a-check:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 
 /* ---------- Status pill / badge (§6.7) ---------- */
 .a-badge {

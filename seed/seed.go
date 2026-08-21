@@ -237,6 +237,18 @@ func Parse(data []byte, format Format) (*Document, error) {
 // the storage layer's validation, so a malformed entity surfaces the same coded
 // error a programmatic Put would. Apply is not transactional — a failure may
 // leave a partial model — which is acceptable for the seed-and-demo use case.
+//
+// Apply writes accounts, principals, and memberships STRAIGHT to storage, so it
+// does not observe the deployment's APERTURE_MANAGE_* entity-management posture
+// (service.ManagedEntities). That is a decision, not an omission: the boot-time
+// loader behind `aperture serve --seed` is the operator provisioning the process
+// it is already configuring, which is the same trust level as setting the switch,
+// and a deployment must be able to seed the entities it then declares unmanaged.
+// The gate belongs on the runtime paths an authenticated caller reaches over the
+// wire — the service facade's mutators, and service.Import, which is the one that
+// funnels a whole Document through this function and therefore carries its own
+// explicit check. A NEW caller of Apply that is reachable at runtime needs one
+// too; it will not inherit anything from here.
 func (d *Document) Apply(ctx context.Context, store model.Storage) error {
 	for _, a := range d.Accounts {
 		if err := store.PutAccount(ctx, model.Account{

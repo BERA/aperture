@@ -19,6 +19,12 @@
  * the operator sees edit controls on load with no account context. A non-admin
  * sees a read-only view with editing affordances hidden, and any mutation that
  * still reaches the API surfaces its APERTURE_* code + msg.
+ *
+ * Deployment posture is a SECOND, unrelated reason a control can be
+ * unavailable: an operator can declare an entity kind mastered outside Aperture,
+ * and then nobody manages it here. That one renders as a visible, disabled
+ * control with hover text rather than a hidden one — see "locked controls"
+ * below for why the two look different, and which to reach for.
  */
 
 const CRUD_TOKEN_KEY = "aperture.devToken";
@@ -30,6 +36,38 @@ const ADMIN_OBJECT = "system:schema"; // the system-tier authority anchor (authz
 // one. The platform "*" account (model.AccountWildcard) is where the super-admin
 // grant lives, so system-tier work resolves against it.
 const ADMIN_ACCOUNT = "*";
+
+// ---- Deployment posture: locked entity kinds ----
+//
+// An operator can declare an entity kind mastered outside Aperture with
+// APERTURE_MANAGE_ACCOUNTS / _PRINCIPALS / _MEMBERSHIPS, read once at server
+// startup. The open Capabilities RPC reports the three booleans; the server
+// refuses every create, update, and delete of a locked kind with
+// APERTURE_ENTITY_UNMANAGED, for every caller including a system-admin. The
+// shell only mirrors that posture — it is not the enforcement point.
+//
+// LOCKED_HINTS is the hover text for the controls a lock turns off, keyed by
+// the Capabilities field the switch drives. These strings are client-side BY
+// DECISION: the wire carries booleans and no message, so the wording can change
+// without a proto change, and there is deliberately no Go<->JS parity gate for
+// them. That makes keeping them in step a human job — if either side is
+// reworded, re-read the APERTURE_ENTITY_UNMANAGED message in errors/codes.go
+// ("this deployment does not manage <kind>") and the refusal in
+// service/mutations.go, and keep this terse voice saying the same thing.
+const LOCKED_HINTS = {
+  accounts: "Account management is disabled in this deployment.",
+  principals: "Principal management is disabled in this deployment.",
+  // Memberships has two entry points of its own (the account members editor and
+  // the principal form's Accounts checklist); both read this one string through
+  // membershipHint(), which is hintFor("memberships").
+  memberships: "Membership management is disabled in this deployment.",
+};
+
+// CAPABILITIES_OPEN is the posture assumed before the probe answers and after a
+// probe that fails: every kind manageable. That is the server's documented
+// default and exactly how this screen behaved before the switches existed, so
+// an unconfigured deployment is indistinguishable from today.
+const CAPABILITIES_OPEN = { accounts: true, principals: true, memberships: true };
 
 // rpc POSTs a Twirp JSON call through the shared bearer wrapper and returns the
 // decoded response. A non-2xx carries a Twirp error body
@@ -73,6 +111,10 @@ const TYPES = [
     singular: "account",
     rpc: { list: "ListAccounts", put: "PutAccount", del: "DeleteAccount" },
     idField: "ID",
+    // managedKey names the deployment switch that owns this kind's lifecycle —
+    // a field of the Capabilities response. An entity with no managedKey is
+    // never gated (roles, groups, permissions, object types).
+    managedKey: "accounts",
     // manageMembers adds a per-row "Members" action that opens the account's
     // membership editor (principals become members via PutMembership).
     manageMembers: true,
@@ -94,6 +136,7 @@ const TYPES = [
     singular: "principal",
     rpc: { list: "ListPrincipals", put: "PutPrincipal", del: "DeletePrincipal" },
     idField: "ID",
+    managedKey: "principals",
     // membership renders an "Accounts" checklist on the form; the principal's
     // account memberships are reconciled (Put/DeleteMembership) after the
     // principal itself is saved.
@@ -210,6 +253,18 @@ function crud() {
     canEdit: false,
     tierChecked: false,
 
+    // capabilities mirrors the Capabilities RPC: one boolean per gated entity
+    // kind, true when this deployment manages the kind. It sits beside canEdit
+    // because both decide what the write controls do — and it is emphatically
+    // NOT the same thing: canEdit is about the actor, this is about the
+    // deployment. See "locked controls" below.
+    //
+    // capabilitiesChecked mirrors tierChecked: it says the probe has answered,
+    // so a surface that wants to explain the posture in prose can wait for the
+    // truth instead of flashing the optimistic default.
+    capabilities: { ...CAPABILITIES_OPEN },
+    capabilitiesChecked: false,
+
     // Reference lists used to populate multi-select and select widgets. Kept
     // small (the whole model) and refreshed after each mutation.
     refs: { roles: [], permissions: [], objectTypes: [], principals: [], rules: [] },
@@ -232,6 +287,9 @@ function crud() {
         this.principal = (e.detail && e.detail.principal) || localStorage.getItem(CRUD_TOKEN_KEY) || "";
         this.bootstrap();
       });
+      // Signing out drops everything identity-shaped. capabilities is NOT
+      // identity-shaped — the deployment manages the same kinds whoever is
+      // looking — so it survives, and the next sign-in re-probes it anyway.
       const clear = () => {
         this.principal = "";
         this.accounts = [];
@@ -250,11 +308,12 @@ function crud() {
       return this.types.find((t) => t.key === this.activeType) || this.types[0];
     },
 
-    // bootstrap probes admin authority, loads the reference lists, then lists the
-    // active entity. These are global schema entities, so nothing here depends on
-    // an account.
+    // bootstrap probes admin authority and deployment posture, loads the
+    // reference lists, then lists the active entity. These are global schema
+    // entities, so nothing here depends on an account.
     async bootstrap() {
       await this.probeTier();
+      await this.probeCapabilities();
       await this.loadRefs();
       await this.load();
     },
@@ -279,6 +338,134 @@ function crud() {
         this.canEdit = false;
       }
       this.tierChecked = true;
+    },
+
+    // probeCapabilities asks the OPEN Capabilities RPC which entity kinds this
+    // deployment manages. Like the Check probe above it carries the bearer but
+    // needs no auth, and unlike it the answer does not depend on who asks: the
+    // response is three booleans of boot-time operator configuration, with no
+    // ids, counts, or model data in it.
+    //
+    // A failed probe leaves every kind manageable. The server is the enforcement
+    // point — a locked write is refused with APERTURE_ENTITY_UNMANAGED whatever
+    // the shell believes — so failing open costs at worst one error message,
+    // while failing closed would grey out working controls on a transient blip.
+    async probeCapabilities() {
+      this.capabilitiesChecked = false;
+      try {
+        const caps = await rpc("Capabilities", {});
+        // Twirp's JSON codec emits unpopulated fields, so all three keys are
+        // present with an explicit true/false. Reading "anything but false" as
+        // true still makes a key that somehow went missing mean the documented
+        // default (managed) rather than a silent lock.
+        this.capabilities = {
+          accounts: caps.manage_accounts !== false,
+          principals: caps.manage_principals !== false,
+          memberships: caps.manage_memberships !== false,
+        };
+      } catch (_) {
+        this.capabilities = { ...CAPABILITIES_OPEN };
+      }
+      this.capabilitiesChecked = true;
+    },
+
+    // ---- locked controls (the disabled-with-hover-text pattern) ----
+    //
+    // There are TWO reasons a write control can be unavailable on this screen,
+    // and they render DIFFERENTLY on purpose. Pick by cause, not by convenience:
+    //
+    //   canEdit — the signed-in principal lacks system-admin authority. HIDE the
+    //   control (x-show / x-if in index.html: the "New" button, the whole
+    //   per-row action cell). A read-only viewer cannot make it work by any
+    //   action available to them, and the read-only banner already explains the
+    //   screen once, so a row of dead buttons is noise.
+    //
+    //   a locked entity kind — the DEPLOYMENT does not manage this kind. Keep
+    //   the control VISIBLE and render it DISABLED with hover text. The action
+    //   exists in Aperture and refuses everyone equally (a system-admin
+    //   included), and whoever is looking is usually the person who can set
+    //   APERTURE_MANAGE_* and restart. Hiding it would read as "this build has
+    //   no such feature" and send an operator hunting through the grant table
+    //   for something a startup flag decided.
+    //
+    // Never let one imply the other: an admin on a locked deployment sees
+    // disabled controls, a non-admin on an open one still sees nothing, and a
+    // non-admin on a locked one sees nothing (authority wins the outer gate).
+    //
+    // The markup shape, in index.html:
+    //
+    //   <span class="a-locked" :title="lockHint(currentType)">
+    //     <button :disabled="!entityManaged(currentType)" @click="openEdit(row)">
+    //
+    // The title goes on the WRAPPER, not the control: .a-btn:disabled sets
+    // pointer-events: none, so a disabled button never receives the hover that
+    // would show a title of its own. Handlers guard themselves too
+    // (openCreate / openEdit / askDelete), so a locked control is inert even if
+    // its :disabled binding is ever lost.
+    //
+    // A whole GROUP of controls (either membership checklist) wraps the same
+    // way but adds .a-locked--block: the plain wrapper is inline-flex and would
+    // shrink-wrap a wrapping checklist to max-content width.
+
+    // manages reports whether the deployment manages a Capabilities key
+    // ("accounts" | "principals" | "memberships"). Unknown keys are manageable.
+    manages(key) {
+      return this.capabilities[key] !== false;
+    },
+
+    // hintFor is the hover text for a locked key, and "" for a live one — an
+    // empty title renders no tooltip, so the healthy case adds nothing.
+    hintFor(key) {
+      return this.manages(key) ? "" : LOCKED_HINTS[key] || "";
+    },
+
+    // entityManaged / lockHint are the entity-descriptor spellings of the two
+    // primitives above, for the type-driven list and form controls. A type with
+    // no managedKey is ungated and always manageable.
+    entityManaged(type) {
+      const key = type && type.managedKey;
+      return !key || this.manages(key);
+    },
+
+    lockHint(type) {
+      const key = type && type.managedKey;
+      return key ? this.hintFor(key) : "";
+    },
+
+    // ---- membership: an edge, not an entity descriptor ----
+    //
+    // Membership has no TYPES row of its own — it is a (principal, account)
+    // edge reachable from two places — so it cannot ride entityManaged(type).
+    // These are the membership spellings of manages() / hintFor(), and they
+    // read APERTURE_MANAGE_MEMBERSHIPS **alone**: a locked accounts or
+    // principals kind must not grey out a membership control, and a membership
+    // lock must leave account and principal editing completely alone. Mixing
+    // the three would make the posture unreadable — an operator who locked one
+    // kind would see three kinds go inert.
+    //
+    // What a membership lock turns off is WRITE only. Both editors keep
+    // rendering the edges they already found, because "who belongs to what" is
+    // a read, and the read RPC (Export) is not gated. A locked deployment gets
+    // a read-only membership view, not a blank one.
+    //
+    // The two entry points, both gated:
+    //
+    //   1. the account-centric members editor (openMembers/toggleMember/
+    //      saveMembers) — the obvious one; its checklist and Save go disabled.
+    //   2. the principal form's Accounts checklist (toggleModalAccount) — the
+    //      one that hides. Its writes are a SIDE EFFECT of saving a principal,
+    //      not a control anyone would think to disable, so the checklist going
+    //      inert is not enough: save() must skip the reconciliation too.
+    //
+    // reconcileMemberships() is the single write chokepoint under both, and it
+    // guards itself. That is the guarantee worth having — a future third caller
+    // is gated by construction, not by remembering.
+    membershipsManaged() {
+      return this.manages("memberships");
+    },
+
+    membershipHint() {
+      return this.hintFor("memberships");
     },
 
     async loadRefs() {
@@ -582,7 +769,16 @@ function crud() {
 
     // reconcile persists the difference between a desired membership set and the
     // set present at open. `pairs` are { principal, account } objects.
+    //
+    // This is the ONE place either membership editor writes, which is why the
+    // deployment lock is enforced here and not only at the call sites: with
+    // memberships locked, no PutMembership and no DeleteMembership leaves the
+    // browser, whichever path asked. The server refuses them anyway
+    // (APERTURE_ENTITY_UNMANAGED) — this just means a principal save on a
+    // locked deployment succeeds quietly instead of erroring on an edge the
+    // operator never touched.
     async reconcileMemberships(toAdd, toRemove) {
+      if (!this.membershipsManaged()) return;
       for (const p of toAdd) {
         await rpc("PutMembership", { actor: this.actor(), entity_json: JSON.stringify({ PrincipalID: p.principal, AccountID: p.account }) });
       }
@@ -609,6 +805,9 @@ function crud() {
     },
 
     toggleMember(principalID) {
+      // Inert on a locked deployment even if the :disabled binding is lost —
+      // same belt-and-braces contract as openCreate / openEdit / askDelete.
+      if (!this.membershipsManaged()) return;
       const cur = { ...this.members.selected };
       if (cur[principalID]) delete cur[principalID];
       else cur[principalID] = true;
@@ -616,6 +815,7 @@ function crud() {
     },
 
     async saveMembers() {
+      if (!this.membershipsManaged()) return;
       const acct = this.members.account.ID;
       const sel = this.members.selected;
       const orig = this.members.original;
@@ -658,6 +858,7 @@ function crud() {
     },
 
     toggleModalAccount(accountID) {
+      if (!this.membershipsManaged()) return;
       const cur = { ...this.modal.memberSel };
       if (cur[accountID]) delete cur[accountID];
       else cur[accountID] = true;
@@ -667,11 +868,14 @@ function crud() {
     // ---- create / edit ----
 
     openCreate() {
+      // A locked kind is inert, not merely greyed: no form opens.
+      if (!this.entityManaged(this.currentType)) return;
       const form = this.currentType.blank();
       this.modal = { open: true, mode: "create", form, saving: false, error: null, tagText: this.seedTagText(form), scopeSel: this.seedScopeSel(form), memberSel: {}, memberOrig: {}, memberLoading: false };
     },
 
     openEdit(row) {
+      if (!this.entityManaged(this.currentType)) return;
       // Deep-clone so an aborted edit does not mutate the visible row.
       const form = JSON.parse(JSON.stringify(row));
       this.modal = { open: true, mode: "edit", form, saving: false, error: null, tagText: this.seedTagText(form), scopeSel: this.seedScopeSel(form), memberSel: {}, memberOrig: {}, memberLoading: false };
@@ -708,7 +912,14 @@ function crud() {
         await rpc(type.rpc.put, { actor: this.actor(), entity_json: JSON.stringify(this.modal.form) });
         // Reconcile account membership after the principal itself is saved, so a
         // brand-new principal exists before any PutMembership references it.
-        if (type.membership) {
+        //
+        // Skipped outright when the deployment does not manage memberships:
+        // this is the write path that does not look like one, so it is gated on
+        // its own membership flag and NOT on whatever gated the principal.
+        // Principals open + memberships locked is a real posture, and it must
+        // save the principal and touch not one edge. reconcileMemberships()
+        // refuses again below; the two together are deliberate.
+        if (type.membership && this.membershipsManaged()) {
           const pid = this.modal.form[type.idField];
           const sel = this.modal.memberSel || {};
           const orig = this.modal.memberOrig || {};
@@ -737,6 +948,7 @@ function crud() {
     // ---- delete ----
 
     askDelete(row) {
+      if (!this.entityManaged(this.currentType)) return;
       this.confirm = { open: true, row, message: this.confirmMessage(row), deleting: false, error: null };
     },
 

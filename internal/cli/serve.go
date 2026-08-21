@@ -59,12 +59,71 @@ func serveCommand() *ucli.Command {
 				Usage:   "deny any decision whose principal is not a member of the active account, before grants are consulted (defence-in-depth; lets shared roles be reused across accounts safely)",
 				Sources: ucli.EnvVars("APERTURE_ENFORCE_MEMBERSHIP"),
 			},
+			&ucli.BoolFlag{
+				Name:  "manage-accounts",
+				Value: true,
+				Usage: "manage the lifecycle of account records — allow account create/update/delete through the API (default true; overrides " + service.EnvManageAccounts + "). Pass --manage-accounts=false when accounts are mastered by an upstream system: Aperture then refuses every account write regardless of the caller's authority, while account reads and every decision stay unaffected. Read once at startup; a restart is required to change it",
+			},
+			&ucli.BoolFlag{
+				Name:  "manage-principals",
+				Value: true,
+				Usage: "manage the lifecycle of principal records — allow principal create/update/delete through the API (default true; overrides " + service.EnvManagePrincipals + "). Pass --manage-principals=false when principals are mastered by an upstream directory or IdP: Aperture then refuses every principal write regardless of the caller's authority, while principal reads and every decision stay unaffected. Read once at startup; a restart is required to change it",
+			},
+			&ucli.BoolFlag{
+				Name:  "manage-memberships",
+				Value: true,
+				Usage: "manage the lifecycle of principal-to-account memberships — allow membership create/update/delete through the API (default true; overrides " + service.EnvManageMemberships + "). Independent of the other two, so a deployment can master accounts and principals upstream and still decide who belongs to what, or the reverse. Read once at startup; a restart is required to change it",
+			},
 		},
 		Action: runServe,
 	}
 }
 
+// managedEntities resolves which entity kinds this process manages, in
+// precedence order: the documented default (every kind managed), overridden by
+// the APERTURE_MANAGE_* environment variables, overridden by a --manage-* flag
+// the operator actually passed.
+//
+// The flags deliberately do NOT carry ucli.EnvVars sources even though their
+// usage text names the matching variable. urfave/cli parses a boolean source
+// itself and fails the command with its own uncoded "parse error" before the
+// action ever runs, which would make a typo'd APERTURE_MANAGE_ACCOUNTS report
+// something other than APERTURE_CONFIG_INVALID. Reading the environment through
+// service.ManagedEntitiesFromEnv keeps one coded error for a bad value, and
+// keeps cmd.IsSet meaning "the operator typed this flag" so flag-over-env
+// precedence is unambiguous. Both paths accept strconv.ParseBool's spellings, so
+// the two can never disagree about a value they both accept.
+func managedEntities(cmd *ucli.Command) (service.ManagedEntities, error) {
+	managed, err := service.ManagedEntitiesFromEnv()
+	if err != nil {
+		return service.ManagedEntities{}, err
+	}
+	for _, f := range []struct {
+		flag  string
+		field *service.Managed
+	}{
+		{"manage-accounts", &managed.Accounts},
+		{"manage-principals", &managed.Principals},
+		{"manage-memberships", &managed.Memberships},
+	} {
+		if cmd.IsSet(f.flag) {
+			*f.field = service.ManagedFrom(cmd.Bool(f.flag))
+		}
+	}
+	return managed, nil
+}
+
 func runServe(ctx context.Context, cmd *ucli.Command) error {
+	// Resolve the deployment's entity-management posture FIRST, before anything is
+	// opened or created: a malformed APERTURE_MANAGE_* value must fail the boot
+	// outright rather than after a store file has been written. It is read exactly
+	// once, here — which entities Aperture owns is a property of the deployment,
+	// not of a request, so nothing downstream re-reads or mutates it.
+	managed, err := managedEntities(cmd)
+	if err != nil {
+		return err
+	}
+
 	// Construct the dependency graph by hand: storage -> engine -> service ->
 	// HTTP handler. Each layer is a plain constructor; there is no container.
 	store, err := buildStore(ctx, cmd.String("store"), cmd.String("seed"))
@@ -128,6 +187,7 @@ func runServe(ctx context.Context, cmd *ucli.Command) error {
 		service.WithImpersonation(impersonation.New(store, eng)),
 		service.WithAudit(rec),
 		service.WithRuleSource(stack.ruleSource, stack.fetcher),
+		service.WithManagedEntities(managed),
 	)
 
 	handler := server.Authenticate(authn, server.New(svc))
