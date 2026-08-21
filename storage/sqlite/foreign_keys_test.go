@@ -383,6 +383,12 @@ func TestCascadeRemovesAJoinTableWithItsOwner(t *testing.T) {
 	if err := s.DeleteMembership(ctx, "alice", "acme"); err != nil {
 		t.Fatalf("delete membership: %v", err)
 	}
+	// g1 names alice as its subject, which pins her too. That edge is not a
+	// foreign key (it is polymorphic — see integrity.go) but it RESTRICTs just
+	// the same, so the grant goes first.
+	if err := s.DeleteGrant(ctx, "g1"); err != nil {
+		t.Fatalf("delete grant: %v", err)
+	}
 	if err := s.DeletePrincipal(ctx, "alice"); err != nil {
 		t.Fatalf("delete principal: %v", err)
 	}
@@ -458,7 +464,8 @@ func TestReSavingAnEntityKeepsItsChildren(t *testing.T) {
 // absent. A "*"-stamped grant and a "*"-stamped membership are shipped features
 // (a cross-account super-admin rides on both), and "*" is not an account row. If
 // someone later adds account_id -> apt_accounts(id), this is what tells them what
-// it costs.
+// it costs. The Go rule that replaced the foreign key — an apt_accounts row OR
+// exactly the wildcard — is proved in integrity_test.go.
 func TestTheWildcardAccountStaysWritable(t *testing.T) {
 	ctx := context.Background()
 	s := freshStore(t)

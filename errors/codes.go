@@ -354,8 +354,10 @@ var Registry = map[Code]Metadata{
 	APERTURE_STORAGE_CONSTRAINT: {
 		Message: "the database refused the write because it would break referential integrity",
 		Fixups: []string{
-			"Delete the rows that reference the record first: a principal's memberships and group memberships, a permission's role assignments and grants, a role's principal assignments, an object type's permissions.",
-			"Creating a record? Create what it references first — a permission needs its object type, a membership and a group member need their principal, a grant and a role assignment need their permission.",
+			"Delete the rows that reference the record first: a principal's memberships and group memberships, a permission's role assignments and grants, a role's principal assignments, an object type's permissions, an account's memberships and grants, and the grants that name a principal, role, or group as their subject.",
+			"Creating a record? Create what it references first — a permission needs its object type, a membership and a group member need their principal, a grant and a role assignment need their permission, and a membership and a grant need their account.",
+			"Refused on a grant's subject? subject_kind chooses the table subject_id must exist in — principal, role, or group. A grant naming a role id under kind \"group\" is refused even though that id exists elsewhere.",
+			"Refused on an account id? It must name a real account, or be exactly \"*\" (the all-accounts wildcard). \"*\" is a sentinel, not an account: it needs no account record and cannot be given one.",
 			"Ids are immutable in Aperture: to change one, create the new record, move the children, then delete the old one — an UPDATE that moved a key is refused rather than silently re-parenting.",
 			"Seeing this from Setup rather than a write? The connection is not enforcing foreign keys. Open the store with sqlite.Open, which forces _pragma=foreign_keys(1) into the DSN whatever the caller passed.",
 		},

@@ -50,6 +50,7 @@ func newSvc(t *testing.T, docIDs []string, grants ...model.Grant) *Service {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	mustPut(t, store.PutAccount(ctx, model.Account{ID: acct, Name: acct}))
 	mustPut(t, store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}))
 	mustPut(t, store.PutPermission(ctx, model.Permission{ID: "p-impl", ObjectType: "document", Action: "read", ScopeStrategy: scope.StrategyImplicit}))
 	mustPut(t, store.PutPermission(ctx, model.Permission{ID: "p-lit", ObjectType: "document", Action: "read"}))

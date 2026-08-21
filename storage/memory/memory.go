@@ -139,12 +139,26 @@ func validateStamps(created, updated time.Time) error {
 // read a partially applied delete — the two hazards the SQL backends get from
 // running inside a transaction.
 //
-// TWO EDGES ARE NOT HERE, deliberately: apt_memberships.account_id and
-// apt_grants.account_id. Both columns legitimately carry model.AccountWildcard
-// ("*"), which ValidateAccount refuses to create as an account row, so neither
-// SQL nor Go may treat them as a plain reference; they are E2-S3's, in every
-// backend at once. The polymorphic (subject_kind, subject_id) check is E2-S3's
-// too.
+// THE THREE COLUMNS THAT CARRY NO FOREIGN KEY IN SQLITE EITHER are enforced
+// here on exactly the same terms, because SQLite enforces them in Go too (see
+// storage/sqlite/integrity.go). They are not a memory-backend special case:
+//
+//	apt_memberships.account_id -> apt_accounts(id) OR model.AccountWildcard
+//	apt_grants.account_id      -> apt_accounts(id) OR model.AccountWildcard
+//	apt_grants.subject_id      -> apt_principals | apt_roles | apt_groups,
+//	                              whichever subject_kind selects
+//
+// The two account_id columns legitimately carry model.AccountWildcard ("*"),
+// which ValidateAccount refuses to create as an account row, so no SQL dialect
+// can express them as a reference — the rule is "an apt_accounts row OR exactly
+// the wildcard", and hasAccountRefLocked's first line is what keeps the wildcard
+// grant and the wildcard membership working. The grant subject is POLYMORPHIC:
+// subject_kind picks the table, so subjectTargetLocked does the dispatch.
+//
+// Both are enforced in BOTH directions here as well: deleting an account still
+// stamped on a membership or a grant is refused, and so is deleting a principal,
+// role, or group a grant still names as its subject — the RESTRICT half those
+// columns could not declare.
 
 // constraint renders a referential refusal with the code and shape the SQLite
 // backend produces for the same violation: APERTURE_STORAGE_CONSTRAINT, message
@@ -179,6 +193,42 @@ func (s *Store) hasRoleLocked(id string) bool {
 func (s *Store) hasPermissionLocked(id string) bool {
 	_, ok := s.permissions[id]
 	return ok
+}
+
+// hasAccountRefLocked reports whether an account_id is a legal reference: an
+// existing apt_accounts row, OR the reserved model.AccountWildcard sentinel.
+//
+// The wildcard line is not an optimization — it is the rule. "*" is deliberately
+// not an account row (ValidateAccount refuses to create one), so a plain
+// existence check here would refuse every wildcard grant and every wildcard
+// membership, both of which are shipped features the cross-account super-admin
+// rides on.
+func (s *Store) hasAccountRefLocked(accountID string) bool {
+	if accountID == model.AccountWildcard {
+		return true
+	}
+	_, ok := s.accounts[accountID]
+	return ok
+}
+
+// subjectTargetLocked resolves a grant's polymorphic subject: subject_kind picks
+// which table subject_id must exist in. It reports the SQL table name and the
+// human noun for the refusal message, whether the target exists, and whether the
+// kind was one it knows — false only for a kind ValidateGrant already refused,
+// which cannot reach a write.
+func (s *Store) subjectTargetLocked(sub model.Subject) (table, noun string, exists, known bool) {
+	switch sub.Kind {
+	case model.SubjectPrincipal:
+		_, ok := s.principals[sub.ID]
+		return "apt_principals", "principal", ok, true
+	case model.SubjectRole:
+		_, ok := s.roles[sub.ID]
+		return "apt_roles", "role", ok, true
+	case model.SubjectGroup:
+		_, ok := s.groups[sub.ID]
+		return "apt_groups", "group", ok, true
+	}
+	return "", "", false, false
 }
 
 // -- child-side lookups (a RESTRICT parent may not be deleted while cited) --
@@ -267,6 +317,51 @@ func (s *Store) grantWithPermissionLocked(permissionID string) (string, bool) {
 	return best, found
 }
 
+// membershipOfAccountLocked reports a principal still a member of the account
+// (apt_memberships.account_id).
+func (s *Store) membershipOfAccountLocked(accountID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for k := range s.memberships {
+		if k.accountID == accountID {
+			best, found = keepLowest(best, found, k.principalID)
+		}
+	}
+	return best, found
+}
+
+// grantOfAccountLocked reports a grant still stamped with the account
+// (apt_grants.account_id).
+func (s *Store) grantOfAccountLocked(accountID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, g := range s.grants {
+		if g.AccountID == accountID {
+			best, found = keepLowest(best, found, id)
+		}
+	}
+	return best, found
+}
+
+// grantWithSubjectLocked reports a grant that still names (kind, id) as its
+// subject (apt_grants.subject_id, under the kind that selects this table).
+func (s *Store) grantWithSubjectLocked(kind model.SubjectKind, subjectID string) (string, bool) {
+	var (
+		best  string
+		found bool
+	)
+	for id, g := range s.grants {
+		if g.Subject.Kind == kind && g.Subject.ID == subjectID {
+			best, found = keepLowest(best, found, id)
+		}
+	}
+	return best, found
+}
+
 // permissionOfObjectTypeLocked reports a permission still hanging off the object
 // type (apt_permissions.object_type).
 func (s *Store) permissionOfObjectTypeLocked(name string) (string, bool) {
@@ -323,6 +418,21 @@ func (s *Store) DeleteAccount(_ context.Context, id string) error {
 	if _, ok := s.accounts[id]; !ok {
 		return notFound("account", id)
 	}
+	// apt_memberships.account_id and apt_grants.account_id would be ON DELETE
+	// RESTRICT if they could be foreign keys at all — they cannot, because both
+	// carry model.AccountWildcard — so the RESTRICT half is enforced by hand, in
+	// both backends. Without it, deleting an account silently orphans every
+	// membership and every grant stamped with it.
+	if principalID, ok := s.membershipOfAccountLocked(id); ok {
+		return constraint("delete account",
+			"apt_memberships.account_id references apt_accounts(id): principal %q is still a member of account %q",
+			principalID, id)
+	}
+	if grantID, ok := s.grantOfAccountLocked(id); ok {
+		return constraint("delete account",
+			"apt_grants.account_id references apt_accounts(id): grant %q is still stamped with account %q",
+			grantID, id)
+	}
 	delete(s.accounts, id)
 	return nil
 }
@@ -338,10 +448,16 @@ func (s *Store) PutMembership(_ context.Context, m model.Membership) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// apt_memberships.account_id -> apt_accounts(id) OR model.AccountWildcard.
+	// Checked before the principal edge because that is the order the SQLite
+	// backend runs them in: its Go check precedes the INSERT the foreign key
+	// fires on.
+	if !s.hasAccountRefLocked(m.AccountID) {
+		return constraint("put membership",
+			"apt_memberships.account_id references apt_accounts(id): account %q does not exist",
+			m.AccountID)
+	}
 	// apt_memberships.principal_id -> apt_principals(id).
-	//
-	// account_id is NOT checked here: it may carry model.AccountWildcard, which is
-	// not an account row. That edge is E2-S3's.
 	if !s.hasPrincipalLocked(m.PrincipalID) {
 		return constraint("put membership",
 			"apt_memberships.principal_id references apt_principals(id): principal %q does not exist",
@@ -600,6 +716,16 @@ func (s *Store) DeletePrincipal(_ context.Context, id string) error {
 			"apt_group_members.principal_id references apt_principals(id): principal %q is still a member of group %q",
 			id, groupID)
 	}
+	// apt_grants.subject_id -> apt_principals(id), for the grants whose
+	// subject_kind is "principal". Polymorphic, so no foreign key expresses it in
+	// either backend; the RESTRICT it would have carried is this check. A grant is
+	// authority, and authority naming a subject that no longer exists is authority
+	// nobody can read or revoke.
+	if grantID, ok := s.grantWithSubjectLocked(model.SubjectPrincipal, id); ok {
+		return constraint("delete principal",
+			"apt_grants.subject_id references apt_principals(id) when subject_kind is %q: grant %q still names principal %q",
+			string(model.SubjectPrincipal), grantID, id)
+	}
 	// apt_principal_roles.principal_id -> apt_principals(id), ON DELETE CASCADE:
 	// the principal OWNS its role assignments, so they go with it. Here they live
 	// in the record itself (p.RoleIDs), so this one delete removes both, leaving
@@ -668,6 +794,13 @@ func (s *Store) DeleteRole(_ context.Context, id string) error {
 			"apt_principal_roles.role_id references apt_roles(id): principal %q still holds role %q",
 			principalID, id)
 	}
+	// apt_grants.subject_id -> apt_roles(id), for the grants whose subject_kind
+	// is "role". See DeletePrincipal.
+	if grantID, ok := s.grantWithSubjectLocked(model.SubjectRole, id); ok {
+		return constraint("delete role",
+			"apt_grants.subject_id references apt_roles(id) when subject_kind is %q: grant %q still names role %q",
+			string(model.SubjectRole), grantID, id)
+	}
 	// apt_role_permissions.role_id -> apt_roles(id), ON DELETE CASCADE: the role
 	// OWNS its permission bundle (r.PermissionIDs here), so it goes with the role
 	// in the same delete. The permissions themselves are untouched — only the
@@ -731,6 +864,15 @@ func (s *Store) DeleteGroup(_ context.Context, id string) error {
 	if _, ok := s.groups[id]; !ok {
 		return notFound("group", id)
 	}
+	// apt_grants.subject_id -> apt_groups(id), for the grants whose subject_kind
+	// is "group". See DeletePrincipal. This is the one thing that DOES point at a
+	// group, so the "nothing points AT a group" note below is about the schema's
+	// foreign keys, not about this check.
+	if grantID, ok := s.grantWithSubjectLocked(model.SubjectGroup, id); ok {
+		return constraint("delete group",
+			"apt_grants.subject_id references apt_groups(id) when subject_kind is %q: grant %q still names group %q",
+			string(model.SubjectGroup), grantID, id)
+	}
 	// apt_group_members.group_id -> apt_groups(id), ON DELETE CASCADE: a member
 	// row has no meaning without its group, so the group takes its membership
 	// list (g.MemberPrincipalIDs) with it. Nothing points AT a group, so this
@@ -751,12 +893,23 @@ func (s *Store) PutGrant(_ context.Context, g model.Grant) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// apt_grants.permission_id -> apt_permissions(id).
+	// A grant makes three references, checked in the order the SQLite backend
+	// runs them: its two Go checks, then the INSERT its permission_id foreign key
+	// fires on.
 	//
-	// The grant's other two references are deliberately unchecked here: account_id
-	// may carry model.AccountWildcard, and (subject_kind, subject_id) is
-	// polymorphic — a principal or a group depending on the kind. Both are E2-S3's,
-	// in every backend at once.
+	// apt_grants.account_id -> apt_accounts(id) OR model.AccountWildcard.
+	if !s.hasAccountRefLocked(g.AccountID) {
+		return constraint("put grant",
+			"apt_grants.account_id references apt_accounts(id): account %q does not exist",
+			g.AccountID)
+	}
+	// apt_grants.subject_id -> whichever table subject_kind selects.
+	if table, noun, exists, known := s.subjectTargetLocked(g.Subject); known && !exists {
+		return constraint("put grant",
+			"apt_grants.subject_id references %s(id) when subject_kind is %q: %s %q does not exist",
+			table, string(g.Subject.Kind), noun, g.Subject.ID)
+	}
+	// apt_grants.permission_id -> apt_permissions(id).
 	if !s.hasPermissionLocked(g.PermissionID) {
 		return constraint("put grant",
 			"apt_grants.permission_id references apt_permissions(id): permission %q does not exist",

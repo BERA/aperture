@@ -25,6 +25,10 @@ func newAuditedMutator(t *testing.T, sampler audit.Sampler) (*Service, *memory.S
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	// The account every fixture grant is stamped with. account_id must name a real
+	// apt_accounts row (or be model.AccountWildcard) in every backend, so it has
+	// to exist before the grants below.
+	mustPut(t, store.PutAccount(ctx, model.Account{ID: acct, Name: acct}))
 	// Seed admin authority for alice: an allow grant on the reserved admin action
 	// over ** (covers every tier anchor) in account acme.
 	mustPut(t, store.PutObjectType(ctx, model.ObjectType{Name: "system", Actions: []string{authz.AdminAction}}))

@@ -41,7 +41,10 @@
 --     does not exist and a parent can never be deleted out from under a child
 --     that still points at it. Three columns deliberately carry none, each for a
 --     reason written down below: apt_grants.subject_id (polymorphic) and the two
---     account_id columns (they carry a reserved sentinel).
+--     account_id columns (they carry a reserved sentinel). Those three are
+--     enforced in the application layer instead, on identical terms and in every
+--     backend -- see storage/sqlite/integrity.go. "No foreign key" does not mean
+--     "no integrity"; it means SQL could not express this one.
 --   * ON DELETE CASCADE appears on exactly THREE edges -- the ones where an
 --     entity owns its own join rows and the Go code already cascades by hand in
 --     a transaction: apt_principal_roles.principal_id, apt_role_permissions.
@@ -85,8 +88,14 @@
 --     hot-path index below), or mint a real "*" account row (which the model
 --     explicitly forbids). Neither is a schema decision.
 --   * So account_id joins (subject_kind, subject_id) as a column checked in Go
---     rather than by a constraint. Both are open questions for E2-S3, which
---     already owns the polymorphic subject check; this note is the handoff.
+--     rather than by a constraint. The rule is "an apt_accounts row OR exactly
+--     model.AccountWildcard", enforced in BOTH directions and in every backend
+--     by storage/sqlite/integrity.go (and by hand in storage/memory) -- a write
+--     naming an account that does not exist is refused, and so is deleting an
+--     account a membership or a grant is still stamped with, which is the
+--     ON DELETE RESTRICT these two columns could not declare. A naive existence
+--     check there refuses "*" and breaks both shipped features; that trap has a
+--     test of its own in integrity_test.go.
 --   * Because a REPLACE deletes the conflicting row before inserting the new
 --     one -- firing ON DELETE actions as it goes -- no parent table is written
 --     with INSERT OR REPLACE. Every entity upsert is an ON CONFLICT DO UPDATE,
@@ -231,10 +240,17 @@ CREATE TABLE IF NOT EXISTS apt_grants (
     -- been deleted is authority nobody can read or revoke.
     --
     -- Note the TWO columns that carry no foreign key. (subject_kind, subject_id)
-    -- is POLYMORPHIC -- it points at a principal or a group depending on the
-    -- kind -- and no single-table foreign key can express that; checking it is
-    -- E2-S3's job. account_id carries the "*" sentinel; see "The two account_id
-    -- columns" in the header.
+    -- is POLYMORPHIC -- it points at a principal, a role, or a group depending
+    -- on the kind -- and no single-table foreign key can express that, so it is
+    -- checked in Go instead, in both directions and in every backend
+    -- (integrity.go): a grant may not name a subject that does not exist in the
+    -- table its kind selects, and that subject may not be deleted while the
+    -- grant names it. account_id carries the "*" sentinel and is checked the
+    -- same way; see "The two account_id columns" in the header.
+    --
+    -- The index below is why neither becomes a schema change: nullable columns
+    -- plus a CHECK would break idx_apt_grants_account_subject, the engine's
+    -- hot-path index for GrantsForSubjects.
     FOREIGN KEY (permission_id) REFERENCES apt_permissions (id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 

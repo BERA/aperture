@@ -351,7 +351,21 @@ func (s *Store) ListAccounts(ctx context.Context) ([]model.Account, error) {
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	return s.deleteByID(ctx, "account", "apt_accounts", "id", id)
+	return s.inTx(ctx, "delete account", func(tx sqlExec) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM apt_accounts WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return notFound("account", id)
+		}
+		// apt_memberships.account_id and apt_grants.account_id would be
+		// ON DELETE RESTRICT if they could be foreign keys at all. They cannot —
+		// both carry model.AccountWildcard — so the RESTRICT half is enforced
+		// here instead, inside the same transaction: refusing rolls the delete
+		// back, so an account with live children is never even briefly gone.
+		return checkAccountUncited(ctx, tx, "delete account", id)
+	})
 }
 
 func scanAccount(sc scanner) (model.Account, error) {
@@ -379,14 +393,22 @@ func (s *Store) PutMembership(ctx context.Context, m model.Membership) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?)`,
-		m.PrincipalID, m.AccountID, created, updated)
-	if err != nil {
-		return wrapStorage("put membership", err)
-	}
-	return nil
+	// The principal_id edge is a real foreign key and fires on the INSERT below.
+	// account_id is not and cannot be one — a membership stamped "*" enrolls its
+	// principal in every account — so it is checked here, in the same transaction
+	// as the write. See integrity.go.
+	return s.inTx(ctx, "put membership", func(tx sqlExec) error {
+		if err := checkAccountRef(ctx, tx, "put membership", "apt_memberships.account_id", m.AccountID); err != nil {
+			return err
+		}
+		// REPLACE is safe on apt_memberships: it is a leaf, nothing references it,
+		// so the implicit delete fires no ON DELETE action.
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR REPLACE INTO apt_memberships (principal_id, account_id, created_at, updated_at)
+			VALUES (?, ?, ?, ?)`,
+			m.PrincipalID, m.AccountID, created, updated)
+		return err
+	})
 }
 
 func (s *Store) GetMembership(ctx context.Context, principalID, accountID string) (model.Membership, error) {
@@ -744,6 +766,12 @@ func (s *Store) DeletePrincipal(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("principal", id)
 		}
+		// apt_grants.subject_id -> apt_principals(id), for the grants whose
+		// subject_kind is "principal". Polymorphic, so no foreign key expresses
+		// it; the RESTRICT it would have carried is this check. See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete principal", model.SubjectPrincipal, id); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM apt_principal_roles WHERE principal_id = ?`, id)
 		return err
 	})
@@ -860,6 +888,11 @@ func (s *Store) DeleteRole(ctx context.Context, id string) error {
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("role", id)
+		}
+		// apt_grants.subject_id -> apt_roles(id), for the grants whose
+		// subject_kind is "role". See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete role", model.SubjectRole, id); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM apt_role_permissions WHERE role_id = ?`, id)
 		return err
@@ -981,6 +1014,11 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return notFound("group", id)
 		}
+		// apt_grants.subject_id -> apt_groups(id), for the grants whose
+		// subject_kind is "group". See integrity.go.
+		if err := checkSubjectUncited(ctx, tx, "delete group", model.SubjectGroup, id); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM apt_group_members WHERE group_id = ?`, id)
 		return err
 	})
@@ -1045,15 +1083,26 @@ func (s *Store) PutGrant(ctx context.Context, g model.Grant) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.exec.ExecContext(ctx, `
-		INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
-		created, updated)
-	if err != nil {
-		return wrapStorage("put grant", err)
-	}
-	return nil
+	// A grant makes three references. permission_id is a real foreign key and
+	// fires on the INSERT below. The other two cannot be foreign keys and are
+	// checked here, in the same transaction: account_id may carry the wildcard,
+	// and (subject_kind, subject_id) is polymorphic. See integrity.go.
+	return s.inTx(ctx, "put grant", func(tx sqlExec) error {
+		if err := checkAccountRef(ctx, tx, "put grant", "apt_grants.account_id", g.AccountID); err != nil {
+			return err
+		}
+		if err := checkGrantSubject(ctx, tx, "put grant", g.Subject); err != nil {
+			return err
+		}
+		// REPLACE is safe on apt_grants: it is a leaf, nothing references it, so
+		// the implicit delete fires no ON DELETE action.
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR REPLACE INTO apt_grants (id, account_id, subject_kind, subject_id, permission_id, apt_object, effect, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			g.ID, g.AccountID, string(g.Subject.Kind), g.Subject.ID, g.PermissionID, g.Object, string(g.Effect),
+			created, updated)
+		return err
+	})
 }
 
 func (s *Store) GetGrant(ctx context.Context, id string) (model.Grant, error) {

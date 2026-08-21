@@ -92,7 +92,9 @@ func seedDocumentType(t *testing.T, s model.Storage) {
 //
 // Aperture's storage is RELATIONAL, and the relationships are real: a membership
 // names a principal, a role assignment names a role, a grant names a permission,
-// a group member names a principal. A backend that enforces those relationships
+// a group member names a principal, a membership and a grant name an account,
+// and a grant names a subject — a principal, a role, or a group, whichever its
+// subject_kind selects. A backend that enforces those relationships
 // refuses a child row whose parent was never written — correctly, because a
 // grant citing a permission that does not exist is authority nobody can read or
 // revoke.
@@ -114,6 +116,34 @@ func seedPrincipals(t *testing.T, s model.Storage, ids ...string) {
 		p := model.Principal{ID: id, Kind: model.PrincipalUser, Identity: "user:" + id}
 		if err := s.PutPrincipal(ctx(), p); err != nil {
 			t.Fatalf("seed principal %s: %v", id, err)
+		}
+	}
+}
+
+// seedAccounts writes the accounts a membership or a grant in the case below is
+// stamped with. account_id must name a real apt_accounts row OR be exactly
+// model.AccountWildcard, so the wildcard is SKIPPED rather than written: "*" is
+// a sentinel, not an account, and ValidateAccount refuses to create it (see
+// testAccountCRUD). Passing it through here is what lets a case seed a mixed
+// list of accounts, wildcard included, in one call.
+func seedAccounts(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if id == model.AccountWildcard {
+			continue
+		}
+		if err := s.PutAccount(ctx(), model.Account{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed account %s: %v", id, err)
+		}
+	}
+}
+
+// seedGroups writes the groups a grant subject in the case below refers to.
+func seedGroups(t *testing.T, s model.Storage, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		if err := s.PutGroup(ctx(), model.Group{ID: id, Name: id}); err != nil {
+			t.Fatalf("seed group %s: %v", id, err)
 		}
 	}
 }
@@ -207,6 +237,7 @@ func testMembershipCRUDAndQueries(t *testing.T, s model.Storage) {
 			t.Fatalf("put membership %s@%s: %v", principalID, accountID, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
 	seedPrincipals(t, s, "alice", "bob")
 	// alice spans two accounts; bob is only in acme.
 	put("alice", "acme")
@@ -481,6 +512,8 @@ func testGroupCRUD(t *testing.T, s model.Storage) {
 }
 
 func testGrantCRUDAndUpsert(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	g := model.Grant{
 		ID:           "g1",
@@ -544,6 +577,8 @@ func testListGrantsAccountScoped(t *testing.T, s model.Storage) {
 			t.Fatalf("seed grant %s: %v", id, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	seed("g-acme-1", "acme")
 	seed("g-acme-2", "acme")
@@ -589,6 +624,8 @@ func seedGrant(t *testing.T, s model.Storage, id, account string) {
 // model.AllAccounts ("") returns grants across every account — including the
 // wildcard "*" rows inline — while a concrete account id stays account-scoped.
 func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	seedGrant(t, s, "g-acme-1", "acme")
 	seedGrant(t, s, "g-acme-2", "acme")
@@ -643,6 +680,8 @@ func testListGrantsPageAllAccounts(t *testing.T, s model.Storage) {
 // ordered set without gaps or overlap, and an offset past the end is empty.
 func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 	const n = 7
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	for i := 0; i < n; i++ {
 		// Zero-padded ids so lexical id order is stable and predictable.
@@ -690,6 +729,8 @@ func testListGrantsPagePagination(t *testing.T, s model.Storage) {
 // non-positive limit falls back to the default page size.
 func testListGrantsPageMaxPageSize(t *testing.T, s model.Storage) {
 	total := model.MaxGrantPageSize + 5
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	for i := 0; i < total; i++ {
 		seedGrant(t, s, "g-"+itoa2(i), "acme")
@@ -744,6 +785,10 @@ func testGrantsForSubjects(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	seedAccounts(t, s, "acme", "other")
+	seedPrincipals(t, s, "alice", "bob")
+	seedGroups(t, s, "eng")
+	seedRoles(t, s, "admin")
 	seedPermissions(t, s, "p-read")
 	put("g-alice", "acme", model.Subject{Kind: model.SubjectPrincipal, ID: "alice"})
 	put("g-eng", "acme", model.Subject{Kind: model.SubjectGroup, ID: "eng"})
@@ -802,6 +847,10 @@ func testGrantsForSubjectsWildcardAccount(t *testing.T, s model.Storage) {
 			t.Fatalf("put grant %s: %v", id, err)
 		}
 	}
+	// The wildcard row needs no account: "*" is a sentinel, not an apt_accounts
+	// row, and seedAccounts passes it through untouched.
+	seedAccounts(t, s, "acme", model.AccountWildcard)
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	put("g-acme", "acme", "account:acme/**")   // account-specific
 	put("g-star", model.AccountWildcard, "**") // spans every account
@@ -1738,6 +1787,8 @@ func normalizeJSON(t *testing.T, raw []byte) []byte {
 // ---- Transactional apply ----
 
 func testAtomicCommit(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	mkGrant := func(id string) model.Grant {
 		return model.Grant{
@@ -1781,6 +1832,8 @@ func testAtomicCommit(t *testing.T, s model.Storage) {
 // BOTH backends. It covers two failure modes: a write error mid-batch, and an
 // explicit error returned by fn after a successful write.
 func testAtomicRollback(t *testing.T, s model.Storage) {
+	seedAccounts(t, s, "acme")
+	seedPrincipals(t, s, "alice")
 	seedPermissions(t, s, "p-read")
 	keep := model.Grant{
 		ID: "g-keep", AccountID: "acme",

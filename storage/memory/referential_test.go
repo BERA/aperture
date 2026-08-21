@@ -272,11 +272,13 @@ func TestCascadeRemovesTheJoinRowsWithTheirOwner(t *testing.T) {
 		if err := s.PutGroup(ctx, model.Group{ID: "eng", Name: "Engineering"}); err != nil {
 			t.Fatalf("empty the group: %v", err)
 		}
-		if err := s.DeletePrincipal(ctx, "alice"); err != nil {
-			t.Fatalf("delete principal: %v", err)
-		}
+		// g1 names alice as its subject, which pins her too — the polymorphic
+		// edge, RESTRICT like the rest.
 		if err := s.DeleteGrant(ctx, "g1"); err != nil {
 			t.Fatalf("delete grant: %v", err)
+		}
+		if err := s.DeletePrincipal(ctx, "alice"); err != nil {
+			t.Fatalf("delete principal: %v", err)
 		}
 		// The role is now free: no assignment survived alice.
 		if err := s.DeleteRole(ctx, "r-admin"); err != nil {
@@ -340,6 +342,10 @@ func TestCascadeRemovesTheJoinRowsWithTheirOwner(t *testing.T) {
 		}
 		if gs, err := s.GroupsForPrincipal(ctx, "alice"); err != nil || len(gs) != 0 {
 			t.Fatalf("GroupsForPrincipal(alice) = %v, %v — the member rows outlived the group", gs, err)
+		}
+		// g1 names alice as its subject and pins her independently of the group.
+		if err := s.DeleteGrant(ctx, "g1"); err != nil {
+			t.Fatalf("delete grant: %v", err)
 		}
 		// alice survives her group and is now deletable.
 		if err := s.DeletePrincipal(ctx, "alice"); err != nil {
@@ -453,12 +459,11 @@ func TestAtomicRollsBackAConstraintRefusal(t *testing.T) {
 	}
 }
 
-// TestTheWildcardAccountStaysWritable pins the boundary of this story. The two
-// account_id columns are NOT edges here: model.AccountWildcard ("*") is a
-// reserved sentinel that ValidateAccount refuses to create as an account row, so
-// a plain reference would reject every wildcard grant and every wildcard
-// membership — both shipped features. Checking them is E2-S3's, in every backend
-// at once; adding either here would break this test, which is the point.
+// TestTheWildcardAccountStaysWritable pins the reason two planned edges are
+// absent from the nine. A "*"-stamped grant and a "*"-stamped membership are
+// shipped features (a cross-account super-admin rides on both), and "*" is not an
+// account row. The account_id rule that replaced the foreign key, and the
+// polymorphic subject rule beside it, live in sentinel_columns_test.go.
 func TestTheWildcardAccountStaysWritable(t *testing.T) {
 	ctx := context.Background()
 	s := seedWorld(t)
@@ -474,28 +479,5 @@ func TestTheWildcardAccountStaysWritable(t *testing.T) {
 		PrincipalID: "alice", AccountID: model.AccountWildcard,
 	}); err != nil {
 		t.Fatalf("wildcard-stamped membership refused: %v", err)
-	}
-	// And an account that no longer exists does not pin its memberships or grants
-	// either: apt_accounts is not a parent in this story.
-	if err := s.DeleteAccount(ctx, "acme"); err != nil {
-		t.Fatalf("delete account: %v", err)
-	}
-}
-
-// TestAGrantsSubjectIsNotCheckedHere pins the other half of the boundary: the
-// grant's (subject_kind, subject_id) pair is POLYMORPHIC — a principal or a group
-// depending on the kind — and no single reference can express that. Checking it
-// is E2-S3's job, in every backend at once, so it must not be smuggled in here.
-func TestAGrantsSubjectIsNotCheckedHere(t *testing.T) {
-	ctx := context.Background()
-	s := seedWorld(t)
-
-	if err := s.PutGrant(ctx, model.Grant{
-		ID: "g-ghost-subject", AccountID: "acme",
-		Subject:      model.Subject{Kind: model.SubjectPrincipal, ID: "ghost"},
-		PermissionID: "p-read", Object: "account:acme/**", Effect: model.EffectAllow,
-	}); err != nil {
-		t.Fatalf("a grant naming an unknown subject must still be writable in E2-S2 "+
-			"(the polymorphic check is E2-S3, and it has to land in every backend at once): %v", err)
 	}
 }

@@ -138,7 +138,7 @@ func TestGrantsSmokeAllAccountsPagination(t *testing.T) {
 // transactional). The expanded grant lands and is observable via the ListGrants
 // the grants tab renders from.
 func TestGrantsSmokeTemplateProvision(t *testing.T) {
-	srv, _ := newTestServer(t)
+	srv, store := newTestServer(t)
 	c := client(srv)
 	ctx := asPrincipal(context.Background(), t, "root")
 	actor := &rpc.Actor{Principal: "root", Account: acct}
@@ -195,7 +195,13 @@ func TestGrantsSmokeTemplateProvision(t *testing.T) {
 	}
 
 	// Bulk provision (bulk apply modal): client-expanded grants for several
-	// principals written atomically via BulkPutGrants.
+	// principals written atomically via BulkPutGrants. The principals exist
+	// first — a grant's subject is an enforced reference in every backend, so a
+	// bulk apply naming someone who was never created is refused, exactly as the
+	// UI's principal picker implies.
+	for _, id := range []string{"carol", "dave"} {
+		must(t, store.PutPrincipal(context.Background(), model.Principal{ID: id, Kind: model.PrincipalUser, Identity: "user:" + id}))
+	}
 	bulk := []model.Grant{
 		{ID: "bulk-carol-0", AccountID: acct, Subject: model.Subject{Kind: model.SubjectPrincipal, ID: "carol"}, PermissionID: "perm-admin", Object: "account:acme/document:*", Effect: model.EffectAllow},
 		{ID: "bulk-dave-0", AccountID: acct, Subject: model.Subject{Kind: model.SubjectPrincipal, ID: "dave"}, PermissionID: "perm-admin", Object: "account:acme/document:*", Effect: model.EffectAllow},

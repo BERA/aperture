@@ -39,6 +39,12 @@ func newFixture(t *testing.T) *fixture {
 			t.Fatalf("seed: %v", err)
 		}
 	}
+	// Both accounts the tests stamp grants and memberships with are real rows:
+	// storage refuses an account_id that is neither an apt_accounts row nor
+	// model.AccountWildcard, in every backend. The wildcard needs no row — that
+	// is the point of it — so tests that stamp "*" seed nothing extra.
+	mustPut(store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
+	mustPut(store.PutAccount(ctx, model.Account{ID: acctOther, Name: acctOther}))
 	mustPut(store.PutObjectType(ctx, model.ObjectType{
 		Name:    "document",
 		Actions: []string{"read", "write", "delete"},

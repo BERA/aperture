@@ -27,6 +27,9 @@ func newScopeFixture(t *testing.T, deps ...ScopeDeps) *scopeFixture {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	if err := store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
 	if err := store.PutObjectType(ctx, model.ObjectType{
 		Name:    "document",
 		Actions: []string{"read", "write"},
@@ -212,6 +215,7 @@ func TestScope_CustomStrategy(t *testing.T) {
 			t.Fatalf("seed: %v", err)
 		}
 	}
+	mustPut(store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
 	mustPut(store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}))
 	mustPut(store.PutPermission(ctx, model.Permission{ID: "p-even", ObjectType: "document", Action: "read", ScopeStrategy: "even"}))
 	mustPut(store.PutPrincipal(ctx, model.Principal{ID: "alice", Kind: model.PrincipalUser, Identity: "user:alice"}))

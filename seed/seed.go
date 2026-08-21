@@ -259,8 +259,17 @@ func Parse(data []byte, format Format) (*Document, error) {
 //	permissions             ->  object types
 //	roles                   ->  permissions
 //	principals              ->  roles
-//	memberships, groups     ->  principals
-//	grants                  ->  permissions
+//	memberships             ->  principals, accounts
+//	groups                  ->  principals
+//	grants                  ->  permissions, accounts, and their SUBJECT — a
+//	                            principal, role, or group, whichever
+//	                            subject_kind names, which is why grants come
+//	                            after all three
+//
+// The account edges are the reason `accounts:` must be declared before anything
+// stamped with them: account_id must name a real account or be exactly
+// model.AccountWildcard ("*"), and "*" needs no declaration — it is a sentinel,
+// not a row.
 //
 // Reordering these loops to suit a document's own layout, or appending a new
 // entity kind to the end without checking what it points at, breaks seeding

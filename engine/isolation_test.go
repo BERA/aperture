@@ -39,6 +39,8 @@ func newIsoFixture(t *testing.T) *isoFixture {
 		t.Fatalf("setup: %v", err)
 	}
 	f := &isoFixture{t: t, store: store}
+	f.must(store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
+	f.must(store.PutAccount(ctx, model.Account{ID: acctOther, Name: acctOther}))
 	f.must(store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read", "write", "delete"}}))
 	f.must(store.PutPermission(ctx, model.Permission{ID: permRead, ObjectType: "document", Action: "read"}))
 	f.must(store.PutPermission(ctx, model.Permission{ID: permWrite, ObjectType: "document", Action: "write"}))

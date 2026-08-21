@@ -210,6 +210,7 @@ func newAgreementEngine(t *testing.T, ref string) (*Engine, context.Context) {
 	if err := store.Setup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
+	mustSeed(t, store.PutAccount(ctx, model.Account{ID: acctAcme, Name: acctAcme}))
 	mustSeed(t, store.PutObjectType(ctx, model.ObjectType{Name: "document", Actions: []string{"read"}}))
 	mustSeed(t, store.PutObjectType(ctx, model.ObjectType{Name: "folder", Actions: []string{"read"}}))
 	mustSeed(t, store.PutPermission(ctx, model.Permission{

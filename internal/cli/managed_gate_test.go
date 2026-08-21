@@ -31,6 +31,12 @@ import (
 const gateSeed = `
 accounts:
   - {id: acme, name: Acme Corp, description: The tenant every grant is stamped to.}
+  # solo has no members and nothing stamped to it, on purpose: it is the account
+  # the lifecycle test deletes. account_id is an enforced reference in every
+  # backend -- an apt_accounts row or exactly the "*" wildcard -- so deleting
+  # acme, which root and alice both belong to, would be refused for a reason that
+  # has nothing to do with the posture switch this file is about.
+  - {id: solo, name: Solo, description: The tenant nothing references.}
 principals:
   - {id: root, kind: user, identity: "user:root", display_name: Root}
   - {id: alice, kind: user, identity: "user:alice", display_name: Alice}
@@ -112,7 +118,7 @@ func gatedCLICalls(t *testing.T, who string) map[string][]cliCall {
 	return map[string][]cliCall{
 		"account": {
 			{"put account", call("put", "--json", gateJSON(t, model.Account{ID: "beta", Name: "Beta"}), "account")},
-			{"delete account", call("delete", "account", "acme")},
+			{"delete account", call("delete", "account", "solo")},
 		},
 		"principal": {
 			{"put principal", call("put", "--json",
