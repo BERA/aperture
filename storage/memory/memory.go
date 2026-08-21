@@ -13,6 +13,7 @@ import (
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/storage/storagetime"
 )
 
 // Store is a map-backed model.Storage. The zero value is not usable; construct
@@ -771,7 +772,14 @@ func itoa(n int) string {
 
 // ---- Audit trail (append-only) ----
 
+// AppendAudit validates the instant even though this backend keeps a time.Time
+// rather than encoding it: the storable range is a property of the storage
+// contract, not of one dialect's encoding, so every backend must refuse the same
+// instants (storage/storagetest allows no backend-conditional assertions).
 func (s *Store) AppendAudit(_ context.Context, ev model.AuditEvent) error {
+	if err := storagetime.Validate(ev.Timestamp); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ev.Details = cloneDetails(ev.Details)
@@ -780,6 +788,12 @@ func (s *Store) AppendAudit(_ context.Context, ev model.AuditEvent) error {
 }
 
 func (s *Store) QueryAudit(_ context.Context, filter model.AuditFilter) ([]model.AuditEvent, error) {
+	if err := storagetime.Validate(filter.Since); err != nil {
+		return nil, err
+	}
+	if err := storagetime.Validate(filter.Until); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]model.AuditEvent, 0)
@@ -797,6 +811,9 @@ func (s *Store) QueryAudit(_ context.Context, filter model.AuditFilter) ([]model
 }
 
 func (s *Store) PruneAudit(_ context.Context, policy model.RetentionPolicy) (int, error) {
+	if err := storagetime.Validate(policy.Before); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	before := len(s.audit)

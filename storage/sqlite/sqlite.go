@@ -22,6 +22,7 @@ import (
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
+	"github.com/frankbardon/aperture/storage/storagetime"
 
 	_ "modernc.org/sqlite"
 )
@@ -95,6 +96,16 @@ func (s *Store) Close() error {
 }
 
 // ---- timestamp + error helpers ----
+
+// The unit for every stored instant is int64 NANOSECONDS since the Unix epoch,
+// UTC, encoded and decoded by storage/storagetime. That package owns the
+// zero mapping (time.Time{} <-> 0) and the representable-range rejection, and is
+// the only place in the storage layer where a time.Time becomes an integer —
+// never call UnixNano here.
+//
+// encodeTime and decodeTime below are the remaining RFC3339Nano text pair, used
+// by the columns that are still TEXT. They are transitional: the columns move to
+// INTEGER and these two go away, leaving storagetime as the single encoding.
 
 // encodeTime renders a time as RFC3339Nano, or "" for the zero value so zero
 // round-trips to zero rather than the year-0001 sentinel.
@@ -1194,10 +1205,14 @@ func (s *Store) AppendAudit(ctx context.Context, ev model.AuditEvent) error {
 		}
 		details = string(b)
 	}
-	_, err := s.exec.ExecContext(ctx, `
+	ts, err := storagetime.Encode(ev.Timestamp)
+	if err != nil {
+		return err
+	}
+	_, err = s.exec.ExecContext(ctx, `
 		INSERT OR REPLACE INTO apt_audit_log (`+auditColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.Timestamp.UTC().UnixNano(), string(ev.EventType), ev.Action, ev.Actor,
+		ev.ID, ts, string(ev.EventType), ev.Action, ev.Actor,
 		ev.EffectiveSubject, ev.ImpersonationMode, ev.Account, ev.Target, string(ev.Outcome),
 		ev.Reason, details)
 	if err != nil {
@@ -1232,12 +1247,20 @@ func (s *Store) QueryAudit(ctx context.Context, filter model.AuditFilter) ([]mod
 		args = append(args, string(filter.Outcome))
 	}
 	if !filter.Since.IsZero() {
+		since, err := storagetime.Encode(filter.Since)
+		if err != nil {
+			return nil, err
+		}
 		where = append(where, "ts_nanos >= ?")
-		args = append(args, filter.Since.UTC().UnixNano())
+		args = append(args, since)
 	}
 	if !filter.Until.IsZero() {
+		until, err := storagetime.Encode(filter.Until)
+		if err != nil {
+			return nil, err
+		}
 		where = append(where, "ts_nanos < ?")
-		args = append(args, filter.Until.UTC().UnixNano())
+		args = append(args, until)
 	}
 	if len(where) > 0 {
 		b.WriteString(" WHERE ")
@@ -1271,8 +1294,12 @@ func (s *Store) PruneAudit(ctx context.Context, policy model.RetentionPolicy) (i
 	var removed int
 	// Age bound: delete events strictly older than policy.Before.
 	if !policy.Before.IsZero() {
+		before, err := storagetime.Encode(policy.Before)
+		if err != nil {
+			return removed, err
+		}
 		res, err := s.exec.ExecContext(ctx,
-			`DELETE FROM apt_audit_log WHERE ts_nanos < ?`, policy.Before.UTC().UnixNano())
+			`DELETE FROM apt_audit_log WHERE ts_nanos < ?`, before)
 		if err != nil {
 			return removed, wrapStorage("prune audit by age", err)
 		}
@@ -1307,7 +1334,7 @@ func scanAudit(sc scanner) (model.AuditEvent, error) {
 		&ev.Reason, &details); err != nil {
 		return model.AuditEvent{}, wrapStorage("scan audit", err)
 	}
-	ev.Timestamp = time.Unix(0, tsNanos).UTC()
+	ev.Timestamp = storagetime.Decode(tsNanos)
 	ev.EventType = model.AuditEventType(eventType)
 	ev.Outcome = model.AuditOutcome(outcome)
 	if details != "" {
