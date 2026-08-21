@@ -129,10 +129,16 @@ type Store struct {
 	pool *sql.DB // the connection pool; nil for a transaction-scoped Store
 	exec sqlExec // *sql.DB or *sql.Tx — what statements run against
 
+	// schema is the configured schema name, VERBATIM and unquoted, or "" for
+	// the ambient search_path. It is the form compared against
+	// pg_namespace.nspname, which is ordinary text — so this field, and not the
+	// quoted qualifier, is what ensureSchema and inspectTables bind.
+	schema string
 	// qualifier is what schemaPlaceholder is replaced with: "" to create in
 	// whatever search_path resolves to (the default, and the reason the apt_
-	// table prefix exists), or "<name>." to pin the tables into a named schema.
-	// Open leaves it empty; the configuration that can set it is E4-S4's.
+	// table prefix exists), or `"<name>".` to pin the tables into a named
+	// schema. It is derived from schema by qualifierFor and never set
+	// independently, so the two can never name different schemas.
 	qualifier string
 }
 
@@ -142,13 +148,44 @@ type Store struct {
 // first connection is made when Setup (or any later statement) needs one, so a
 // database that is unreachable surfaces there rather than here.
 //
+// Options configure the store; today the only one is the schema Aperture's
+// tables live in (WithSchema / WithSchemaFromEnv). With no Option the tables are
+// addressed UNQUALIFIED and resolve through the connection's search_path, which
+// is safe in a database shared with a host application because every table
+// Aperture owns is prefixed apt_.
+//
+// Options are applied BEFORE the pool is created, on purpose: configuration this
+// backend cannot use is refused with APERTURE_CONFIG_INVALID at boot, with
+// nothing opened and nothing to close. A schema name in particular can never be
+// a bind parameter — it is interpolated into SQL text — so the moment it is
+// accepted is the last moment it can be checked. See config.go.
+//
 // There is no DSN rewriting. storage/sqlite rewrites its DSN to force
 // _pragma=foreign_keys(1) because SQLite defaults foreign keys OFF and scopes
 // the setting per connection, so a caller-supplied DSN can produce a store whose
 // constraints are decoration. PostgreSQL enforces foreign keys unconditionally
 // and has no such switch, so there is nothing to force and nothing for Setup to
 // verify. Porting the dance would be cargo cult.
-func Open(dsn string) (*Store, error) {
+//
+// Note what Open still does NOT do: set search_path on the connection. Where a
+// statement lands is decided when the statement is BUILT, by substituting the
+// qualifier into it, never by per-connection session state. Session state is the
+// same footgun as SQLite's foreign_keys pragma — silently correct until the pool
+// hands out a connection that missed it — and a pool of twenty makes that a
+// matter of timing rather than of code.
+func Open(dsn string, opts ...Option) (*Store, error) {
+	var set settings
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(&set); err != nil {
+			// Already an APERTURE_CONFIG_INVALID with the offending value and
+			// the rule in it. Wrapping would re-stamp the code (aerr.Wrap builds
+			// a fresh CodedError with whatever code it is handed) and bury both.
+			return nil, err
+		}
+	}
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, aerr.Wrap(aerr.APERTURE_STORAGE, "open postgres database", err)
@@ -157,8 +194,13 @@ func Open(dsn string) (*Store, error) {
 	db.SetMaxIdleConns(DefaultMaxIdleConns)
 	db.SetConnMaxLifetime(DefaultConnMaxLifetime)
 	db.SetConnMaxIdleTime(DefaultConnMaxIdleTime)
-	return &Store{pool: db, exec: db}, nil
+	return &Store{pool: db, exec: db, schema: set.validatedSchema, qualifier: qualifierFor(set.validatedSchema)}, nil
 }
+
+// Schema reports the schema this Store pins its tables into, or "" when it uses
+// the connection's search_path. It is the value as configured — unquoted and
+// case-exact — which is the form that appears in pg_namespace.nspname.
+func (s *Store) Schema() string { return s.schema }
 
 // Close releases the underlying pool. It is a no-op on a transaction-scoped
 // Store, which does not own one.
@@ -187,8 +229,10 @@ func (s *Store) Close() error {
 //     pg_class unique violation (42P07 / 23505). Two aperture processes booting
 //     against one database is an ordinary deployment, not a corner case.
 //
-//  2. ENSURE-SCHEMA resolves the schema the tables will be created in and
-//     refuses a connection that has none.
+//  2. ENSURE-SCHEMA resolves the schema the tables will be created in: it
+//     CREATEs the configured one if it is absent, or resolves the ambient
+//     search_path and refuses a connection that has none. Being inside the lock
+//     and the transaction is not incidental — see ensurePinnedSchema.
 //
 //  3. INSPECT reads which of Aperture's tables already exist there.
 //
@@ -282,17 +326,23 @@ func (s *Store) setup(ctx context.Context, exec sqlExec) error {
 	return nil
 }
 
-// ensureSchema resolves the schema Setup will create Aperture's tables in, and
-// refuses a connection that has none.
+// ensureSchema resolves the schema Setup will create Aperture's tables in,
+// creating it when one was configured and does not exist yet, and refusing a
+// connection that has none.
 //
-// With the default (empty) qualifier the tables are written unqualified, so they
-// land in current_schema() — the first schema on the connection's search_path
-// that actually exists. Resolving that name here, once, is what lets INSPECT and
-// VERIFY talk about the same namespace the CREATE statements will use, instead
-// of asking search_path a second time and possibly getting a different answer.
-// It is also why an unqualified deployment is safe at all: an unqualified lookup
-// for one of Aperture's tables resolves to current_schema() first, so the table
-// this step names is the table every later statement will find.
+// It has two paths, and which one runs is decided entirely by configuration, not
+// by anything about the connection.
+//
+// UNCONFIGURED (s.schema == "", the default and the zero-config path). The
+// tables are written unqualified, so they land in current_schema() — the first
+// schema on the connection's search_path that actually exists. Resolving that
+// name here, once, is what lets INSPECT and VERIFY talk about the same namespace
+// the CREATE statements will use, instead of asking search_path a second time
+// and possibly getting a different answer. It is also why an unqualified
+// deployment is safe at all: an unqualified lookup for one of Aperture's tables
+// resolves to current_schema() first, so the table this step names is the table
+// every later statement will find. Nothing is created — the schema is the host's
+// and Aperture is a guest in it.
 //
 // current_schema() returns NULL when search_path names nothing that exists — a
 // role whose "$user" schema was never created and whose search_path was trimmed
@@ -300,11 +350,39 @@ func (s *Store) setup(ctx context.Context, exec sqlExec) error {
 // to create in" from the first CREATE, several steps later; catching it here
 // costs one query and names the actual problem.
 //
-// When E4-S4 adds the configurable qualifier this is the step that grows: a
-// pinned schema is resolved through to_regnamespace and either required to exist
-// or created. Nothing else in Setup needs to change, because everything below
-// takes the resolved name as an argument.
+// CONFIGURED (s.schema != ""). search_path is not consulted AT ALL — that is the
+// whole point of pinning, and it is why a pinned store works over a connection
+// whose search_path points somewhere else entirely. The schema is created if
+// absent, and the configured name is returned for the steps below to use.
+//
+// # Why existence is checked before CREATE SCHEMA IF NOT EXISTS, and not left to it
+//
+// Measured against PostgreSQL 18.4: `CREATE SCHEMA IF NOT EXISTS x` issued by a
+// role without CREATE on the DATABASE fails with 42501, "permission denied for
+// database", EVEN WHEN x ALREADY EXISTS. The IF NOT EXISTS clause does not skip
+// the privilege check. Issuing it unconditionally would therefore break the
+// deployment this backend deliberately supports and Setup's step 4 already
+// preserves: an administrator sets the database up once, and Aperture then runs
+// with a role that can only read and write rows. A store pinned to a schema
+// would demand CREATE on the database forever, for a statement whose entire
+// effect is a NOTICE. So the catalog is asked first, and CREATE SCHEMA is issued
+// only when the answer is "absent" — the same CREATE-IF-ABSENT shape as the
+// tables, for the same reason.
+//
+// # Why pg_namespace and not to_regnamespace
+//
+// to_regnamespace() parses its argument as an identifier REFERENCE, which means
+// it applies PostgreSQL's identifier FOLDING (measured: with a schema named Foo
+// present, to_regnamespace('Foo') is NULL and to_regnamespace('"Foo"') is Foo).
+// A lookup that folds and a lookup that does not would be two different questions
+// asked about one schema, and inspectTables already compares nspname literally.
+// Reading pg_namespace directly makes both comparisons the same rule — plain
+// text equality against the configured name — so there is no case in which
+// ensureSchema and inspectTables can disagree about which schema they mean.
 func (s *Store) ensureSchema(ctx context.Context, exec sqlExec) (string, error) {
+	if s.schema != "" {
+		return s.schema, s.ensurePinnedSchema(ctx, exec)
+	}
 	var name sql.NullString
 	if err := exec.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&name); err != nil {
 		return "", wrapStorage("resolve the target schema", err)
@@ -316,6 +394,53 @@ func (s *Store) ensureSchema(ctx context.Context, exec sqlExec) (string, error) 
 				"or create the one it names")
 	}
 	return name.String, nil
+}
+
+// ensurePinnedSchema creates the configured schema if it is not there already.
+//
+// It runs against the exec it is handed, which is Setup's transaction — so the
+// schema is created under the SAME advisory lock and inside the SAME transaction
+// as the tables. Both halves of that matter and they are different properties.
+// The lock is what stops two booting processes racing the create: without it
+// they can both see the schema absent and the loser fails on 42P06
+// (duplicate_schema), exactly as CREATE TABLE IF NOT EXISTS loses on 42P07. The
+// transaction is what stops a Setup that fails at table creation from leaving an
+// empty schema behind — Postgres DDL is transactional, so the rollback takes the
+// CREATE SCHEMA with it and a failed Setup changes nothing at all.
+func (s *Store) ensurePinnedSchema(ctx context.Context, exec sqlExec) error {
+	var exists bool
+	err := exec.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)`, s.schema).Scan(&exists)
+	if err != nil {
+		return wrapStorage("look up the configured schema", err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := exec.ExecContext(ctx, createSchemaStatement(s.schema)); err != nil {
+		return createSchemaError(err, s.schema)
+	}
+	return nil
+}
+
+// createSchemaError gives the two refusals an operator actually meets their own
+// words, rather than a bare driver error.
+func createSchemaError(err error, name string) error {
+	switch sqlStateOf(err) {
+	case sqlStateInsufficientPrivilege:
+		return aerr.Wrapf(aerr.APERTURE_STORAGE, err,
+			"create schema %q: the database role does not have CREATE on this database. Either grant it "+
+				"(GRANT CREATE ON DATABASE <database> TO <role>), or have an administrator create the "+
+				"schema once (CREATE SCHEMA %s) and grant the role CREATE on it — Aperture issues no "+
+				"CREATE SCHEMA at all once the schema exists",
+			name, quoteSchemaIdent(name))
+	case sqlStateReservedName:
+		return aerr.Wrapf(aerr.APERTURE_STORAGE, err,
+			"create schema %q: PostgreSQL reserves the pg_ prefix for system schemas, so no role can "+
+				"create this one — set %s to a name that does not start with pg_",
+			name, EnvSchema)
+	}
+	return wrapStorage("create the configured schema", err)
 }
 
 // applySchema executes the WHOLE of schema.sql as one ExecContext with ZERO bind
@@ -442,6 +567,11 @@ const (
 	// The unsubstituted schema.sql produces exactly this against a real server —
 	// deliberately, so a placeholder that never got replaced fails loudly.
 	sqlStateInvalidSchemaName = "3F000"
+	// sqlStateReservedName (42939) is Postgres refusing a name it reserves for
+	// itself. For this backend that is a configured schema starting with pg_,
+	// which is a valid identifier and so passes ValidateSchemaName, but which no
+	// role — superuser included — may create.
+	sqlStateReservedName = "42939"
 	// sqlStateClassIntegrityConstraintViolation ("23") is the CLASS, not a single
 	// state: 23503 foreign_key_violation, 23505 unique_violation, 23502
 	// not_null_violation, 23514 check_violation, 23001 restrict_violation, and

@@ -1573,9 +1573,12 @@ func (s *Store) Atomic(ctx context.Context, fn func(tx model.Storage) error) err
 	if err != nil {
 		return wrapStorage("atomic", err)
 	}
-	// The child carries the qualifier forward: a transaction-scoped Store must
-	// address the same tables as the root it came from.
-	child := &Store{pool: nil, exec: tx, qualifier: s.qualifier}
+	// The child carries the schema configuration forward: a transaction-scoped
+	// Store must address the same tables as the root it came from. Both fields
+	// travel, not just the qualifier — a child that inherited the qualifier and
+	// not the name would build the right statements and then, if Setup were ever
+	// called on it, resolve the wrong schema.
+	child := &Store{pool: nil, exec: tx, schema: s.schema, qualifier: s.qualifier}
 	if err := fn(child); err != nil {
 		_ = tx.Rollback()
 		if aerr.CodeOf(err) != "" {

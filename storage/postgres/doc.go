@@ -111,11 +111,29 @@
 //
 // # The schema qualifier
 //
-// Every table identifier in schema.sql is written apt_schema.apt_<thing>, where
-// "apt_schema." is a placeholder replaced before execution — with "" to use
-// whatever search_path resolves to, or with "<name>." to pin Aperture's tables
-// into a named schema. The apt_ table prefix is what makes the unqualified
-// default safe in a database Aperture shares with its host, which is the reason
-// that prefix exists. See schema.sql's header for the full rationale, including
-// why index names are deliberately left unqualified.
+// Every table identifier in schema.sql — and in every statement in store.go — is
+// written apt_schema.apt_<thing>, where "apt_schema." is a placeholder replaced
+// before execution: with "" to use whatever search_path resolves to, or with
+// `"<name>".` to pin Aperture's tables into a named schema. The apt_ table
+// prefix is what makes the unqualified default safe in a database Aperture
+// shares with its host, which is the reason that prefix exists. See schema.sql's
+// header for the full rationale, including why index names are deliberately left
+// unqualified.
+//
+// The schema is configured with WithSchema, or from APERTURE_POSTGRES_SCHEMA
+// with WithSchemaFromEnv; unset means the ambient search_path and is the
+// zero-configuration path. Two properties of that knob are load-bearing enough
+// to restate here:
+//
+//   - Where a statement lands is decided when the statement is BUILT, by
+//     substituting the qualifier into it. NOTHING in this package sets
+//     search_path on a connection. Per-connection session state is the same
+//     footgun as SQLite's foreign_keys pragma — silently correct until the pool
+//     hands out a connection that missed it — and this pool holds twenty.
+//
+//   - A schema name is the ONE piece of configuration this package interpolates
+//     into SQL text, because SQL has no bind parameter in an identifier
+//     position. It is validated at Open against a strict identifier pattern and
+//     quoted at every use; see config.go, which documents why both, and why the
+//     two controls are kept independent.
 package postgres

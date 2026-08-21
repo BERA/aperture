@@ -27,8 +27,10 @@
 --     replaces that exact literal with the configured qualifier before
 --     executing -- with "" to use whatever search_path resolves to (the
 --     default, and the reason the apt_ table prefix exists at all), or with
---     "<name>." to pin the tables into a named schema. E4-S4 owns that
---     plumbing; this file owns the seam.
+--     a QUOTED "<name>." to pin the tables into a named schema. The qualifier
+--     is built by storage/postgres/config.go from a validated schema name; a
+--     schema name cannot be a bind parameter, so that validator and the
+--     quoting beside it are the whole of what guards this seam.
 --   * The seam is here from the first commit ON PURPOSE. This is a static
 --     embedded file, so retrofitting a qualifier later means touching every
 --     statement in it, and every statement in the statement set built on top.

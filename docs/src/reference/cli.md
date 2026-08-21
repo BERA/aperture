@@ -46,7 +46,7 @@ aperture bestow [options]
 | `--file` | — | string | — | path to a JSON grant body |
 | `--json` | — | string | — | grant body as inline JSON |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture bulk`
 
@@ -71,7 +71,7 @@ aperture bulk grant [options]
 | `--json` | — | string | — | a JSON array of grant bodies |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ### `aperture bulk revoke`
 
@@ -87,7 +87,7 @@ aperture bulk revoke [options] [<grant-id>...]
 | `--grant` | — | string | — | grant id to revoke (repeatable) |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture check`
 
@@ -101,7 +101,7 @@ aperture check [options] <principal> <action> <object>
 | --- | --- | --- | --- | --- |
 | `--account` | — | string | `"acme"` | active account the decision is scoped to |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture delete`
 
@@ -118,7 +118,7 @@ aperture delete [options] <kind> [<id>]
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--principal-id` | — | string | — | membership principal id (kind=membership) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture enumerate`
 
@@ -164,7 +164,7 @@ aperture enumerate [options] <principal> <action> <pattern>
 | `--fields-json` | — | string | — | object-metadata predicates as a JSON object, for values that are genuinely a number, bool, or list (e.g. '{"seats":5,"active":true,"tags":["a"]}'). Merged first; --field entries then override by key |
 | `--limit` | — | int | `0` | cap the number of returned object ids (&lt;=0 means the default) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 | `--via` | — | string | — | restrict the result to the objects a holder's declared reference field names, as &lt;holder-identity&gt;.&lt;field&gt; (e.g. --via account:acme/dataset:x.current_brands); repeatable, and several edges are ANDed. The FIELD is everything after the LAST '.' |
 
 ## `aperture explain`
@@ -179,7 +179,7 @@ aperture explain [options] <principal> <action> <object>
 | --- | --- | --- | --- | --- |
 | `--account` | — | string | `"acme"` | active account the decision is scoped to |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture export`
 
@@ -196,7 +196,7 @@ aperture export [options]
 | `--out` | — | string | — | write the state file to this path (default: stdout) |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture get`
 
@@ -209,7 +209,7 @@ aperture get [options] <kind> <id>
 | Name | Aliases | Type | Default | Usage |
 | --- | --- | --- | --- | --- |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture identifiers`
 
@@ -223,7 +223,7 @@ aperture identifiers [options] <object_type>
 | --- | --- | --- | --- | --- |
 | `--exclude` | — | string | — | id to omit from the result (repeatable); expands an exclusive allowance |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture impersonate`
 
@@ -239,7 +239,7 @@ aperture impersonate [options]
 | `--mode` | — | string | `"augment"` | augment\|become |
 | `--operator` | — | string | — | operator principal (env: `APERTURE_PRINCIPAL`) (**required**) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 | `--target` | — | string | — | target principal to impersonate (**required**) |
 
 ## `aperture import`
@@ -256,7 +256,7 @@ aperture import [options]
 | `--file` | — | string | — | path to the JSON/YAML state file (default: stdin, treated as JSON) |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture list`
 
@@ -270,7 +270,7 @@ aperture list [options] <kind>
 | --- | --- | --- | --- | --- |
 | `--account` | — | string | — | account to list grants for (required for kind=grant) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture mcp`
 
@@ -285,7 +285,7 @@ aperture mcp [options]
 | Name | Aliases | Type | Default | Usage |
 | --- | --- | --- | --- | --- |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture put`
 
@@ -302,7 +302,7 @@ aperture put [options] <kind>
 | `--json` | — | string | — | entity body as inline JSON |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture revoke`
 
@@ -317,7 +317,7 @@ aperture revoke [options]
 | `--delegator` | — | string | — | principal revoking the grant (env: `APERTURE_PRINCIPAL`) (**required**) |
 | `--grant` | — | string | — | id of the grant to revoke (**required**) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture serve`
 
@@ -332,8 +332,11 @@ aperture serve [options]
 | `--addr` | — | string | `":8080"` | TCP address to listen on |
 | `--auth` | — | string | — | authenticator adapter: dev\|oidc\|parsec (overrides APERTURE_AUTH_MODE; defaults to dev — bearer is the principal id, no external IdP) (env: `APERTURE_AUTH_MODE`) |
 | `--enforce-membership` | — | bool | — | deny any decision whose principal is not a member of the active account, before grants are consulted (defence-in-depth; lets shared roles be reused across accounts safely) (env: `APERTURE_ENFORCE_MEMBERSHIP`) |
+| `--manage-accounts` | — | bool | — | manage the lifecycle of account records — allow account create/update/delete through the API (default true; overrides APERTURE_MANAGE_ACCOUNTS). Pass --manage-accounts=false when accounts are mastered by an upstream system: Aperture then refuses every account write regardless of the caller's authority, while account reads and every decision stay unaffected. Read once at startup; a restart is required to change it |
+| `--manage-memberships` | — | bool | — | manage the lifecycle of principal-to-account memberships — allow membership create/update/delete through the API (default true; overrides APERTURE_MANAGE_MEMBERSHIPS). Independent of the other two, so a deployment can master accounts and principals upstream and still decide who belongs to what, or the reverse. Read once at startup; a restart is required to change it |
+| `--manage-principals` | — | bool | — | manage the lifecycle of principal records — allow principal create/update/delete through the API (default true; overrides APERTURE_MANAGE_PRINCIPALS). Pass --manage-principals=false when principals are mastered by an upstream directory or IdP: Aperture then refuses every principal write regardless of the caller's authority, while principal reads and every decision stay unaffected. Read once at startup; a restart is required to change it |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture template`
 
@@ -359,7 +362,7 @@ aperture template apply [options]
 | `--param` | — | string | — | parameter as name=value (repeatable) |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 | `--version` | — | int | `0` | template version (0 = latest) |
 
 ### `aperture template delete`
@@ -375,7 +378,7 @@ aperture template delete [options] <name>
 | `--account` | — | string | — | active account (required for system-tier authority resolution) |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 | `--version` | — | int | `0` | template version to delete (0 = all versions of the name) |
 
 ### `aperture template get`
@@ -389,7 +392,7 @@ aperture template get [options] <name>
 | Name | Aliases | Type | Default | Usage |
 | --- | --- | --- | --- | --- |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 | `--version` | — | int | `0` | template version (0 = latest) |
 
 ### `aperture template list`
@@ -403,7 +406,7 @@ aperture template list [options]
 | Name | Aliases | Type | Default | Usage |
 | --- | --- | --- | --- | --- |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ### `aperture template put`
 
@@ -420,5 +423,5 @@ aperture template put [options]
 | `--json` | — | string | — | template body as inline JSON |
 | `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
 | `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
-| `--store` | — | string | — | sqlite DSN for the backing store (defaults to in-memory) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 

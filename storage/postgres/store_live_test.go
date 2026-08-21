@@ -47,47 +47,42 @@ func TestPostgresLive_Conformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) model.Storage { return liveStore(t, dsn) })
 }
 
-// TestPostgresLive_ConformanceWithAPinnedSchemaQualifier runs the SAME contract
-// against a Store whose tables are reachable ONLY through the schema qualifier:
-// the schema is created in a scratch namespace, and the store under test then
-// connects with search_path pointing somewhere else entirely (public), with
-// Store.qualifier pinned to the scratch schema.
+// TestPostgresLive_ConformanceWithAConfiguredSchema runs the SAME contract
+// against a Store whose tables are reachable ONLY through the schema qualifier.
+// The store is configured with WithSchema and connects with search_path pointing
+// somewhere else entirely (public), so nothing it does can resolve through
+// session state: Setup creates the schema and its tables, and every subsequent
+// statement finds them only because the qualifier was substituted in when the
+// statement was built.
 //
-// That is the only way to prove the seam actually holds. Every statement in this
-// backend is written apt_schema.apt_<thing> and substituted before execution,
-// but the qualifier is empty until E4-S4 configures it — so a statement that
-// FORGOT the qualifier would pass every other test in this package, silently, and
-// break the story that turns the seam on. Here it fails immediately with
-// SQLSTATE 42P01, naming the statement.
+// Together with TestPostgresLive_Conformance above, this is the "full storagetest
+// with a configured schema AND with none" criterion — one contract, no
+// backend-conditional assertions, run twice over the two configurations.
 //
-// (Setup itself is not exercised through the pinned store: resolving a pinned
-// schema through INSPECT and VERIFY is E4-S4's plumbing, and this story owns the
-// statement set only.)
-func TestPostgresLive_ConformanceWithAPinnedSchemaQualifier(t *testing.T) {
+// It is also the only way to prove the seam holds statement by statement. Every
+// statement in this backend is written apt_schema.apt_<thing> and substituted
+// before execution; one that FORGOT the qualifier would pass every unqualified
+// test in this package silently, and fail here immediately with SQLSTATE 42P01,
+// naming itself.
+//
+// This test used to reach into Store.qualifier directly, because there was no
+// constructor that could set it. There is now, and it goes through the validator
+// — so the pinned path the contract exercises is exactly the pinned path an
+// operator gets, rather than a hand-assembled lookalike.
+func TestPostgresLive_ConformanceWithAConfiguredSchema(t *testing.T) {
 	dsn := requirePostgres(t)
 	storagetest.Run(t, func(t *testing.T) model.Storage {
 		ctx := liveCtx(t)
-		name, setupDSN := scratchSchema(t, ctx, dsn)
+		name := reservedSchemaName(t, ctx, dsn)
 
-		// Create the schema the ordinary way, through search_path.
-		setup, err := Open(setupDSN)
-		if err != nil {
-			t.Fatalf("open for setup: %v", err)
-		}
-		if err := setup.Setup(ctx); err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-		if err := setup.Close(); err != nil {
-			t.Fatalf("close the setup store: %v", err)
-		}
-
-		// The store under test cannot see those tables unqualified.
-		s, err := Open(withSearchPath(t, dsn, "public"))
+		s, err := Open(withSearchPath(t, dsn, "public"), WithSchema(name))
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
-		s.qualifier = quoteIdent(name) + "."
+		if err := s.Setup(ctx); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
 		return s
 	})
 }
@@ -211,7 +206,7 @@ func (p panicExec) QueryRowContext(context.Context, string, ...any) *sql.Row {
 // flattening claim, and it runs in `make test`: a Store with no pool must hand
 // fn ITSELF and take nothing from anywhere.
 func TestAtomicFlattensOnATransactionScopedStore(t *testing.T) {
-	s := &Store{pool: nil, exec: panicExec{t: t}, qualifier: "aperture."}
+	s := &Store{pool: nil, exec: panicExec{t: t}, schema: "aperture", qualifier: qualifierFor("aperture")}
 	var got model.Storage
 	if err := s.Atomic(context.Background(), func(tx model.Storage) error {
 		got = tx
@@ -248,8 +243,8 @@ func TestInTxFlattensOnATransactionScopedStore(t *testing.T) {
 // proved live, by running the whole contract — Atomic subtests included —
 // against a pinned store.)
 func TestStatementsCarryTheSchemaQualifier(t *testing.T) {
-	pinned := &Store{qualifier: "aperture."}
-	if got := pinned.q(grantSelect); !strings.Contains(got, "FROM aperture.apt_grants") {
+	pinned := &Store{schema: "aperture", qualifier: qualifierFor("aperture")}
+	if got := pinned.q(grantSelect); !strings.Contains(got, `FROM "aperture".apt_grants`) {
 		t.Errorf("a pinned Store built %q", got)
 	}
 	ambient := &Store{}

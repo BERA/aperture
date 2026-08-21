@@ -3,11 +3,13 @@ package cli
 import (
 	"context"
 	"path/filepath"
+	"strings"
 
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/model"
 	"github.com/frankbardon/aperture/seed"
 	"github.com/frankbardon/aperture/storage/memory"
+	"github.com/frankbardon/aperture/storage/postgres"
 	"github.com/frankbardon/aperture/storage/sqlite"
 )
 
@@ -16,8 +18,9 @@ import (
 // share: choose a backend from --store, run Setup, and load a model from --seed
 // (or the embedded example when --seed is empty).
 //
-//   - storeDSN == ""  -> in-memory backend (storage/memory), ideal for the demo.
-//   - storeDSN != ""  -> SQLite backend at the DSN (storage/sqlite).
+//   - storeDSN == ""            -> in-memory backend (storage/memory), ideal for the demo.
+//   - storeDSN is a postgres URL -> PostgreSQL backend (storage/postgres).
+//   - any other storeDSN         -> SQLite backend at the DSN (storage/sqlite).
 //   - seedPath == ""  -> load the embedded example fixture (account "acme").
 //   - seedPath != ""  -> load the file, format inferred from its extension.
 //
@@ -69,10 +72,58 @@ func bootError(msg string, err error) error {
 	return aerr.Wrap(aerr.APERTURE_BOOT, msg, err)
 }
 
+// postgresDSNSchemes are the DSN prefixes that select the PostgreSQL backend.
+// They are libpq's own two URI schemes, and they are the whole rule.
+//
+// A libpq KEYWORD DSN ("host=... dbname=...") deliberately does NOT select
+// Postgres, even though pgx accepts one. The alternative would be sniffing a
+// caller's string for something that looks like a keyword pair, and --store's
+// other value is a FILE PATH: a path containing '=' would start opening
+// databases over the network. A rule an operator can state in one sentence, and
+// which cannot be triggered by accident, is worth more here than accepting a
+// second spelling of the same connection.
+var postgresDSNSchemes = []string{"postgres://", "postgresql://"}
+
+// isPostgresDSN reports whether the DSN names a PostgreSQL server.
+func isPostgresDSN(storeDSN string) bool {
+	for _, scheme := range postgresDSNSchemes {
+		if strings.HasPrefix(storeDSN, scheme) {
+			return true
+		}
+	}
+	return false
+}
+
 // openStore selects the storage backend from the DSN.
+//
+//   - ""                                -> in-memory (storage/memory)
+//   - "postgres://..." / "postgresql://" -> PostgreSQL (storage/postgres)
+//   - anything else                      -> SQLite at that path (storage/sqlite)
+//
+// The Postgres store reads APERTURE_POSTGRES_SCHEMA through
+// postgres.WithSchemaFromEnv. Unset means "use whatever the connection's
+// search_path resolves to", which is the zero-configuration path and the reason
+// every table Aperture owns is prefixed apt_: pinning a schema is an operator's
+// choice about tidiness and grants, not a requirement.
+//
+// The schema is configured by ENVIRONMENT rather than by a flag on purpose. It
+// is a property of the deployment, not of an invocation — a --store-schema that
+// could differ between `aperture serve` and `aperture grant` would be a way to
+// write half a model into the wrong namespace — and eight commands carry
+// --store, so a flag would be eight places for the two to disagree. A malformed
+// value is refused by postgres.Open with APERTURE_CONFIG_INVALID before any
+// connection is made, and bootError passes that code through rather than burying
+// it under APERTURE_BOOT.
 func openStore(storeDSN string) (model.Storage, error) {
 	if storeDSN == "" {
 		return memory.New(), nil
+	}
+	if isPostgresDSN(storeDSN) {
+		store, err := postgres.Open(storeDSN, postgres.WithSchemaFromEnv())
+		if err != nil {
+			return nil, bootError("cli: open postgres store", err)
+		}
+		return store, nil
 	}
 	store, err := sqlite.Open(storeDSN)
 	if err != nil {
