@@ -144,6 +144,54 @@ func (d *DecisionAttributes) Account() (map[string]any, bool) {
 	return d.account.value()
 }
 
+// PrincipalRoot returns the `principal` root exactly as every rule evaluated
+// under this decision saw it — the resolver's bag with the floor (id and kind)
+// stamped over it — and whether one was ever resolved.
+//
+// It is Principal's rendered counterpart, and both exist because they answer
+// different questions. Principal answers "what did the HOST say about this
+// subject", which is what a caller asking whether a directory contributed
+// anything needs. PrincipalRoot answers "what did the RULE read", which is what
+// a decision trace needs: a trace that showed the resolver's bag would omit
+// principal.id and principal.kind, the two fields most rules actually compare
+// against, and an operator would be reading a bag no rule ever saw.
+//
+// Unlike Principal the returned map is a FRESH copy the caller owns, because
+// building it is the same stamping principalBag does and stamping into the
+// resolver's own map is the write this whole seam forbids. Safe on a nil
+// receiver.
+func (d *DecisionAttributes) PrincipalRoot() (map[string]any, bool) {
+	if d == nil {
+		return nil, false
+	}
+	kind, id, bag, ok := d.principal.snapshot()
+	if !ok {
+		return nil, false
+	}
+	return principalBag(bag, kind, id), true
+}
+
+// AccountRoot returns the `account` root as every rule evaluated under this
+// decision saw it — the resolver's bag with the account id stamped over it — and
+// whether one was ever resolved. It is PrincipalRoot's counterpart in every
+// respect, including the fresh copy and nil-receiver safety.
+//
+// It reports false for a decision made at the account wildcard, for the reason
+// Account does: "*" is not an account and never reaches a resolver, so there is
+// no bag to render rather than a floor-only one. A trace of such a decision
+// still says `account` was floor-only — that is the note's job, not this one's
+// (see NoteAttributesFloorOnly).
+func (d *DecisionAttributes) AccountRoot() (map[string]any, bool) {
+	if d == nil {
+		return nil, false
+	}
+	_, id, bag, ok := d.account.snapshot()
+	if !ok {
+		return nil, false
+	}
+	return accountBag(bag, id), true
+}
+
 // attributeMemo is one slot of the decision memo: the subject a bag was resolved
 // for, the bag, and whether one was ever taken.
 //
@@ -164,6 +212,18 @@ func (m *attributeMemo) value() (map[string]any, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.bag, m.taken
+}
+
+// snapshot returns the whole slot — the subject the bag was resolved for, the
+// bag, and whether one was taken — under ONE acquisition of the lock. Reading
+// the subject and the bag through two calls would be a race with a re-resolution
+// for a different subject, and the result would be one subject's id stamped over
+// another's attributes: precisely the failure the memo's key exists to make
+// impossible.
+func (m *attributeMemo) snapshot() (kind, id string, bag map[string]any, taken bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.kind, m.id, m.bag, m.taken
 }
 
 // principalAttributes returns the decision's principal bag, calling r at most

@@ -654,7 +654,7 @@ object.hired_at: between bounds are inverted; the lower bound is after the upper
 Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
 `Actual` — carrying **shape and path only, never a metadata value**. That last
 point is not a nicety for dates: a date is often personal data (a birth date, a
-termination date), and the same trace crosses the Twirp and MCP surfaces. Five
+termination date), and the same trace crosses the Twirp and MCP surfaces. Six
 kinds are recorded today:
 
 - `shape_mismatch` — a collection operator met a non-collection, **or** a date
@@ -675,6 +675,23 @@ kinds are recorded today:
   rule evaluation: it comes from the engine's enumeration path
   (`engine/reference.go`), but it is the same class of observation and rides the
   same collector, so it renders identically. See `skills/object-references.md`.
+- `attributes_floor_only` — a rule read a **host-defined field** off `principal`
+  or `account` while that root carried nothing but the engine's floor
+  (`principal.id` + `principal.kind`, `account.id`). `Path` is the root; there is
+  nothing else to say, because there was nothing there. It is the mitigation the
+  attribute leniency contract promises: a missing bag makes every comparison
+  against it false, which is deny-safe in an **inclusive** grant and
+  access-**widening** in an **exclusive** one, and nothing in the verdict says so.
+
+  Two things about it are deliberate. It is **one kind, not two** — "nothing was
+  wired" and "a directory answered and had nothing" are different operator
+  situations, but the distinction this layer can draw ("is a resolver
+  installed?") is not that one: an `AttributeRegistry` with no slot for this
+  principal's kind is installed and answers identically, so a second kind would
+  be confidently wrong a lot of the time. And it fires only when the rule
+  **names** a non-floor path on the root — otherwise every trace of every
+  rule-backed grant in the many deployments that wire no attribute provider
+  would carry it, and the traces where it matters would be unfindable.
 
 The channel is opt-in and costs the decision path nothing: `Check` and
 `Enumerate` install no collector, so nothing is recorded and nothing is

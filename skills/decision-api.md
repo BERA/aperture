@@ -191,11 +191,30 @@ path. The declaration side and the full reasoning are in
 - `MaxSpecificity` — the tier the tiebreak resolved at.
 - `Notes []EvaluationNote` — diagnostics rule evaluation recorded while resolving
   a grant's scope (see below). Empty when no rule was evaluated.
+- `Attributes TraceAttributes` — the `principal` and `account` roots the rules
+  were evaluated against, **values included**, each with the engine's floor
+  stamped in exactly as a rule read it. Zero when no rule was evaluated;
+  `Account` is also nil for a decision made at the account wildcard, which
+  resolves no account bag at all.
 - `Decision` — identical to what Check returns.
 
-`Trace.String()` renders an operator-readable report (subjects, each grant's
-disposition, any evaluation notes, the verdict and reason), with the deciding
-grants marked.
+`Attributes` **deliberately discloses values**, and it is the one field that
+does. A note is held to shape-and-path-only because it is produced by
+comparisons against whatever objects a wide decision swept; these two bags are
+the *subjects of the request being explained* — the principal in
+`Request.Principal`, the account in `Request.Account` — so the trace tells the
+asker about the decision they asked about and nothing else. It is also the point:
+"why was this denied?" is unanswerable from a grant list when the deciding
+comparison was `principal.tier == "gold"` and the operator cannot see that the
+tier is `"silver"`. Do not redact it into a note, and do not widen it past those
+two subjects. The what-if preview (`service.EvaluateRulePreview`) takes the
+opposite side on purpose — it supplies **no** principal or account input, not
+even the floor, so a rule author's editor cannot become a directory read oracle.
+
+`Trace.String()` renders an operator-readable report (subjects, the attribute
+roots the rules read, each grant's disposition, any evaluation notes, the verdict
+and reason), with the deciding grants marked. The attribute lines are printed
+with their keys sorted, and are omitted entirely when no rule ran.
 
 The report is **deterministic**: two traces of the same decision render
 byte-identically, so a trace can be diffed, snapshotted, or pasted into a bug
@@ -219,8 +238,20 @@ records them:
      g-doc [rule tagged]: object.tags: expected collection, got string
 ```
 
+A rule can also fail to select because the attribute bag it read came back
+**floor-only** — no provider wired for the slot, or a directory with no record
+for this subject — which is the same invisible `false`, and worse in an
+exclusive grant, where a rule that stops selecting stops excluding:
+
+```
+  evaluation notes (1):
+     g-alice [rule gold-only]: principal: floor-only; no host attributes were resolved, so every comparison against a host-defined field is false
+```
+
 Each `EvaluationNote` carries `GrantID`, `Rule`, `Kind` (`shape_mismatch` /
-`absent_field`), `Op`, `Path`, `Expected`, `Actual` and a rendered `Message`.
+`absent_field` / `date_invalid` / `date_bounds_inverted` / `dangling_reference` /
+`attributes_floor_only`), `Op`, `Path`, `Expected`, `Actual` and a rendered
+`Message`. The kinds are defined in `skills/rules-engine.md`.
 
 Three rules govern them:
 
@@ -229,7 +260,9 @@ Three rules govern them:
    their behavior is unchanged.
 3. **Shape and path only.** A note names the variable path and the shapes
    involved — **never a metadata value**, never anything that could cross an
-   account boundary. Same rule as error messages.
+   account boundary. Same rule as error messages. `Trace.Attributes` is the
+   deliberate, separately-named exception described above; it is not a licence to
+   put values in a note.
 
 They reach every surface for free: the CLI prints `Trace.String()`, Twirp carries
 the whole trace as `trace_json`, and the MCP `aperture_explain` tool returns

@@ -3,6 +3,8 @@ package rules
 import (
 	"context"
 	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
@@ -109,6 +111,16 @@ const (
 	principalKeyKind = "kind"
 )
 
+// The two attribute roots, spelled once for the diagnostic channel: a floor-only
+// note names the root it is about (see NoteAttributesFloorOnly), and the root is
+// the whole of what that note discloses. They are the same words allowedRoots
+// (ast.go) admits, which is frozen — `principal` and `account` are two of the
+// four things a rule may name.
+const (
+	principalRoot = "principal"
+	accountRoot   = "account"
+)
+
 // accountKeyID is the `account` root's single floor key. It is spelled
 // separately from principalKeyID rather than shared: the two floors are
 // independent contracts that happen to agree on one word today, and a shared
@@ -211,6 +223,101 @@ func principalBag(bag map[string]any, kind, principal string) map[string]any {
 	// "unknown" and "not published by this build" the same observation.
 	out[principalKeyKind] = kind
 	return out
+}
+
+// recordFloorOnly notes each attribute root that THIS rule reads a host-defined
+// field off and that resolved to NOTHING but the engine's floor — so a rule
+// written against `principal.tier` says the tier was never there, instead of
+// merely failing to select.
+//
+// The bags are the RESOLVERS' answers, before principalBag/accountBag stamp the
+// floor into them, which is what makes "floor-only" a plain emptiness check: an
+// empty resolver bag is exactly a root that carries the floor alone.
+//
+// # Why the rule's own paths gate it
+//
+// A note is only worth recording where the hazard exists. A rule that reads
+// nothing but `object.*`, or nothing but `principal.id`, is unaffected by an
+// unwired directory: the floor is always there and it always says the same
+// thing. Recording a floor-only note for those rules would put two lines on
+// every trace of every rule-backed grant in the very common deployment that
+// wires no attribute provider at all, and the traces where the note MATTERS
+// would be the ones nobody could find.
+//
+// The gate is on what the rule NAMES, not on what a comparison did, and that is
+// the deliberate half. `principal.tier == "contractor"` earns the note whether
+// the comparison was reached, short-circuited away by an && to its left, or
+// evaluated and found false — because in every one of those cases the operator
+// reading the trace is looking at a rule whose author expected a field the
+// deployment did not supply.
+//
+// It is called only from the collector branch of Selected, so the AST walk — and
+// the note — cost Check and Enumerate nothing.
+//
+// THE ACCOUNT WILDCARD LANDS HERE TOO, and truthfully. A decision made at
+// platform scope resolves no account bag at all (see Engine.accountAttributes:
+// "*" is not an account and never reaches a resolver), so a rule reading
+// `account.plan` there really is comparing against nothing, which is worth
+// saying out loud for the same reason an unwired slot is.
+func recordFloorOnly(sink *NoteCollector, ast *Node, principal, account map[string]any) {
+	if len(principal) == 0 && readsBeyondFloor(ast, principalRoot, principalKeyID, principalKeyKind) {
+		sink.Add(Note{Kind: NoteAttributesFloorOnly, Path: principalRoot})
+	}
+	if len(account) == 0 && readsBeyondFloor(ast, accountRoot, accountKeyID) {
+		sink.Add(Note{Kind: NoteAttributesFloorOnly, Path: accountRoot})
+	}
+}
+
+// readsBeyondFloor reports whether n names any variable path rooted at root
+// whose first segment past the root is outside floor — that is, whether the rule
+// reads something only a HOST provider could have supplied.
+//
+// A bare reference to the root itself (`principal`, with no path under it)
+// counts: a rule handed the whole bag reads whatever is in it, so an empty bag
+// is exactly the surprise this note exists for.
+//
+// The walk covers every field a Node can hang a child off — Left, Right,
+// Children, Items — rather than switching on Type, so a node type that gains a
+// child position cannot silently stop being scanned. It is a diagnostic-path
+// walk over a rule AST (tens of nodes, not thousands), performed once per
+// evaluation only when a collector is installed.
+func readsBeyondFloor(n *Node, root string, floor ...string) bool {
+	if n == nil {
+		return false
+	}
+	if n.Type == NodeVar && n.Name != "" {
+		if path, ok := strings.CutPrefix(n.Name, root); ok {
+			switch {
+			case path == "":
+				// The whole bag.
+				return true
+			case path[0] == '.':
+				field := path[1:]
+				if i := indexByte(field, '.'); i >= 0 {
+					field = field[:i]
+				}
+				if !slices.Contains(floor, field) {
+					return true
+				}
+			}
+			// Anything else shares a prefix without sharing a root
+			// (`principality.x`) and is not this root at all.
+		}
+	}
+	if readsBeyondFloor(n.Left, root, floor...) || readsBeyondFloor(n.Right, root, floor...) {
+		return true
+	}
+	for _, c := range n.Children {
+		if readsBeyondFloor(c, root, floor...) {
+			return true
+		}
+	}
+	for _, it := range n.Items {
+		if readsBeyondFloor(it, root, floor...) {
+			return true
+		}
+	}
+	return false
 }
 
 // Engine is the rules engine: it resolves a rule reference, compiles-and-caches
@@ -403,6 +510,14 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 	// — the collector spans every grant in the trace, so the reference is what
 	// tells two rules' notes apart.
 	local := &NoteCollector{}
+	// The floor-only observation is made HERE, past the fast-path return, and
+	// that placement is the whole of its cost model: Check and Enumerate install
+	// no collector, so they never reach this line and pay nothing for a
+	// diagnostic nobody asked for. It is recorded BEFORE evaluation because it
+	// describes the input the evaluation is about to be handed, and it goes
+	// through the same local sink so it is stamped with this rule's reference
+	// like every other note.
+	recordFloorOnly(local, r.AST, principalAttrs, accountAttrs)
 	selected, err := compiled.eval(in, local)
 	notes := local.Notes()
 	for i := range notes {
