@@ -9,6 +9,7 @@ import (
 	"github.com/frankbardon/aperture/csvprovider"
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/provider"
+	"github.com/frankbardon/aperture/sqlprovider"
 )
 
 // The attribute_providers: block.
@@ -280,11 +281,49 @@ func csvAttributeSource(src attributeSource) (provider.AttributeProvider, error)
 // sqlAttributeSource builds the database-backed attribute provider for a kind:
 // sql entry, reading through the shared pool src.Pool already holds.
 //
-// The adapter it needs — an sqlprovider that binds the bare subject id verbatim
-// and reads a bare id column — is E3-S3's, and until that lands this arm refuses
-// rather than pretending, for the reason csvAttributeSource gives.
+// The YAML path and the Go path (sqlprovider.NewAttributes(querier, cfg)) meet
+// exactly here, and neither is a special case of the other: resolveAttributeSource
+// has already turned connection: into a live pool and a statement budget, and
+// this arm then calls the SAME constructor a host calls, with the same
+// AttributeConfig a host fills in by hand. So every rule the constructor enforces
+// — the slot, the required get_one, the id column, the timeout — is enforced
+// identically whichever way the slot was declared, and the two contract
+// differences from an object provider (a bare id bound verbatim, a bare id
+// selected) live in ONE implementation rather than in a YAML-only copy of it.
+//
+// Nothing is dialled here. sql.Open is lazy, and pinging would make building a
+// registry a network operation; a wrong host or password surfaces on the first
+// decision touching the slot, as APERTURE_SQL_PROVIDER_QUERY. What IS eager is
+// everything Aperture can decide on its own, and all of it has already happened
+// by the time this arm runs.
+//
+// The QUERY TIMEOUT is the CONNECTION's, carried on the resolved source rather
+// than re-read from the entry: it is a property of the database being read, and
+// an object type and an attribute slot over one pool that disagreed about how
+// long the server may take would be two opinions about the same server.
+//
+// The error passes through when it is already coded — sqlprovider's refusals
+// carry APERTURE_ATTRIBUTE_SLOT_UNKNOWN or APERTURE_CONFIG_INVALID and their
+// registry fixups with them, and Wrap RE-STAMPS, so wrapping would trade a
+// specific remedy for a generic one.
 func sqlAttributeSource(src attributeSource) (provider.AttributeProvider, error) {
-	return nil, unwiredAttributeKind(src)
+	impl, err := sqlprovider.NewAttributes(src.Pool, sqlprovider.AttributeConfig{
+		Slot:       src.Slot,
+		FetchQuery: src.GetOne,
+		// Empty when the entry declared no get_all:, which is legal here and
+		// yields a fetch-only slot — see AttributeProvider.GetAll.
+		ListQuery: src.GetAll,
+		IDColumn:  src.IDColumn,
+		Timeout:   src.QueryTimeout,
+	})
+	if err != nil {
+		if aerr.CodeOf(err) != "" {
+			return nil, err
+		}
+		return nil, aerr.Wrapf(aerr.APERTURE_CONFIG_INVALID, err,
+			"seed: sql attribute provider for subject %q cannot be built", src.Slot)
+	}
+	return impl, nil
 }
 
 // unwiredAttributeKind is the refusal for a declared kind whose loader this

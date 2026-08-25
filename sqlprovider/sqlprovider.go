@@ -1,9 +1,19 @@
-// Package sqlprovider implements provider.ObjectProvider over a relational
-// database, so a host serves its real objects to Aperture from the tables it
-// already has instead of exporting them to a CSV. It is a drop-in sibling of
-// csvprovider: register a *Provider under an object-type in a
-// provider.Registry exactly as the CSV loader is registered, and the Registry's
-// cache, invalidation, and rules wiring are unchanged.
+// Package sqlprovider implements provider.ObjectProvider and
+// provider.AttributeProvider over a relational database, so a host serves its
+// real objects AND its real directory to Aperture from the tables it already has
+// instead of exporting them to a CSV. It is a drop-in sibling of csvprovider:
+// register a *Provider under an object-type in a provider.Registry exactly as the
+// CSV loader is registered, and the Registry's cache, invalidation, and rules
+// wiring are unchanged.
+//
+// This doc describes the OBJECT seam. The attribute seam is *Attributes
+// (attributes.go): the same Querier, the same statements-in, the same
+// driver-value mapping table and the same value model, serving one attribute
+// SLOT instead of one object-type. Everything below is true of both unless the
+// Attributes doc says otherwise — and it says otherwise about exactly two
+// things, both concerning what a key is: an attribute fetch binds the BARE
+// subject id verbatim rather than an identity's terminal segment, and an
+// attribute "get all" selects a BARE id rather than a composed identity.
 //
 //	db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 //	brands, err := sqlprovider.New(db, sqlprovider.Config{
@@ -486,7 +496,7 @@ func (p *Provider) Fetch(ctx context.Context, id identity.Identity) (provider.Me
 			"sqlprovider: no object with this id", map[string]any{"id": id.String()})
 	}
 
-	md, err := scanRow(rows, id)
+	md, err := scanRow(rows, id.String())
 	if err != nil {
 		return nil, err
 	}
@@ -592,7 +602,7 @@ func (p *Provider) enumerate(ctx context.Context, filter provider.Filter) ([]pro
 		if filter.Pattern != nil && !filter.Pattern.Matches(id) {
 			continue
 		}
-		md, err := rowMetadata(cols, vals, idIndex, id)
+		md, err := rowMetadata(cols, vals, idIndex, id.String())
 		if err != nil {
 			return nil, err
 		}
@@ -737,21 +747,21 @@ func queryError(err error, id identity.Identity) error {
 // The destination slice is allocated per call — a Provider retains nothing
 // between fetches — which is what keeps the read-only Metadata contract true for
 // concurrent callers.
-func scanRow(rows *sql.Rows, id identity.Identity) (provider.Metadata, error) {
+func scanRow(rows *sql.Rows, id string) (provider.Metadata, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_SCAN, err,
-			"sqlprovider: cannot read the result columns for %s", id.String())
+			"sqlprovider: cannot read the result columns for %s", id)
 	}
 
-	if err := validateColumns(cols, map[string]any{"id": id.String()}); err != nil {
+	if err := validateColumns(cols, map[string]any{"id": id}); err != nil {
 		return nil, err
 	}
 
 	vals, dest := scanSlots(len(cols))
 	if err := rows.Scan(dest...); err != nil {
 		return nil, aerr.Wrapf(aerr.APERTURE_SQL_PROVIDER_SCAN, err,
-			"sqlprovider: cannot scan the row for %s", id.String())
+			"sqlprovider: cannot scan the row for %s", id)
 	}
 	// -1: a fetch result has no identity column to skip — the identity is the
 	// caller's own input, not something the row carries.
@@ -802,13 +812,16 @@ func scanSlots(n int) (vals []any, dest []any) {
 }
 
 // rowMetadata maps one scanned row into a fresh Metadata keyed by column name,
-// skipping the column at index skip (the identity column of an enumeration; -1
-// when there is none).
+// skipping the column at index skip (the key column of an enumeration; -1 when
+// there is none).
+//
+// id is the row's key rendered as text — an object identity's String() here, a
+// bare subject key on the attribute seam — and it appears only in diagnostics.
 //
 // The map and every container inside it are allocated for this one row — a
 // Provider retains nothing between rows — which is what keeps the transitively
 // read-only Metadata contract true for concurrent holders.
-func rowMetadata(cols []string, vals []any, skip int, id identity.Identity) (provider.Metadata, error) {
+func rowMetadata(cols []string, vals []any, skip int, id string) (provider.Metadata, error) {
 	md := make(provider.Metadata, len(cols))
 	for i, name := range cols {
 		if i == skip {
@@ -832,7 +845,7 @@ func rowMetadata(cols []string, vals []any, skip int, id identity.Identity) (pro
 	// rather than reaching the expression evaluator.
 	if err := provider.ValidateMetadata(md); err != nil {
 		return nil, aerr.Wrapf(aerr.APERTURE_METADATA_INVALID, err,
-			"sqlprovider: row for %s rejected by the metadata value model", id.String())
+			"sqlprovider: row for %s rejected by the metadata value model", id)
 	}
 	return md, nil
 }
