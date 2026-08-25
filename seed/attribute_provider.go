@@ -574,6 +574,62 @@ func resolveAttributeSource(ap AttributeProvider, baseDir string, conns *Connect
 	return src, nil
 }
 
+// AttributeSourceInline is the source label for a slot filled from the
+// attributes: block rather than from an attribute_providers: entry. It is not a
+// kind — inline is not selectable with kind: — which is exactly why it needs a
+// name of its own: an operator reading "inline" must not go looking for a loader
+// that does not exist.
+const AttributeSourceInline = "inline"
+
+// AttributeSlotSources reports, per slot, WHERE this document says that slot's
+// bags come from: the declared kind: of its attribute_providers: entry ("csv",
+// "sql"), or AttributeSourceInline when only the attributes: block fills it. A
+// slot the document does not fill at all is absent from the map.
+//
+// It exists so a surface that DISPLAYS the wiring — `aperture attributes slots`
+// — does not have to re-derive the precedence rule. The rule is one rule and it
+// is defined in this file: an attribute_providers: entry WINS and the inline
+// bags for that slot are discarded entirely (see AttributeCollisions). A CLI
+// that walked the two sections itself would be a second implementation of it,
+// and the two would eventually disagree about which source an operator is
+// actually running — the one question the listing exists to answer.
+//
+// It reports WIRING, not contents: slot names and kinds, never a key and never a
+// bag. What a slot's cache is actually configured with is a property of the
+// built registry, not of the document, and is read from
+// provider.AttributeRegistry.CacheConfigFor.
+//
+// A malformed subject: is skipped rather than reported, exactly as
+// AttributeCollisions skips it: an unknown subject fails the BUILD, and a report
+// asked of a document that cannot build should still answer for the slots that
+// can.
+func (d *Document) AttributeSlotSources() map[string]string {
+	if d == nil {
+		return nil
+	}
+	out := make(map[string]string, len(provider.AttributeSlots()))
+	// Inline first, external second: the external entry OVERWRITES, which is the
+	// precedence rule spelled as an assignment order rather than as a condition.
+	for _, a := range d.Attributes {
+		slot, err := provider.ParseAttributeSlot(strings.TrimSpace(a.Subject))
+		if err != nil {
+			continue
+		}
+		out[slot.String()] = AttributeSourceInline
+	}
+	for _, ap := range d.AttributeProviders {
+		slot, err := provider.ParseAttributeSlot(strings.TrimSpace(ap.Subject))
+		if err != nil {
+			continue
+		}
+		out[slot.String()] = strings.TrimSpace(ap.Kind)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // AttributeCollisions reports the SLOTS declared in BOTH the
 // attribute_providers: and attributes: sections, in provider.AttributeSlots()
 // order.

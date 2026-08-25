@@ -36,6 +36,9 @@ func NewApp(version string) *ucli.Command {
 			// Declarative state: whole-model export/import (system-admin tier).
 			exportCommand(),
 			importCommand(),
+			// Attribute directories: wiring listing, gated bulk read, cache
+			// invalidation.
+			attributesCommand(),
 			// Server.
 			serveCommand(),
 			// Read-only MCP surface (stdio).

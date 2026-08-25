@@ -135,6 +135,70 @@ func (s *Service) ListAttributes(ctx context.Context, actor Actor, slot string, 
 	return s.attrs.Enumerate(ctx, parsed, filter)
 }
 
+// InvalidateAttribute drops the cached bag for one key in one slot, so the next
+// decision about that subject re-reads it from the host directory. It reports
+// whether an entry was actually dropped, and actor must hold system-admin
+// authority in its active account.
+//
+// # Why a cache drop is gated at all
+//
+// Invalidation writes nothing and discloses no bag, so the instinct is to leave
+// it open. Two things argue the other way, and both are about the boolean.
+//
+// The return value says whether this process had that key cached, which is a
+// fact about the directory's TRAFFIC — that somebody has recently been decided
+// about under that key. And clearing a large slot costs the next wave of
+// decisions a provider round-trip each, which an unauthenticated caller in a
+// loop turns into load on the host's user table.
+//
+// So it runs through requireAttributeAdmin, the same three conditions in the
+// same order ListAttributes uses. Same order matters: checking authority before
+// resolving the slot is what keeps a refused caller from learning which slots
+// this deployment wires by reading which error came back.
+//
+// The operator-facing reason to reach for it is in
+// provider.AttributeRegistry.Invalidate: a slot's ttl: is the window a REVOKED
+// clearance keeps authorizing for, and this is how an operator closes it now
+// rather than waiting it out.
+func (s *Service) InvalidateAttribute(ctx context.Context, actor Actor, slot, id string) (bool, error) {
+	if err := s.requireAttributeAdmin(ctx, actor); err != nil {
+		return false, err
+	}
+	parsed, err := provider.ParseAttributeSlot(slot)
+	if err != nil {
+		return false, err // APERTURE_ATTRIBUTE_SLOT_UNKNOWN, verbatim
+	}
+	return s.attrs.Invalidate(parsed, id)
+}
+
+// InvalidateAttributeSlot clears every cached bag for one slot — the bulk form,
+// for a directory that changed wholesale rather than one subject at a time.
+// Gated identically to InvalidateAttribute.
+func (s *Service) InvalidateAttributeSlot(ctx context.Context, actor Actor, slot string) error {
+	if err := s.requireAttributeAdmin(ctx, actor); err != nil {
+		return err
+	}
+	parsed, err := provider.ParseAttributeSlot(slot)
+	if err != nil {
+		return err // APERTURE_ATTRIBUTE_SLOT_UNKNOWN, verbatim
+	}
+	return s.attrs.InvalidateSlot(parsed)
+}
+
+// InvalidateAllAttributes clears every registered slot's cache. Gated
+// identically to InvalidateAttribute.
+//
+// It names no slot, so it cannot report one that is unwired and cannot be used
+// to probe which slots exist: a registry holding nothing satisfies "drop
+// everything" as completely as a full one does.
+func (s *Service) InvalidateAllAttributes(ctx context.Context, actor Actor) error {
+	if err := s.requireAttributeAdmin(ctx, actor); err != nil {
+		return err
+	}
+	s.attrs.InvalidateAll()
+	return nil
+}
+
 // ExplainAttributeAuthority returns the full engine Trace behind the
 // system-admin authority decision ListAttributes enforces — the same
 // gate.ExplainSystemAdmin derivation, reachable from the facade an operator

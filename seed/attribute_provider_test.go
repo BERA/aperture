@@ -459,3 +459,40 @@ attribute_providers:
 		t.Fatalf("Apply did not write the model: %+v", out.Principals)
 	}
 }
+
+// TestAttributeSlotSourcesReportsThePrecedence: the listing a surface prints has
+// to name the source that is actually SERVING each slot, and that is the
+// precedence rule — an attribute_providers: entry wins and the inline bags for
+// that slot are discarded entirely. Defined here, in seed, so a CLI that
+// displays it is not a second implementation of it.
+func TestAttributeSlotSourcesReportsThePrecedence(t *testing.T) {
+	doc := attributeDoc(t, `
+attribute_providers:
+  - {subject: user, kind: csv, path: users.csv}
+  - {subject: machine, kind: sql, connection: main, get_one: "SELECT 1"}
+attributes:
+  # user collides with the csv entry above: the external source wins, so the
+  # listing must say csv and never inline.
+  - {subject: user, id: alice, metadata: {department: eng}}
+  - {subject: account, id: acme, metadata: {plan: enterprise}}
+`)
+	got := doc.AttributeSlotSources()
+	want := map[string]string{
+		"user":    "csv",
+		"machine": "sql",
+		"account": AttributeSourceInline,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("AttributeSlotSources() = %v, want %v", got, want)
+	}
+
+	// A document that declares no attribute source at all reports nothing, which
+	// is how a listing tells "unwired" from "wired to something unnamed".
+	if got := attributeDoc(t, "accounts:\n  - {id: acme, name: Acme}\n").AttributeSlotSources(); got != nil {
+		t.Errorf("a document with no attribute sections reported %v, want nil", got)
+	}
+	var nilDoc *Document
+	if got := nilDoc.AttributeSlotSources(); got != nil {
+		t.Errorf("a nil document reported %v, want nil", got)
+	}
+}

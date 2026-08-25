@@ -424,6 +424,78 @@ func (r *AttributeRegistry) AccountAttributes(ctx context.Context, account strin
 	return md, nil
 }
 
+// Invalidate drops the cached bag for id in slot so the next Fetch re-pulls it
+// from the provider. It reports whether an entry was present. An unknown slot is
+// APERTURE_ATTRIBUTE_SLOT_UNKNOWN and an unfilled one is
+// APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED, exactly as a Fetch would report
+// them.
+//
+// # This is a security control, not a performance knob
+//
+// The object Registry's Invalidate (registry.go) exists so a host whose source
+// of truth changed can stop serving a stale row. The three methods here have the
+// same shape and a different reason, and the difference is worth stating because
+// it decides how a deployment tunes ttl:.
+//
+// An object's metadata going stale for a TTL is usually tolerable: a document's
+// category is a fact about a thing, and a decision made against yesterday's
+// category is wrong in the way a cache is always wrong. An attribute bag is the
+// ASKER'S standing — the clearance, the department, the plan — and a revoked
+// clearance that stays cached keeps AUTHORIZING for the rest of the window.
+// Principals are the classic revoke case, so the freshness window a slot's ttl:
+// buys in fetch traffic is paid for in the time a revocation takes to become
+// true. An operator who has just removed someone's access needs a way to make
+// that true now; this is that way.
+//
+// The key is validated through the SAME guard Fetch uses, so the empty string
+// and the account wildcard are refused here as well. Neither can ever have been
+// cached — Fetch refuses them before a provider is consulted — so the refusal
+// costs a caller nothing it could otherwise have had, and it answers "why did
+// invalidating '*' report nothing?" with the reason instead of a false.
+func (r *AttributeRegistry) Invalidate(slot AttributeSlot, id string) (bool, error) {
+	e, err := r.entry(slot)
+	if err != nil {
+		return false, err
+	}
+	if err := attributeKeyError(slot, id); err != nil {
+		return false, err
+	}
+	return e.cache.Delete(id), nil
+}
+
+// InvalidateSlot clears every cached bag for slot. Use it when a whole directory
+// changed underneath the cache — a bulk role sync, a department reorg, a
+// restored backup — rather than invalidating each key the change touched.
+//
+// It is spelled InvalidateSlot, not InvalidateType: the object registry's unit
+// is an open-ended object TYPE and this one's is a closed SLOT, and the two are
+// deliberately different words everywhere they appear (see the type doc).
+func (r *AttributeRegistry) InvalidateSlot(slot AttributeSlot) error {
+	e, err := r.entry(slot)
+	if err != nil {
+		return err
+	}
+	e.cache.Clear()
+	return nil
+}
+
+// InvalidateAll clears every registered slot's cache. It does not unregister
+// providers, and it is not an error on a registry with no slot filled — "drop
+// everything" is satisfiable by a registry that is holding nothing.
+//
+// It is the blunt instrument, and the right one exactly once: an operator who
+// knows a directory changed but not which subjects it changed. Every decision
+// that follows re-reads its bags, so a large slot pays a burst of provider
+// traffic; that is the price of the guarantee, and it is cheaper than the window
+// it closes.
+func (r *AttributeRegistry) InvalidateAll() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.slots {
+		e.cache.Clear()
+	}
+}
+
 // Stats returns the cache counters for slot, or false when the slot has no
 // registered provider. The counters are per slot and never pooled: a user
 // directory's hit rate says nothing about an account cache's, and one number
