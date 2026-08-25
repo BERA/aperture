@@ -500,6 +500,7 @@ var Registry = map[Code]Metadata{
 			"Register an AttributeProvider for the slot before fetching its attributes.",
 			"Check that the principal's kind maps to the slot you wired: a machine principal reads the machine slot, not the user slot.",
 			"Deployment genuinely has no subjects of this kind? Then nothing should be fetching that slot — fix the caller rather than registering an empty provider.",
+			"Seeing this from a decision? You should not: a Check/Enumerate/Explain against an unwired slot evaluates the floor bag and decides. This code reaches you only from a DIRECT attribute read (Fetch or Enumerate on the registry), so the caller to fix is that reader, not the decision path.",
 		},
 	},
 	APERTURE_ATTRIBUTE_PROVIDER_FETCH: {

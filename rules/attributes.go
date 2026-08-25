@@ -60,10 +60,28 @@ import (
 // construction rather than by convention. The failure mode of a mismatch is a
 // re-fetch: correct and slow, which is the right direction.
 //
-// FAILURES ARE NOT MEMOIZED. Only a successful resolution is retained, so a
-// transient directory failure is not frozen into the rest of the decision. What
-// a failure MEANS to a decision — which codes are lenient, which are a
-// non-decision — is the resolver's contract and is not decided here.
+// FAILURES ARE NOT MEMOIZED; ABSENCES ARE. Which codes are lenient stays the
+// resolver's contract (see provider.AttributeRegistry.Attributes) and is not
+// decided here, but the two outcomes it produces land on opposite sides of this
+// memo, and that split is deliberate:
+//
+//   - An ABSENCE — no provider wired for the slot, or a directory with no record
+//     for this subject — reaches the memo as a successful resolution of a nil
+//     bag, and is retained like any other. "The host knows nothing about this
+//     subject" is a complete answer, it describes a steady state rather than a
+//     blip, and re-resolving it per object would reintroduce exactly the
+//     TTL-straddling inconsistency this type exists to remove. A 1,000-object
+//     enumeration against an unwired slot therefore performs ONE resolution. It
+//     is also what lets Principal/Account report (nil, true) — resolved, and
+//     empty — which is the distinction a floor-only decision trace is built on.
+//   - A FAILURE is not retained, so a directory that blinks for one round trip
+//     does not decide the rest of the decision. The cost of that choice is
+//     bounded and small: every consumer of a rule verdict treats an error as a
+//     NON-DECISION and returns immediately (scope's resolvers stop enumerating
+//     on the first error; the decision engine stops on the first grant), so
+//     "retried" means at most one further attempt in this decision, never one
+//     per object. Freezing the blip instead would be unbounded in the direction
+//     that matters — a wrong answer, held for the whole decision.
 //
 // READ-ONLY, AND MORE SO THAN BEFORE. A resolved bag was always read-only
 // transitively (see PrincipalResolver, AccountResolver, and provider's
@@ -168,7 +186,10 @@ func (d *DecisionAttributes) principalAttributes(ctx context.Context, r Principa
 	bag, err := r.Attributes(ctx, kind, principal)
 	if err != nil {
 		// Deliberately not memoized: a transient directory failure must not be
-		// frozen into every later evaluation in this decision.
+		// frozen into every later evaluation in this decision, and it cannot
+		// cost a fetch per object because the error ENDS the decision. An
+		// absence does not arrive here at all — the resolver reports it as a nil
+		// bag and no error, and it memoizes. See the file doc.
 		return nil, err
 	}
 	m.kind, m.id, m.bag, m.taken = kind, principal, bag, true

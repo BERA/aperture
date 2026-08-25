@@ -337,6 +337,28 @@ func principalSlot(kind string) (AttributeSlot, bool) {
 // caller treats it as a non-decision. An outage must not read as "this principal
 // has no attributes", because that is an authorization change wearing an
 // infrastructure failure's clothes.
+//
+// A key that can never name one subject is a third thing, and it is refused
+// rather than collapsed: an empty key, or the account wildcard, is a CALLER that
+// has not resolved what it is asking about, not a deployment that chose not to
+// wire a directory (see attributeKeyError).
+//
+// # The asymmetry leniency leaves, which is accepted rather than solved
+//
+// An absent attribute makes every comparison against it false. That is deny-safe
+// in an INCLUSIVE grant, where a rule that fails to select covers nothing — and
+// access-WIDENING in an EXCLUSIVE one, where selection means "excluded", so a
+// rule that stops selecting stops excluding and the object the exclusion was
+// written to withhold becomes covered.
+//
+// The alternative is worse in the direction that matters more: erroring on an
+// absent bag makes a deployment with an unwired slot undecidable for every
+// principal of that kind, which is the outage the leniency exists to prevent.
+// The mitigation is therefore VISIBILITY, not refusal — a decision trace says
+// when a bag came back floor-only — plus `principal.kind`, which is what lets a
+// rule author state a rule's dependence on a directory instead of hiding it (see
+// rules.principalBag). rules.TestAMissingBagWidensAnExclusiveGrant keeps the
+// hazard executable, so it cannot quietly stop being true.
 func (r *AttributeRegistry) Attributes(ctx context.Context, kind, principal string) (map[string]any, error) {
 	slot, ok := principalSlot(kind)
 	if !ok {
