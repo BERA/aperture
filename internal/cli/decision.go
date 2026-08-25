@@ -245,9 +245,17 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 // dependencies — `serve` passes storage, the admin gate, delegation,
 // impersonation, audit and the editor's rule source, while a one-shot command
 // passes nothing and gets the read-only decision facade.
+//
+// The ATTRIBUTE registry is wired here too, unconditionally and for the same
+// reason every other attribute wiring lands in this one builder: a surface that
+// assembled its own stack could answer differently from the rest. It is not a
+// grant of access. service.ListAttributes is a system-tier read that refuses
+// any actor without system-admin authority and refuses outright when no gate is
+// wired — which is exactly the one-shot decision commands, so passing the
+// registry to them changes nothing they can do.
 func (s decisionStack) newService(opts ...service.Option) *service.Service {
-	all := make([]service.Option, 0, len(opts)+1)
-	all = append(all, service.WithProviders(s.registry))
+	all := make([]service.Option, 0, len(opts)+2)
+	all = append(all, service.WithProviders(s.registry), service.WithAttributes(s.attributes))
 	all = append(all, opts...)
 	return service.New(s.eng, all...)
 }

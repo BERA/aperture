@@ -59,6 +59,16 @@ Full surface:
   allowance ("all objects of this type except these ids") expands to. An
   object-type with no declared provider → `APERTURE_PROVIDER_UNREGISTERED`; a
   facade built without `WithProviders` → `APERTURE_UNIMPLEMENTED`.
+- **Attribute directories (SYSTEM-tier read)**: `ListAttributes(actor, slot,
+  provider.AttributeFilter)` enumerates one attribute slot (`user` / `machine` /
+  `account`) — the host directory the decision path resolves `principal` and
+  `account` bags from — returning `[]provider.AttributeRecord` (key + bag). It is
+  wired with `WithAttributes` and is **gated directly through
+  `authz.Gate.RequireSystemAdmin`**, exactly like `Export`, not through the
+  `Mutation` table: it writes nothing, so it is a read, and it is not audited.
+  `ExplainAttributeAuthority(actor)` returns the engine `Trace` behind that
+  authority decision so a refused operator can see why. See
+  [the attribute directory read](#the-attribute-directory-read).
 - **Rules (E7-S3)**: `Put/Get/List/Delete` for `Rule` (the named rule-AST
   definitions the node editor authors and rule-backed scope strategies resolve;
   the AST rides as `rule_json`/`rules_json`, the exact `rules.Node` serialization).
@@ -354,6 +364,47 @@ scope, gated by `service.readScope` as above, and is paginated:
 On the Twirp surface the actor's principal is ALWAYS the authenticated identity
 from the auth middleware, never a value from the request body — a caller cannot
 act as someone else. The wire's `Actor.account` selects the active account.
+
+## The attribute directory read
+
+`ListAttributes` is the ONE administrative door onto an attribute slot, and the
+only place `provider.AttributeRegistry.Enumerate` is reachable from a surface.
+Listing the `user` slot returns the host's whole user table, so it is a
+system-tier read: `RequireSystemAdmin` directly, the shape `Export` uses, never a
+`Mutation` row (it writes nothing).
+
+- **The gate is above the registry, deliberately.** `provider` imports only
+  `identity` + `errors` (`TestProviderPackageImportsOnlyIdentityAndErrors`), and
+  `authz` imports `engine` — a gate inside the registry would invert the
+  dependency. The facade is also where it belongs on the merits: one gate serves
+  CLI, HTTP, Twirp and MCP at once.
+- **The gate runs BEFORE the slot is resolved**, so a refused caller cannot
+  probe which slots a deployment wires. A non-admin gets the identical
+  `APERTURE_AUTHZ_DENIED` for a populated slot, an unregistered slot, and a slot
+  name that does not exist — with a nil slice, no count, and nothing about the
+  directory in the error. The gate's error passes through VERBATIM (`Wrap`
+  re-stamps, and the code's fixups are the operator's remedy). A system-admin, by
+  contrast, does get the real diagnostics: `APERTURE_ATTRIBUTE_SLOT_UNKNOWN` and
+  `APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED`.
+- **No gate wired → `APERTURE_UNIMPLEMENTED`**, not "unrestricted". This is the
+  one read that does NOT take `readScope`'s local-context concession, because a
+  bulk directory read has no narrower fallback to degrade to.
+- **`Fetch` on the decision path is NOT gated, and must never be.** A decision
+  resolves one bag for a subject it already named; gating it would deny every
+  rule-backed decision in every deployment that wires a directory. The two paths
+  reach the same registry through different seams —
+  `rules.WithPrincipalResolver` / `rules.WithAccountResolver` for the decision,
+  `WithAttributes` for the admin read.
+- **The implicit path is impossible, not policed.** A scope resolver enumerating
+  mid-decision through `scope.ObjectLister` has no actor, so it could never carry
+  a gate. `provider.AttributeRegistry` is therefore built so it cannot satisfy
+  that interface (`Enumerate`, not `List`; an `AttributeSlot`, not a type string;
+  an `AttributeFilter` with no `identity.Pattern`; `[]AttributeRecord`, not
+  `[]identity.Identity`), asserted by
+  `provider.TestAttributeRegistryIsNotAScopeLister`.
+- **It is not the only way a value is seen.** An `Explain` trace carries the
+  bags a decision was evaluated against, values included (E5-S1) — a deliberate
+  disclosure. The gate closes the bulk-read door, not every door.
 
 ## Wire encoding
 

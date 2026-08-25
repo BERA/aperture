@@ -117,6 +117,14 @@ type Service struct {
 	// default) makes ObjectIdentifiers report APERTURE_UNIMPLEMENTED. Wired with
 	// WithProviders.
 	providers *provider.Registry
+	// attrs, when non-nil, is the ATTRIBUTE registry (principal + account
+	// directories) the gated ListAttributes read enumerates a slot through. It is
+	// a separate field from providers because the two are separate registries
+	// answering separate questions — what the host knows about an OBJECT versus
+	// what it knows about the party ASKING — and only this one is behind a
+	// system-admin gate. Nil (the default) makes ListAttributes report
+	// APERTURE_UNIMPLEMENTED. Wired with WithAttributes.
+	attrs *provider.AttributeRegistry
 	// managed is the deployment's boot-time entity-management posture: which of
 	// accounts / principals / memberships this Aperture owns the lifecycle of.
 	// Read once at construction and never mutated. Its zero value means every
@@ -172,6 +180,21 @@ func WithRuleSource(base rules.RuleSource, fetcher rules.MetadataFetcher) Option
 // ObjectIdentifiers reports APERTURE_UNIMPLEMENTED.
 func WithProviders(reg *provider.Registry) Option {
 	return func(s *Service) { s.providers = reg }
+}
+
+// WithAttributes gives the facade the attribute registry its gated
+// ListAttributes read enumerates a slot through — the same registry the decision
+// path resolves `principal` and `account` bags from, so an operator lists
+// exactly the directory a rule reads. Without it, ListAttributes reports
+// APERTURE_UNIMPLEMENTED.
+//
+// Wiring it grants nobody anything: enumeration is refused to any actor without
+// system-admin authority, and the decision path's per-bag Fetch never goes
+// through this option at all (it goes through rules.WithPrincipalResolver /
+// rules.WithAccountResolver, wired straight onto the rules engine). See
+// service/attributes.go for why that separation is the whole design.
+func WithAttributes(reg *provider.AttributeRegistry) Option {
+	return func(s *Service) { s.attrs = reg }
 }
 
 // WithManagedEntities declares which entity kinds this deployment manages —
