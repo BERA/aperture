@@ -148,11 +148,11 @@ func (e *Engine) Enumerate(ctx context.Context, req EnumerateRequest) ([]string,
 		return []string{}, nil
 	}
 
-	subjects, err := e.subjectSet(ctx, req.Principal)
+	subjects, principalKind, err := e.subjectSet(ctx, req.Principal)
 	if err != nil {
 		return nil, err
 	}
-	return e.enumerateWithSubjects(ctx, req, query, subjects)
+	return e.enumerateWithSubjects(ctx, req, principalKind, query, subjects)
 }
 
 // enumerateWithSubjects runs the Enumerate algorithm over an already-resolved
@@ -161,7 +161,7 @@ func (e *Engine) Enumerate(ctx context.Context, req EnumerateRequest) ([]string,
 // enumeration is the exact same deny-overrides walk over a different subject set —
 // no impersonation-specific decision logic. decReq.Principal stays the requesting
 // principal so a rule-backed scope strategy still sees the real operator.
-func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest, query identity.Pattern, subjects []model.Subject) ([]string, error) {
+func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest, principalKind string, query identity.Pattern, subjects []model.Subject) ([]string, error) {
 	// One reference instant for the WHOLE enumeration — the member gather and
 	// every per-candidate decision underneath it. A rule-backed Enumerate
 	// evaluates its rule twice per candidate, so this is where a long-running
@@ -186,7 +186,7 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 	// principal may not see — or one absent from outside the account — fails
 	// closed to an empty result rather than an error, so it is indistinguishable
 	// from a holder that simply contains nothing visible.
-	restrictTo, open, err := e.referenceRestriction(ctx, req, decReq, grants, permCache)
+	restrictTo, open, err := e.referenceRestriction(ctx, req, decReq, principalKind, grants, permCache)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +209,7 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 			continue
 		}
 		perm := permCache[g.PermissionID]
-		members, err := e.coverer.members(ctx, decReq, g, perm, query)
+		members, err := e.coverer.members(ctx, decReq, principalKind, g, perm, query)
 		if err != nil {
 			return nil, err
 		}
@@ -239,7 +239,7 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 			}
 		}
 		decReq.Object = obj.String()
-		dec, err := e.evaluate(ctx, decReq, obj, grants, permCache)
+		dec, err := e.evaluate(ctx, decReq, principalKind, obj, grants, permCache)
 		if err != nil {
 			return nil, err
 		}

@@ -97,8 +97,10 @@ type Decision struct {
 // and the resolution logic in Check is unaffected either way. The grant's
 // permission is threaded through because a scope strategy is selected by the
 // permission's scope-strategy reference and bounded by its object type; the
-// literal default ignores it. The request supplies the principal/action context
-// a rule-backed strategy needs.
+// literal default ignores it. The request supplies the account/principal/action
+// context a rule-backed strategy needs; principalKind rides alongside it because
+// it is derived from storage during the decision rather than supplied by the
+// caller, so it has no home on Request.
 type coverer interface {
 	// cover reports whether g applies to object and, when it does, the
 	// specificity at which it applies (higher = more specific). perm is the
@@ -106,7 +108,7 @@ type coverer interface {
 	// returns an error on a malformed grant pattern or scope reference (an
 	// internal inconsistency, since writes validate them) or an unresolvable
 	// strategy.
-	cover(ctx context.Context, req Request, g model.Grant, perm *model.Permission, object identity.Identity) (covered bool, specificity int, err error)
+	cover(ctx context.Context, req Request, principalKind string, g model.Grant, perm *model.Permission, object identity.Identity) (covered bool, specificity int, err error)
 
 	// members enumerates the concrete object identities g covers that also match
 	// query, bounded by the resolver's own limit. It is the Enumerate seam: the
@@ -115,7 +117,7 @@ type coverer interface {
 	// lister, so it contributes nothing); a scope strategy delegates to its
 	// resolver's Members, which may consult the ObjectLister for "all of type"
 	// strategies. perm selects the strategy exactly as cover does.
-	members(ctx context.Context, req Request, g model.Grant, perm *model.Permission, query identity.Pattern) ([]identity.Identity, error)
+	members(ctx context.Context, req Request, principalKind string, g model.Grant, perm *model.Permission, query identity.Pattern) ([]identity.Identity, error)
 }
 
 // literalCoverer is the E1 coverer: it treats Grant.Object as a literal identity
@@ -124,7 +126,7 @@ type coverer interface {
 // E1 behaviour.
 type literalCoverer struct{ cache *patternCache }
 
-func (c literalCoverer) cover(_ context.Context, _ Request, g model.Grant, _ *model.Permission, object identity.Identity) (bool, int, error) {
+func (c literalCoverer) cover(_ context.Context, _ Request, _ string, g model.Grant, _ *model.Permission, object identity.Identity) (bool, int, error) {
 	pat, err := c.cache.orParse(g.Object)
 	if err != nil {
 		// PutGrant validates the pattern, so reaching here means the stored grant
@@ -138,7 +140,7 @@ func (c literalCoverer) cover(_ context.Context, _ Request, g model.Grant, _ *mo
 	return true, identity.Specificity(pat), nil
 }
 
-func (literalCoverer) members(_ context.Context, _ Request, g model.Grant, _ *model.Permission, query identity.Pattern) ([]identity.Identity, error) {
+func (literalCoverer) members(_ context.Context, _ Request, _ string, g model.Grant, _ *model.Permission, query identity.Pattern) ([]identity.Identity, error) {
 	return literalMembers(g, query)
 }
 
@@ -203,7 +205,7 @@ type scopeCoverer struct {
 	cache    *patternCache
 }
 
-func (c scopeCoverer) cover(ctx context.Context, req Request, g model.Grant, perm *model.Permission, object identity.Identity) (bool, int, error) {
+func (c scopeCoverer) cover(ctx context.Context, req Request, principalKind string, g model.Grant, perm *model.Permission, object identity.Identity) (bool, int, error) {
 	ref := ""
 	objectType := ""
 	if perm != nil {
@@ -231,11 +233,13 @@ func (c scopeCoverer) cover(ctx context.Context, req Request, g model.Grant, per
 	}
 
 	resolver, err := c.registry.Resolve(scope.GrantContext{
-		Pattern:    pat,
-		ObjectType: objectType,
-		Spec:       spec,
-		Principal:  req.Principal,
-		Action:     req.Action,
+		Pattern:       pat,
+		ObjectType:    objectType,
+		Spec:          spec,
+		Account:       req.Account,
+		PrincipalKind: principalKind,
+		Principal:     req.Principal,
+		Action:        req.Action,
 	}, c.deps)
 	if err != nil {
 		return false, 0, err
@@ -250,7 +254,7 @@ func (c scopeCoverer) cover(ctx context.Context, req Request, g model.Grant, per
 	return true, specificity, nil
 }
 
-func (c scopeCoverer) members(ctx context.Context, req Request, g model.Grant, perm *model.Permission, query identity.Pattern) ([]identity.Identity, error) {
+func (c scopeCoverer) members(ctx context.Context, req Request, principalKind string, g model.Grant, perm *model.Permission, query identity.Pattern) ([]identity.Identity, error) {
 	ref := ""
 	objectType := ""
 	if perm != nil {
@@ -274,11 +278,13 @@ func (c scopeCoverer) members(ctx context.Context, req Request, g model.Grant, p
 	}
 
 	resolver, err := c.registry.Resolve(scope.GrantContext{
-		Pattern:    pat,
-		ObjectType: objectType,
-		Spec:       spec,
-		Principal:  req.Principal,
-		Action:     req.Action,
+		Pattern:       pat,
+		ObjectType:    objectType,
+		Spec:          spec,
+		Account:       req.Account,
+		PrincipalKind: principalKind,
+		Principal:     req.Principal,
+		Action:        req.Action,
 	}, c.deps)
 	if err != nil {
 		return nil, err
@@ -496,7 +502,7 @@ func (e *Engine) Check(ctx context.Context, req Request) (Decision, error) {
 		return nonMemberDeny(req), nil
 	}
 
-	subjects, err := e.subjectSet(ctx, req.Principal)
+	subjects, principalKind, err := e.subjectSet(ctx, req.Principal)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -510,7 +516,7 @@ func (e *Engine) Check(ctx context.Context, req Request) (Decision, error) {
 	// A single permission cache is threaded through the evaluation so a subject
 	// with many grants on the same permission pays one lookup.
 	permCache := make(map[string]*model.Permission, len(grants))
-	return e.evaluate(ctx, req, object, grants, permCache)
+	return e.evaluate(ctx, req, principalKind, object, grants, permCache)
 }
 
 // evaluate runs the deny-overrides/specificity decision for one concrete object
@@ -518,7 +524,7 @@ func (e *Engine) Check(ctx context.Context, req Request) (Decision, error) {
 // the shared core of Check and of Enumerate's per-candidate verdict, so the
 // "never returns a denied object" guarantee in Enumerate is the exact same
 // decision the hot path makes.
-func (e *Engine) evaluate(ctx context.Context, req Request, object identity.Identity, grants []model.Grant, permCache map[string]*model.Permission) (Decision, error) {
+func (e *Engine) evaluate(ctx context.Context, req Request, principalKind string, object identity.Identity, grants []model.Grant, permCache map[string]*model.Permission) (Decision, error) {
 	// One reference instant for the whole decision, whatever a rule-backed scope
 	// resolver asks for later. The call is idempotent, so an Enumerate that
 	// already opened a scope for the enumeration keeps ITS instant across every
@@ -537,7 +543,7 @@ func (e *Engine) evaluate(ctx context.Context, req Request, object identity.Iden
 		// actionMatches has populated permCache with a non-nil permission for a
 		// matched grant; the scope coverer needs it to select the strategy.
 		perm := permCache[g.PermissionID]
-		covered, spec, err := e.coverer.cover(ctx, req, g, perm, object)
+		covered, spec, err := e.coverer.cover(ctx, req, principalKind, g, perm, object)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -567,7 +573,9 @@ func (e *Engine) EffectiveGrants(ctx context.Context, account, principal string)
 	case principal == "":
 		return nil, aerr.New(aerr.APERTURE_INVALID_INPUT, "engine: principal is empty")
 	}
-	subjects, err := e.subjectSet(ctx, principal)
+	// The kind is irrelevant here: EffectiveGrants returns grants verbatim and
+	// evaluates no scope strategy, so nothing downstream asks who is asking.
+	subjects, _, err := e.subjectSet(ctx, principal)
 	if err != nil {
 		return nil, err
 	}
@@ -582,12 +590,18 @@ func (e *Engine) EffectiveGrants(ctx context.Context, account, principal string)
 // subjectSet expands a principal into the set of subjects whose grants apply to
 // it: the principal itself, every role it is assigned, and every group it belongs
 // to. The expansion is the union {principal} ∪ roles ∪ groups.
-func (e *Engine) subjectSet(ctx context.Context, principalID string) ([]model.Subject, error) {
+//
+// It also returns the principal's kind. The kind is free here — GetPrincipal is
+// already on the decision's critical path to read RoleIDs — and returning it is
+// what keeps a rule-backed scope strategy from having to buy a second read of the
+// same row later. It is a string, not a model.PrincipalKind, because that is the
+// form scope.GrantContext carries (scope imports no model).
+func (e *Engine) subjectSet(ctx context.Context, principalID string) ([]model.Subject, string, error) {
 	p, err := e.store.GetPrincipal(ctx, principalID)
 	if err != nil {
 		// A missing principal surfaces as APERTURE_NOT_FOUND verbatim; the caller
 		// decides whether to render it as a hard error or a fail-closed deny.
-		return nil, err
+		return nil, "", err
 	}
 
 	subjects := make([]model.Subject, 0, 1+len(p.RoleIDs)+2)
@@ -598,13 +612,13 @@ func (e *Engine) subjectSet(ctx context.Context, principalID string) ([]model.Su
 
 	groups, err := e.store.GroupsForPrincipal(ctx, principalID)
 	if err != nil {
-		return nil, aerr.Wrap(aerr.APERTURE_STORAGE,
+		return nil, "", aerr.Wrap(aerr.APERTURE_STORAGE,
 			"engine: failed to load groups for principal", err)
 	}
 	for _, g := range groups {
 		subjects = append(subjects, model.Subject{Kind: model.SubjectGroup, ID: g.ID})
 	}
-	return subjects, nil
+	return subjects, string(p.Kind), nil
 }
 
 // actionMatches reports whether the grant's permission names the requested

@@ -192,11 +192,11 @@ func (e *Engine) Explain(ctx context.Context, req Request) (Trace, error) {
 		return Trace{Request: req, Decision: nonMemberDeny(req), Considered: []GrantEvaluation{}}, nil
 	}
 
-	subjects, err := e.subjectSet(ctx, req.Principal)
+	subjects, principalKind, err := e.subjectSet(ctx, req.Principal)
 	if err != nil {
 		return Trace{}, err
 	}
-	return e.explainWithSubjects(ctx, req, object, subjects)
+	return e.explainWithSubjects(ctx, req, principalKind, object, subjects)
 }
 
 // explainWithSubjects builds a Trace over an already-resolved subject set. It is
@@ -204,7 +204,7 @@ func (e *Engine) Explain(ctx context.Context, req Request) (Trace, error) {
 // impersonation-elevated set), so an impersonated trace records the same
 // derivation against a different subject set. req.Principal stays the requesting
 // principal in the trace's Request; the caller attaches any impersonation context.
-func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object identity.Identity, subjects []model.Subject) (Trace, error) {
+func (e *Engine) explainWithSubjects(ctx context.Context, req Request, principalKind string, object identity.Identity, subjects []model.Subject) (Trace, error) {
 	// One reference instant for the whole trace. Explain evaluates a rule per
 	// candidate grant, so without the scope a wide trace could resolve its first
 	// grant against one instant and its last against another — and the recorded
@@ -253,7 +253,7 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 		// scope seam without widening any of its interfaces. One collector per
 		// grant is what ties each note to the grant that produced it.
 		noteCtx, collector := rules.WithNoteCollector(ctx)
-		covered, spec, err := e.coverer.cover(noteCtx, req, g, perm, object)
+		covered, spec, err := e.coverer.cover(noteCtx, req, principalKind, g, perm, object)
 		if err != nil {
 			return Trace{}, err
 		}

@@ -166,6 +166,7 @@ func (e *Engine) referenceRestriction(
 	ctx context.Context,
 	req EnumerateRequest,
 	decReq Request,
+	principalKind string,
 	grants []model.Grant,
 	permCache map[string]*model.Permission,
 ) (map[string]struct{}, bool, error) {
@@ -219,7 +220,7 @@ func (e *Engine) referenceRestriction(
 
 		holderReq := decReq
 		holderReq.Object = holder.String()
-		dec, err := e.evaluate(ctx, holderReq, holder, grants, permCache)
+		dec, err := e.evaluate(ctx, holderReq, principalKind, holder, grants, permCache)
 		if err != nil {
 			return nil, false, err
 		}

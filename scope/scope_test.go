@@ -142,7 +142,7 @@ func TestDefaultSeamsAreUnconfigured(t *testing.T) {
 	if code := aerr.CodeOf(err); code != aerr.APERTURE_SCOPE_LISTER_UNCONFIGURED {
 		t.Errorf("lister: code = %q, want APERTURE_SCOPE_LISTER_UNCONFIGURED", code)
 	}
-	_, err = d.rules().Selected(context.Background(), "r", identity.MustParse("document:1"), "p", "a")
+	_, err = d.rules().Selected(context.Background(), "r", identity.MustParse("document:1"), "acme", "user", "p", "a")
 	if code := aerr.CodeOf(err); code != aerr.APERTURE_SCOPE_RULE_UNCONFIGURED {
 		t.Errorf("rules: code = %q, want APERTURE_SCOPE_RULE_UNCONFIGURED", code)
 	}

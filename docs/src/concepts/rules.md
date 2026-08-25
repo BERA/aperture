@@ -468,16 +468,27 @@ in-memory default; a missing reference yields `APERTURE_RULE_NOT_FOUND`) and a
 `MetadataFetcher` (whose signature matches `*provider.Registry.Fetch`, so a
 [provider registry](providers.md) wires in directly as the object-metadata
 source without the rules package importing `provider`). An optional
-`PrincipalResolver` supplies principal attributes; the default exposes only
-`principal.id`.
+`PrincipalResolver` supplies principal attributes, keyed by
+`Attributes(ctx, kind, principal)`; the default exposes only `principal.id`, and
+takes the kind without publishing it. The `kind` is `model.PrincipalKind`'s
+spelling (`"user"` / `"machine"`) carried as a string, so one resolver can
+dispatch to a different attribute source per kind — a human directory and a
+service-account registry are rarely the same store. An **empty** kind means the
+caller did not have the principal's record in hand: treat it as unknown, never
+as a default, or a machine gets answered for out of the human directory.
 
-`Engine.Selected(ctx, rule, object, principal, action)` is the full path:
+`Engine.Selected(ctx, rule, object, account, principalKind, principal, action)`
+is the full path:
 
 1. resolve the rule reference through the `RuleSource`;
 2. compile-and-cache its AST;
 3. fetch the object's metadata (empty when no fetcher is configured);
-4. resolve the principal's attributes;
+4. resolve the principal's attributes for its kind;
 5. build the `Input` and evaluate.
+
+`account` is accepted and **not yet read** — `Input.Account` is still the empty
+map. It is in the signature ahead of the account attribute source that will
+consume it so this exported signature breaks once rather than twice.
 
 Any step's failure is an `APERTURE_*` coded error, and the caller treats it as a
 **non-decision** — there is no select-on-error. That signature is exactly

@@ -122,7 +122,7 @@ func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationConte
 		return Decision{}, err
 	}
 
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, principalKind, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -137,7 +137,7 @@ func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationConte
 			"engine: failed to load grants for impersonated subjects", err)
 	}
 	permCache := make(map[string]*model.Permission, len(grants))
-	dec, err := e.evaluate(ctx, req, object, grants, permCache)
+	dec, err := e.evaluate(ctx, req, principalKind, object, grants, permCache)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -163,7 +163,7 @@ func (e *Engine) EnumerateAs(ctx context.Context, req EnumerateRequest, ic Imper
 	if err != nil {
 		return nil, err
 	}
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, principalKind, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (e *Engine) EnumerateAs(ctx context.Context, req EnumerateRequest, ic Imper
 		return []string{}, nil
 	}
 	ctx = WithImpersonation(ctx, ic)
-	return e.enumerateWithSubjects(ctx, req, query, subjects)
+	return e.enumerateWithSubjects(ctx, req, principalKind, query, subjects)
 }
 
 // ExplainAs is the impersonation-aware sibling of Explain: it returns the full
@@ -193,7 +193,7 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 	if err != nil {
 		return Trace{}, err
 	}
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, principalKind, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return Trace{}, err
 	}
@@ -202,7 +202,7 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 		return Trace{Request: req, Decision: dec, Considered: []GrantEvaluation{}, Impersonation: cloneIC(ic)}, nil
 	}
 	ctx = WithImpersonation(ctx, ic)
-	tr, err := e.explainWithSubjects(ctx, req, object, subjects)
+	tr, err := e.explainWithSubjects(ctx, req, principalKind, object, subjects)
 	if err != nil {
 		return Trace{}, err
 	}
@@ -216,36 +216,44 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 // is not a member of account — neither mode may cross an account boundary. On
 // ok, augment yields operator∪target subjects and become yields the target's
 // subjects alone.
-func (e *Engine) elevatedSubjects(ctx context.Context, account string, ic ImpersonationContext) (subjects []model.Subject, ok bool, err error) {
+//
+// principalKind is the OPERATOR's kind, because the operator is who the request
+// names and therefore who a rule-backed scope strategy is told about
+// (scope.GrantContext.Principal stays req.Principal under impersonation). Under
+// become, the operator's record is never read — only its account membership is —
+// so the kind is returned EMPTY rather than substituting the target's, which
+// would describe the wrong principal, or buying a read this path does not
+// otherwise need. Empty means unknown; it never means "user".
+func (e *Engine) elevatedSubjects(ctx context.Context, account string, ic ImpersonationContext) (subjects []model.Subject, principalKind string, ok bool, err error) {
 	opMember, err := e.store.IsMember(ctx, ic.RealActor, account)
 	if err != nil {
-		return nil, false, aerr.Wrap(aerr.APERTURE_STORAGE,
+		return nil, "", false, aerr.Wrap(aerr.APERTURE_STORAGE,
 			"engine: failed to check operator membership for impersonation", err)
 	}
 	tgtMember, err := e.store.IsMember(ctx, ic.EffectiveSubject, account)
 	if err != nil {
-		return nil, false, aerr.Wrap(aerr.APERTURE_STORAGE,
+		return nil, "", false, aerr.Wrap(aerr.APERTURE_STORAGE,
 			"engine: failed to check target membership for impersonation", err)
 	}
 	if !opMember || !tgtMember {
-		return nil, false, nil
+		return nil, "", false, nil
 	}
 
-	target, err := e.subjectSet(ctx, ic.EffectiveSubject)
+	target, _, err := e.subjectSet(ctx, ic.EffectiveSubject)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 	if ic.Mode == ModeBecome {
-		return target, true, nil
+		return target, "", true, nil
 	}
 
 	// Augment: union the operator's own subject set with the target's, deduped so
 	// a subject shared by both (e.g. a common group) is consulted once.
-	operator, err := e.subjectSet(ctx, ic.RealActor)
+	operator, operatorKind, err := e.subjectSet(ctx, ic.RealActor)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
-	return unionSubjects(operator, target), true, nil
+	return unionSubjects(operator, target), operatorKind, true, nil
 }
 
 // unionSubjects returns the deduplicated union of two subject sets, preserving

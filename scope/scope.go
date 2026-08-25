@@ -185,14 +185,31 @@ func ParseSpec(ref string) (Spec, error) {
 // GrantContext is the per-evaluation context a resolver is built from. Pattern
 // is the grant's already-parsed object pattern (the engine parses it once for
 // both specificity and scope); ObjectType is the permission's object type;
-// Spec is the parsed scope reference; Principal and Action carry the request
-// context the rule path needs.
+// Spec is the parsed scope reference; Account, PrincipalKind, Principal and
+// Action carry the request context the rule path needs.
+//
+// Account and PrincipalKind are carried because a rule-backed strategy asks
+// about attributes, and an attribute is only meaningful once you know WHOSE it
+// is and WHERE it is being read. They arrive as fields rather than being
+// recovered from the context.Context deliberately: a missing ctx value degrades
+// silently to an empty account — which reads as "no attributes" and therefore as
+// a quiet allow-or-deny nobody wrote — where a struct field is a compile-time
+// obligation on every caller.
 type GrantContext struct {
 	Pattern    identity.Pattern
 	ObjectType string
 	Spec       Spec
-	Principal  string
-	Action     string
+	// Account is the active account the decision is scoped to. It bounds every
+	// attribute read a rule-backed strategy performs; the account wildcard is
+	// never a legal value here.
+	Account string
+	// PrincipalKind is the kind of Principal (model.PrincipalKind's spelling —
+	// "user" or "machine"), carried as a string because scope imports no model.
+	// Empty means the engine did not have the principal's record in hand and
+	// declined to buy one; a consumer treats it as unknown, never as a default.
+	PrincipalKind string
+	Principal     string
+	Action        string
 }
 
 // ObjectLister enumerates the object identities of a type, bounded. It is the
@@ -218,9 +235,16 @@ func (noLister) List(context.Context, string, identity.Pattern, int) ([]identity
 // RuleEvaluator decides rule-backed scope membership. It is the seam the
 // rule-driven inclusive/exclusive path consults; Aperture's rules engine
 // satisfies it directly. Selected reports whether object is selected by rule for
-// the given principal/action context.
+// the given account/principal/action context.
+//
+// account and principalKind travel alongside principal because the evaluator
+// builds a rule's evaluation environment from them: the account bounds any
+// attribute lookup the rule performs, and the kind selects which attribute
+// source answers for this principal. They are parameters, not context values,
+// so an implementation that forgets one fails to compile instead of quietly
+// evaluating against an empty account.
 type RuleEvaluator interface {
-	Selected(ctx context.Context, rule string, object identity.Identity, principal, action string) (bool, error)
+	Selected(ctx context.Context, rule string, object identity.Identity, account, principalKind, principal, action string) (bool, error)
 }
 
 // noRules is the default RuleEvaluator: a grant that declares a rule but is
@@ -228,7 +252,7 @@ type RuleEvaluator interface {
 // rather than deciding.
 type noRules struct{}
 
-func (noRules) Selected(context.Context, string, identity.Identity, string, string) (bool, error) {
+func (noRules) Selected(context.Context, string, identity.Identity, string, string, string, string) (bool, error) {
 	return false, aerr.New(aerr.APERTURE_SCOPE_RULE_UNCONFIGURED,
 		"scope: rule-backed membership requires a RuleEvaluator")
 }

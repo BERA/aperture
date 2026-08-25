@@ -346,8 +346,14 @@ an unknown variable, rejected at validation:
 
 - `object` — the object's metadata fields (read-only snapshot from the provider).
 - `principal` — principal attributes; `principal.id` always present. Richer
-  attributes come from a `PrincipalResolver` (`WithPrincipalResolver`).
-- `account` — account attributes (reserved; empty until wired).
+  attributes come from a `PrincipalResolver` (`WithPrincipalResolver`), whose
+  `Attributes(ctx, kind, principal)` receives the principal's kind (`"user"` /
+  `"machine"`, empty = unknown) so one resolver can dispatch per kind. The
+  default floor bag takes the kind and still publishes only `id`.
+- `account` — account attributes (reserved; empty until wired). `Selected` now
+  takes the account, but `Input.Account` stays empty until an account attribute
+  source is wired — the argument travels ahead of its reader on purpose, so the
+  exported signature breaks once rather than twice.
 - `action` — the action verb (a string).
 
 There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per

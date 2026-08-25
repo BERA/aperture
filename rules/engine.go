@@ -48,11 +48,20 @@ type MetadataFetcher interface {
 }
 
 // PrincipalResolver supplies a principal's attribute bag for the evaluation
-// context, keyed by principal id. The default exposes only {"id": principal}; a
-// host wires a richer resolver (roles, account, clearance) when its rules need
-// principal attributes. The returned map is treated as read-only.
+// context, keyed by principal kind and id. The default exposes only
+// {"id": principal}; a host wires a richer resolver (roles, account, clearance)
+// when its rules need principal attributes. The returned map is treated as
+// read-only.
+//
+// kind is model.PrincipalKind's spelling — "user" or "machine" — passed as a
+// string because rules imports no model. It is what lets one resolver dispatch to
+// a different attribute source per kind (a human directory and a service-account
+// registry are rarely the same store) without re-deriving the kind from the id.
+// An empty kind means the caller did not have the principal's record in hand: a
+// resolver treats that as unknown, and must not substitute a default kind, or a
+// machine would silently be answered for out of the human directory.
 type PrincipalResolver interface {
-	Attributes(ctx context.Context, principal string) (map[string]any, error)
+	Attributes(ctx context.Context, kind, principal string) (map[string]any, error)
 }
 
 // Engine is the rules engine: it resolves a rule reference, compiles-and-caches
@@ -152,15 +161,23 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 }
 
 // Selected reports whether object is selected by the named rule for the given
-// principal/action context. It is the scope.RuleEvaluator implementation the
-// rule-backed inclusive/exclusive scope resolvers consult: an inclusive grant
+// account/principal/action context. It is the scope.RuleEvaluator implementation
+// the rule-backed inclusive/exclusive scope resolvers consult: an inclusive grant
 // covers an object Selected reports true for, an exclusive grant excludes one.
 //
 // The flow is: resolve the rule reference, compile-and-cache its AST, fetch the
 // object's metadata, build the context (including the decision's reference
 // instant), and evaluate. Any failure is an APERTURE_* coded error and the
 // resolver treats it as a non-decision — there is no select-on-error.
-func (e *Engine) Selected(ctx context.Context, rule string, object identity.Identity, principal, action string) (bool, error) {
+//
+// account is accepted and not yet read. It is here now, ahead of the account
+// attribute source that will consume it, because the alternative is breaking this
+// exported signature twice: once for the principal's kind and again, later, for
+// the account. One break is cheaper for every host than two, and an argument that
+// is present-but-unread cannot change a decision — an argument absent from the
+// interface is the one that later gets smuggled in through a context value and
+// degrades to an empty account without saying so.
+func (e *Engine) Selected(ctx context.Context, rule string, object identity.Identity, account, principalKind, principal, action string) (bool, error) {
 	r, err := e.source.Lookup(ctx, rule)
 	if err != nil {
 		return false, err
@@ -177,15 +194,19 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 	if err != nil {
 		return false, err
 	}
-	principalAttrs, err := e.principal.Attributes(ctx, principal)
+	principalAttrs, err := e.principal.Attributes(ctx, principalKind, principal)
 	if err != nil {
 		return false, err
 	}
 	in := Input{
 		Object:    metadata,
 		Principal: principalAttrs,
-		Account:   map[string]any{},
-		Action:    action,
+		// Deliberately still empty. The account arrives as an argument now, but
+		// populating account.* from an attribute source is a separate change:
+		// plumbing that also altered what a rule sees would make its own
+		// correctness impossible to test in isolation.
+		Account: map[string]any{},
+		Action:  action,
 		// The reference instant, read from the engine's one clock. Under a
 		// decision scope (the decision engine opens one per Check / Enumerate /
 		// Explain) every evaluation in that decision shares the first instant
@@ -283,8 +304,13 @@ func (e *Engine) Invalidate(n *Node) (bool, error) {
 
 // idOnlyPrincipal is the default PrincipalResolver: it exposes only the
 // principal's id, so a rule can reference principal.id without any host wiring.
+//
+// It takes the kind and ignores it. The floor bag is the "no host wiring" answer,
+// and widening what it publishes would change what an existing rule evaluates to
+// — so the kind reaches this seam first and is published from it separately, by
+// the change that owns that behaviour.
 type idOnlyPrincipal struct{}
 
-func (idOnlyPrincipal) Attributes(_ context.Context, principal string) (map[string]any, error) {
+func (idOnlyPrincipal) Attributes(_ context.Context, _ string, principal string) (map[string]any, error) {
 	return map[string]any{"id": principal}, nil
 }
