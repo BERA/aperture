@@ -73,6 +73,12 @@ session:
   `APERTURE_INVALID_INPUT`, not a deny.
 - Augment resolves over operator ∪ target subjects; become resolves over the
   target alone.
+- A rule-backed scope strategy is told about the **effective subject**: under
+  `become` the rule's `principal.id` is the *target's* id and the *target's* kind
+  picks the attribute slot `principal.*` is read from; under `augment` both are
+  the operator's, because the operator keeps acting under its own identity. The
+  rule and the grant set therefore always describe the same principal — see
+  [Under `become`, `principal.*` is the target](#under-become-principal-is-the-target).
 - The operator **and** the target must both be members of the active account,
   else the decision is a fail-closed deny — cross-account impersonation is
   refused. (`CheckAs`/`ExplainAs` return a deny with no deciding grant;
@@ -81,6 +87,30 @@ session:
   audit. In a `Trace`, `Subjects` is the *effective* subject set while
   `Request.Principal` remains the real operator — so a trace shows both who asked
   and whose authority answered.
+
+### Under `become`, `principal.*` is the target
+
+The subject set and the rule must describe the **same** principal. A decision
+whose grants are the target's and whose rule is about the operator answers a
+question nobody asked, and nothing in a trace reveals it.
+
+| | Subject set | `principal.id` / `principal.*` | `Request.Principal` | `Impersonation.RealActor` |
+|---|---|---|---|---|
+| `augment` | operator ∪ target | **operator** | operator | operator |
+| `become` | target alone | **target** | operator | operator |
+
+`principal.id` therefore *changes meaning* under `become`: a rule comparing
+`principal.id == object.owner` asks whether the **target** owns the object, which
+is what "as if the target had asked" means. The target's kind also picks the
+attribute slot, so `principal.tier` is read from the target's directory.
+
+Audit is unaffected in both modes. `Request.Principal` is still the operator —
+it is what the deny reason names and what a `Trace` records — and
+`Decision.Impersonation` / `Trace.Impersonation` still carry the real actor. The
+rule sees whose authority answered; the audit trail sees who acted.
+
+The change is free: the target's kind arrives with the subject-set expansion a
+`become` decision already performs, so it buys no extra storage read.
 
 ### Inert sessions fail closed
 

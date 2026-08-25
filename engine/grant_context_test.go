@@ -201,49 +201,126 @@ func TestPrincipalKindCostsNoExtraStorageRead(t *testing.T) {
 	}
 }
 
-// TestImpersonatedBecomeReportsAnUnknownKind documents the one place the kind is
-// deliberately absent. Under become, the request still names the operator — a
-// rule-backed strategy is told about the operator, not the target — but the
-// operator's row is never read on that path, only its account membership. The
-// engine reports the kind as unknown rather than substituting the target's, which
-// would describe the wrong principal, or buying a read to answer a question no
-// rule has asked yet.
-func TestImpersonatedBecomeReportsAnUnknownKind(t *testing.T) {
+// enrolOperator adds a machine operator "root" to the grant-context fixture and
+// enrols both principals in the account, which is the precondition for any active
+// impersonation session.
+func enrolOperator(t *testing.T, eng *Engine, target string) {
+	t.Helper()
 	ctx := context.Background()
-	eng, rec := grantContextFixture(t, "alice", model.PrincipalUser)
-
-	// The operator impersonates alice; both must be account members.
 	store := eng.store.(*memory.Store)
 	if err := store.PutPrincipal(ctx, model.Principal{
 		ID: "root", Kind: model.PrincipalMachine, Identity: "machine:root",
 	}); err != nil {
 		t.Fatalf("seed operator: %v", err)
 	}
-	for _, id := range []string{"alice", "root"} {
+	for _, id := range []string{target, "root"} {
 		if err := store.PutMembership(ctx, model.Membership{PrincipalID: id, AccountID: acctAcme}); err != nil {
 			t.Fatalf("membership %s: %v", id, err)
 		}
 	}
+}
 
-	ic := ImpersonationContext{
-		RealActor:        "root",
-		EffectiveSubject: "alice",
-		Mode:             ModeBecome,
-		ExpiresAt:        time.Now().Add(time.Hour),
+// TestImpersonationTellsTheRuleAboutTheEffectiveSubject is E4-S3's whole point,
+// and it REPLACES the earlier TestImpersonatedBecomeReportsAnUnknownKind, whose
+// contract this story deliberately reverses.
+//
+// The old contract reported the operator's id and an EMPTY kind under become: the
+// request names the operator, the operator's row is never read on that path, and
+// substituting the target's kind would have described a principal the rule was not
+// being told about. That reasoning held only while `principal` was `{"id": …}` and
+// nothing read it. Now that the bag carries host attributes, a decision whose
+// grant set is the target's and whose rule describes the operator is an
+// authorization bug that leaves no trace — and an empty kind is worse still, since
+// it picks no attribute slot and hands every rule the floor.
+//
+// So under become the GrantContext carries the TARGET's id and kind, and under
+// augment — where the operator keeps acting as itself — the operator's.
+func TestImpersonationTellsTheRuleAboutTheEffectiveSubject(t *testing.T) {
+	ctx := context.Background()
+	live := time.Now().Add(time.Hour)
+
+	cases := []struct {
+		name     string
+		mode     Mode
+		wantID   string
+		wantKind string
+	}{
+		{"become describes the target", ModeBecome, "alice", "user"},
+		{"augment describes the operator", ModeAugment, "root", "machine"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("check", func(t *testing.T) {
+				eng, rec := grantContextFixture(t, "alice", model.PrincipalUser)
+				enrolOperator(t, eng, "alice")
+				ic := ImpersonationContext{
+					RealActor: "root", EffectiveSubject: "alice", Mode: tc.mode, ExpiresAt: live,
+				}
+				if _, err := eng.CheckAs(ctx, Request{
+					Account: acctAcme, Principal: "root", Action: "read",
+					Object: "account:acme/document:1",
+				}, ic); err != nil {
+					t.Fatalf("CheckAs: %v", err)
+				}
+				assertGrantContext(t, rec.last(t), acctAcme, tc.wantKind, tc.wantID)
+			})
+
+			t.Run("enumerate", func(t *testing.T) {
+				eng, rec := grantContextFixture(t, "alice", model.PrincipalUser)
+				enrolOperator(t, eng, "alice")
+				ic := ImpersonationContext{
+					RealActor: "root", EffectiveSubject: "alice", Mode: tc.mode, ExpiresAt: live,
+				}
+				if _, err := eng.EnumerateAs(ctx, EnumerateRequest{
+					Account: acctAcme, Principal: "root", Action: "read", Pattern: "account:acme/**",
+				}, ic); err != nil {
+					t.Fatalf("EnumerateAs: %v", err)
+				}
+				assertGrantContext(t, rec.last(t), acctAcme, tc.wantKind, tc.wantID)
+			})
+
+			t.Run("explain", func(t *testing.T) {
+				eng, rec := grantContextFixture(t, "alice", model.PrincipalUser)
+				enrolOperator(t, eng, "alice")
+				ic := ImpersonationContext{
+					RealActor: "root", EffectiveSubject: "alice", Mode: tc.mode, ExpiresAt: live,
+				}
+				if _, err := eng.ExplainAs(ctx, Request{
+					Account: acctAcme, Principal: "root", Action: "read",
+					Object: "account:acme/document:1",
+				}, ic); err != nil {
+					t.Fatalf("ExplainAs: %v", err)
+				}
+				assertGrantContext(t, rec.last(t), acctAcme, tc.wantKind, tc.wantID)
+			})
+		})
+	}
+}
+
+// TestTheEffectiveSubjectsKindCostsNoExtraStorageRead is the impersonated twin of
+// TestPrincipalKindCostsNoExtraStorageRead, and it is what makes the story's
+// answer to "what does the target's kind cost?" checkable: nothing. Become expands
+// the TARGET's subject set, so the target's row is already read; the kind was in
+// hand all along and was previously discarded. One GetPrincipal, exactly as
+// before this story.
+func TestTheEffectiveSubjectsKindCostsNoExtraStorageRead(t *testing.T) {
+	ctx := context.Background()
+	eng, _ := grantContextFixture(t, "alice", model.PrincipalUser)
+	enrolOperator(t, eng, "alice")
+
+	counting := &principalCountingStore{Storage: eng.store}
+	eng.store = counting
+
 	if _, err := eng.CheckAs(ctx, Request{
 		Account: acctAcme, Principal: "root", Action: "read", Object: "account:acme/document:1",
-	}, ic); err != nil {
+	}, ImpersonationContext{
+		RealActor: "root", EffectiveSubject: "alice", Mode: ModeBecome,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
 		t.Fatalf("CheckAs: %v", err)
 	}
-	gc := rec.last(t)
-	if gc.Principal != "root" {
-		t.Fatalf("GrantContext.Principal = %q, want the operator", gc.Principal)
-	}
-	if gc.PrincipalKind != "" {
-		t.Errorf("GrantContext.PrincipalKind = %q, want empty (unknown, never the target's)", gc.PrincipalKind)
-	}
-	if gc.Account != acctAcme {
-		t.Errorf("GrantContext.Account = %q, want %q", gc.Account, acctAcme)
+	if got := counting.count(); got != 1 {
+		t.Errorf("GetPrincipal called %d times for one become CheckAs, want exactly 1 "+
+			"(the target's row, which the subject-set expansion already reads)", got)
 	}
 }

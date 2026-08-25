@@ -208,8 +208,15 @@ type GrantContext struct {
 	// Empty means the engine did not have the principal's record in hand and
 	// declined to buy one; a consumer treats it as unknown, never as a default.
 	PrincipalKind string
-	Principal     string
-	Action        string
+	// Principal is the EFFECTIVE subject the decision is being resolved for —
+	// whose authority the grant set describes and whose attributes a rule reads.
+	// On the ordinary path that is the principal that made the request. Under an
+	// impersonation session it is the target in `become` mode and the operator in
+	// `augment` mode, so the grant set and the rule always describe the same
+	// principal; the requesting principal remains the audit identity and never
+	// reaches here. A resolver therefore never has to ask which one it holds.
+	Principal string
+	Action    string
 }
 
 // ObjectLister enumerates the object identities of a type, bounded. It is the

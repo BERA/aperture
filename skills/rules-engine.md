@@ -370,6 +370,16 @@ an unknown variable, rejected at validation:
   `principal.kind == "user" && principal.tier == "gold"`.
   The bag is resolved **once per decision**, not once per object — see "One bag
   per decision".
+  Under an **active impersonation** the root describes the EFFECTIVE subject, not
+  the requesting principal: `become` resolves the target's id and the target's
+  kind (so `principal.*` comes from the target's directory), `augment` the
+  operator's. The rule and the grant set must describe the same principal — a
+  decision resolving the target's grants while reading the operator's attributes
+  is an authorization bug that leaves no mark in a trace. `Request.Principal` and
+  `Decision.Impersonation` still name the real operator, so audit is unaffected;
+  the target's kind costs no extra read (it arrives with the subject-set
+  expansion become already performs). An inert or expired session elevates
+  nothing and reads the operator's own bag.
 - `account` — the **active** account's attributes: the tenancy the decision is
   being made in, never the account a grant is stamped to (a wildcard-stamped
   grant evaluates inside whatever account is active, so reading the stamp would

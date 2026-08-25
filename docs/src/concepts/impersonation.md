@@ -36,6 +36,17 @@ flowchart LR
 Become is **strictly stronger** than augment, and that ordering drives the
 gating rule below.
 
+The mode also decides **whose attributes a rule reads**. A rule-backed
+[scope strategy](scopes.md) evaluates against the *effective subject*: under
+become that is the target — `principal.id` is the target's id and the target's
+kind picks the attribute slot `principal.tier` and friends come from — and under
+augment it is the operator, which is what "keeps acting under its own identity"
+means. The grant set and the rule always describe the same principal; a decision
+that resolved the target's grants while reading the operator's attributes would
+be an authorization bug invisible in a trace. This does not touch the audit
+trail: the real operator is recorded either way (see below). Under become,
+`principal.id` therefore *means the target* — a deliberate change in v0.8.0.
+
 ## Impersonation is a permission — and become needs the stronger right
 
 Like [delegation](delegation.md), impersonation is gated by ordinary grants on
