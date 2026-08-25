@@ -368,6 +368,8 @@ an unknown variable, rejected at validation:
   access in an **exclusive** one, where not-selected means not-excluded. Say the
   dependence out loud:
   `principal.kind == "user" && principal.tier == "gold"`.
+  The bag is resolved **once per decision**, not once per object — see "One bag
+  per decision".
 - `account` — the **active** account's attributes: the tenancy the decision is
   being made in, never the account a grant is stamped to (a wildcard-stamped
   grant evaluates inside whatever account is active, so reading the stamp would
@@ -394,7 +396,8 @@ an unknown variable, rejected at validation:
   undecidable at platform scope, including the ones that never mention `account`
   — and `provider.AttributeRegistry` refuses `"*"` with
   `APERTURE_ATTRIBUTE_PROVIDER_INVALID`, so that refusal is the backstop rather
-  than the mechanism.
+  than the mechanism. Like `principal`, the bag is resolved **once per
+  decision** — see "One bag per decision".
 - `action` — the action verb (a string).
 
 There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per
@@ -469,6 +472,58 @@ output for the same decision.
 **Testing.** Time-dependent tests pin the clock and never assert against
 `time.Now()` — an expectation derived from the real clock only exercises the
 interesting calendar path on the days the calendar happens to cooperate.
+
+## One bag per decision
+
+`object` is legitimately per object — a decision over a thousand objects reads a
+thousand metadata bags, each describing something different. `principal` and
+`account` are not: both are **constant for the whole decision**, so they are
+resolved **once per decision**, exactly as `NOW` is snapshotted once:
+
+```
+PrincipalResolver → DecisionAttributes (scope) → principalBag → Input.Principal
+AccountResolver   → DecisionAttributes (scope) → accountBag   → Input.Account
+```
+
+The decision engine opens the scope (`rules.WithDecisionAttributes`) at the same
+three boundaries it opens `WithDecisionInstant` at — `Check`, `Enumerate`,
+`Explain` — and every evaluation underneath shares the **first** bags resolved.
+Nesting is idempotent, so a per-candidate decision inside an enumeration keeps the
+enumeration's bags. Outside a scope — a host driving `rules.Engine` directly, a
+hand-built `rules.Input` — each evaluation resolves its own, which is the same
+guarantee narrowed to one evaluation. **The scope is never mandatory**; unscoped
+is correct, merely unmemoized.
+
+**It is a correctness property, not only a cost one.** The cost is plain: a
+rule-backed `Enumerate` evaluates its rule twice per candidate, so N objects
+without the scope means 2N principal fetches and 2N account fetches — a host
+round-trip inside a loop, and the `Check` NFR broken outright. The correctness
+half is that an attribute bag is served through a cache **with a TTL**: a TTL
+expiring halfway through an enumeration would judge the first candidates against
+one version of the principal and the last against another, returning a set no
+single view of the principal justifies, with no error anywhere. That is the same
+defect as a decision straddling a tick, and it takes the same fix.
+
+**A memo, not a cache, and not an injection point.** It holds ONE principal bag
+and ONE account bag rather than a map of them, so it cannot grow with what a
+decision looks at and it dies with the request. There is no API for a caller to
+supply a bag: the value always comes from the engine's resolver, for the reason
+there is no API to supply an instant. It is also **keyed** — it records which
+subject each bag was resolved for and re-resolves on a mismatch — so a scope that
+travels somewhere its author did not picture cannot serve one principal's
+attributes as another's; the failure mode is a re-fetch, which is correct and
+slow. **Failures are not memoized**: a directory that blinks is retried, and what
+a failure means to a decision stays the resolver's contract.
+
+**Read-only, and more so than before.** A resolved bag was always read-only
+transitively; memoizing widens who holds it to *every evaluation in the decision*,
+on top of every concurrent decision for the same key through the provider's
+cache. One write at any depth is therefore every rule, for every object, in every
+in-flight decision for that subject. The engine stamps the floor into a **fresh**
+map (`principalBag` / `accountBag`) and never into the resolver's.
+
+A decision at the account wildcard resolves no account bag at all — `"*"` never
+reaches a resolver — so there is nothing to memoize there.
 
 ## Missing fields: nested access is nil-safe, but `nin` grants
 

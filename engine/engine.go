@@ -530,6 +530,12 @@ func (e *Engine) evaluate(ctx context.Context, req Request, principalKind string
 	// already opened a scope for the enumeration keeps ITS instant across every
 	// per-candidate decision rather than taking a fresh one each time.
 	ctx, _ = rules.WithDecisionInstant(ctx)
+	// One principal bag and one account bag for the whole decision, for the same
+	// reason and with the same idempotence: the principal asking and the tenancy
+	// it is asking in do not change between two grants, and a bag re-resolved
+	// mid-decision could come back different (an attribute cache expires on a
+	// TTL) and decide two grants against two views of the same principal.
+	ctx, _ = rules.WithDecisionAttributes(ctx)
 
 	candidates := make([]candidate, 0, len(grants))
 	for _, g := range grants {

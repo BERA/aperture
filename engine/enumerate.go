@@ -168,6 +168,14 @@ func (e *Engine) enumerateWithSubjects(ctx context.Context, req EnumerateRequest
 	// enumeration would otherwise straddle a tick and return a set no single
 	// instant justifies.
 	ctx, _ = rules.WithDecisionInstant(ctx)
+	// One principal bag and one account bag for the WHOLE enumeration. This is the
+	// widest fan-out Aperture has — without the scope, an N-object enumeration
+	// resolves the same principal N times and the same account N times, putting a
+	// host round-trip inside the candidate loop — and it is a correctness scope as
+	// much as a cost one: an attribute cache expiring mid-enumeration would judge
+	// the first candidates against one view of the principal and the last against
+	// another, returning a set no single view justifies.
+	ctx, _ = rules.WithDecisionAttributes(ctx)
 
 	grants, err := e.store.GrantsForSubjects(ctx, req.Account, subjects)
 	if err != nil {

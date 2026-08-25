@@ -210,6 +210,11 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, principal
 	// grant against one instant and its last against another — and the recorded
 	// Now would then be true of only part of the report.
 	ctx, instant := rules.WithDecisionInstant(ctx)
+	// One principal bag and one account bag for the whole trace, for the reason
+	// the instant is one: a trace that derived its first grant from one view of
+	// the principal and its last from another would be a report of a decision
+	// nothing ever made.
+	ctx, _ = rules.WithDecisionAttributes(ctx)
 
 	grants, err := e.store.GrantsForSubjects(ctx, req.Account, subjects)
 	if err != nil {

@@ -359,11 +359,17 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 	if err != nil {
 		return false, err
 	}
-	principalAttrs, err := e.principal.Attributes(ctx, principalKind, principal)
+	// The decision's attribute memo, or nil when this evaluation is unscoped.
+	// Both lookups below go through it, so under a decision scope the principal
+	// and the account are resolved ONCE for the whole decision however many
+	// objects and rules it evaluates, and every evaluation sees the same two
+	// bags. Unscoped, each resolves its own. See attributes.go.
+	attrs := decisionAttributesFrom(ctx)
+	principalAttrs, err := attrs.principalAttributes(ctx, e.principal, principalKind, principal)
 	if err != nil {
 		return false, err
 	}
-	accountAttrs, err := e.accountAttributes(ctx, account)
+	accountAttrs, err := e.accountAttributes(ctx, attrs, account)
 	if err != nil {
 		return false, err
 	}
@@ -477,11 +483,14 @@ func (e *Engine) metadata(ctx context.Context, object identity.Identity) (map[st
 // APERTURE_ATTRIBUTE_PROVIDER_INVALID, so a caller that DOES reach a fetch with
 // it gets a diagnostic rather than a bag. This short-circuit is what keeps that
 // refusal a backstop instead of the mechanism.
-func (e *Engine) accountAttributes(ctx context.Context, account string) (map[string]any, error) {
+// The short-circuit is also why the memo (attrs, nil when unscoped) is consulted
+// only past it: a wildcard decision resolves nothing, so there is nothing to
+// memoize and DecisionAttributes.Account reports that no bag was taken.
+func (e *Engine) accountAttributes(ctx context.Context, attrs *DecisionAttributes, account string) (map[string]any, error) {
 	if account == accountWildcard {
 		return nil, nil
 	}
-	return e.account.AccountAttributes(ctx, account)
+	return attrs.accountAttributes(ctx, e.account, account)
 }
 
 // CacheStats exposes the compiled-rule cache counters for observability and the
