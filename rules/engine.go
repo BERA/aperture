@@ -2,6 +2,7 @@ package rules
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
@@ -48,10 +49,16 @@ type MetadataFetcher interface {
 }
 
 // PrincipalResolver supplies a principal's attribute bag for the evaluation
-// context, keyed by principal kind and id. The default exposes only
-// {"id": principal}; a host wires a richer resolver (roles, account, clearance)
-// when its rules need principal attributes. The returned map is treated as
-// read-only.
+// context, keyed by principal kind and id. A host wires one (a directory, a
+// *provider.AttributeRegistry) when its rules need principal attributes; without
+// one, `principal` is exactly the floor bag. The returned map is treated as
+// read-only, transitively — the engine copies it rather than writing into it,
+// and no other holder writes to it at any depth.
+//
+// A resolver returns ONLY what the host knows. It does not need to publish `id`
+// or `kind`: the engine stamps the floor over whatever comes back (see
+// principalBag), so a resolver that returns nil is not an error and not an empty
+// `principal` — it is the floor.
 //
 // kind is model.PrincipalKind's spelling — "user" or "machine" — passed as a
 // string because rules imports no model. It is what lets one resolver dispatch to
@@ -62,6 +69,60 @@ type MetadataFetcher interface {
 // machine would silently be answered for out of the human directory.
 type PrincipalResolver interface {
 	Attributes(ctx context.Context, kind, principal string) (map[string]any, error)
+}
+
+// The floor keys. `principal` always carries these two, whatever resolver is
+// wired and whether or not it answered.
+const (
+	principalKeyID   = "id"
+	principalKeyKind = "kind"
+)
+
+// principalBag builds the `principal` root: a FRESH map holding the resolver's
+// attributes with the floor — id and kind — stamped over them.
+//
+// # Why the floor is the engine's job, not the resolver's
+//
+// Every resolver gets it, including a host's own. A rule author can therefore
+// write principal.id and principal.kind against ANY deployment, wired or not,
+// which is the whole point of a floor: it is the part of `principal` that does
+// not depend on what the host happened to configure.
+//
+// # Why `kind` is published at all
+//
+// Attribute providers are registered PER KIND, so a rule that reads a user
+// directory's field is silently kind-dependent: for a machine principal that
+// field is simply absent and the comparison is false. In an inclusive grant that
+// is deny-safe; in an EXCLUSIVE one — where selection means "excluded" — a rule
+// that quietly stops selecting WIDENS access. principal.kind is the tool an
+// author needs to say which kinds a rule is about, so
+// `principal.kind == "user" && principal.tier == "gold"` states the dependence
+// instead of hiding it.
+//
+// # Why the floor wins on collision
+//
+// The floor is stamped LAST, so a host bag carrying its own "id" or "kind" key
+// cannot shadow it. Not primarily as a defence — a directory is host-trusted
+// infrastructure — but because the realistic collision is innocent: a directory
+// with its own internal `id` column would silently redefine what
+// `principal.id == object.owner` compares, and an ownership rule would start
+// answering a different question with no error anywhere. A floor that can be
+// shadowed is not a floor.
+//
+// # Why a fresh map
+//
+// bag may be a cached attribute bag, shared across every object in this decision
+// and every concurrent decision for the same principal. Stamping into it would
+// be a write through a read-only value at the widest blast radius Aperture has.
+func principalBag(bag map[string]any, kind, principal string) map[string]any {
+	out := make(map[string]any, len(bag)+2)
+	maps.Copy(out, bag)
+	out[principalKeyID] = principal
+	// Published even when empty. An unknown kind is a value a rule can compare
+	// against ("" matches neither "user" nor "machine"); an ABSENT key would make
+	// "unknown" and "not published by this build" the same observation.
+	out[principalKeyKind] = kind
+	return out
 }
 
 // Engine is the rules engine: it resolves a rule reference, compiles-and-caches
@@ -126,7 +187,9 @@ func WithClock(clk Clock) Option {
 }
 
 // WithPrincipalResolver supplies principal attributes to the evaluation context.
-// Without it, principal exposes only its id.
+// Without it, `principal` is the floor bag alone: its id and its kind. A
+// *provider.AttributeRegistry is wired straight in here — it resolves the
+// principal's kind to an attribute slot and fetches through that slot's provider.
 func WithPrincipalResolver(r PrincipalResolver) Option {
 	return func(c *engineConfig) { c.principal = r }
 }
@@ -140,7 +203,7 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	var principal PrincipalResolver = idOnlyPrincipal{}
+	var principal PrincipalResolver = floorPrincipal{}
 	if cfg.principal != nil {
 		principal = cfg.principal
 	}
@@ -199,8 +262,10 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 		return false, err
 	}
 	in := Input{
-		Object:    metadata,
-		Principal: principalAttrs,
+		Object: metadata,
+		// The resolver's answer with the floor stamped over it, in a fresh map —
+		// the resolver's bag may be cached and shared, and is read-only.
+		Principal: principalBag(principalAttrs, principalKind, principal),
 		// Deliberately still empty. The account arrives as an argument now, but
 		// populating account.* from an attribute source is a separate change:
 		// plumbing that also altered what a rule sees would make its own
@@ -302,15 +367,15 @@ func (e *Engine) Invalidate(n *Node) (bool, error) {
 	return e.cache.invalidate(hashSource(src)), nil
 }
 
-// idOnlyPrincipal is the default PrincipalResolver: it exposes only the
-// principal's id, so a rule can reference principal.id without any host wiring.
+// floorPrincipal is the default PrincipalResolver: it contributes NOTHING, so an
+// unwired engine's `principal` is exactly the floor the engine stamps — id and
+// kind (see principalBag).
 //
-// It takes the kind and ignores it. The floor bag is the "no host wiring" answer,
-// and widening what it publishes would change what an existing rule evaluates to
-// — so the kind reaches this seam first and is published from it separately, by
-// the change that owns that behaviour.
-type idOnlyPrincipal struct{}
+// It returns nil rather than the floor map itself so there is exactly one
+// definition of what the floor is. A default that built its own copy would be a
+// second definition, free to drift from the one every host resolver gets.
+type floorPrincipal struct{}
 
-func (idOnlyPrincipal) Attributes(_ context.Context, _ string, principal string) (map[string]any, error) {
-	return map[string]any{"id": principal}, nil
+func (floorPrincipal) Attributes(context.Context, string, string) (map[string]any, error) {
+	return nil, nil
 }

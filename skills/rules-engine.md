@@ -345,11 +345,29 @@ The expression environment exposes four roots; a variable under any other root i
 an unknown variable, rejected at validation:
 
 - `object` — the object's metadata fields (read-only snapshot from the provider).
-- `principal` — principal attributes; `principal.id` always present. Richer
-  attributes come from a `PrincipalResolver` (`WithPrincipalResolver`), whose
+- `principal` — principal attributes. The **floor** is `{id, kind}` and the engine
+  stamps it over every resolver's answer, so both are always present and a host
+  bag carrying its own `id` / `kind` key cannot shadow them (a directory with an
+  internal `id` column would otherwise silently redefine what
+  `principal.id == object.owner` compares). Richer attributes come from a
+  `PrincipalResolver` (`WithPrincipalResolver`), whose
   `Attributes(ctx, kind, principal)` receives the principal's kind (`"user"` /
-  `"machine"`, empty = unknown) so one resolver can dispatch per kind. The
-  default floor bag takes the kind and still publishes only `id`.
+  `"machine"`, empty = unknown) so one resolver can dispatch per kind; it returns
+  the host's bag alone, and `nil` is a complete answer.
+  A `*provider.AttributeRegistry` is wired straight in: the kind picks the
+  attribute **slot** (`user` → the user slot, `machine` → the machine slot;
+  `"account"` is a slot but not a principal kind, so it never resolves here). A
+  slot with **no registered provider** — and a registered provider with no record
+  for the key — yields the floor and **no error**, so a deployment with a human
+  directory and no machine directory keeps deciding. Any other failure surfaces
+  verbatim and the resolver treats it as a non-decision: an outage must not read
+  as "this principal has no attributes".
+  `principal.kind` exists because per-kind providers make a rule silently
+  kind-dependent — a rule written against the user directory reads nothing for a
+  machine principal, which denies safely in an **inclusive** grant but **widens**
+  access in an **exclusive** one, where not-selected means not-excluded. Say the
+  dependence out loud:
+  `principal.kind == "user" && principal.tier == "gold"`.
 - `account` — account attributes (reserved; empty until wired). `Selected` now
   takes the account, but `Input.Account` stays empty until an account attribute
   source is wired — the argument travels ahead of its reader on purpose, so the

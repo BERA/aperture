@@ -199,8 +199,7 @@ func (f principalResolverFunc) Attributes(ctx context.Context, kind, principal s
 // TestEnginePassesThePrincipalKindToTheResolver is the compile-honest half of the
 // signature change made observable: the kind is threaded from Selected's argument
 // list to the resolver, so a host that dispatches per kind gets the right source.
-// The default floor bag deliberately does NOT publish it — widening what an
-// unwired engine exposes would change what an existing rule evaluates to.
+// The floor bag publishes it too, so a rule can branch on it with no host wiring.
 func TestEnginePassesThePrincipalKindToTheResolver(t *testing.T) {
 	source := MapSource{"any": {AST: Compare(OpEq, Var("principal.id"), Lit("svc-1"))}}
 	var seen string
@@ -218,12 +217,17 @@ func TestEnginePassesThePrincipalKindToTheResolver(t *testing.T) {
 		t.Errorf("resolver saw kind %q, want %q", seen, "machine")
 	}
 
-	// The floor resolver takes the kind and publishes only the id.
-	bag, err := idOnlyPrincipal{}.Attributes(context.Background(), "machine", "svc-1")
+	// The default resolver contributes nothing; the floor is the engine's, and it
+	// is exactly {id, kind}.
+	contributed, err := floorPrincipal{}.Attributes(context.Background(), "machine", "svc-1")
 	if err != nil {
-		t.Fatalf("idOnlyPrincipal.Attributes: %v", err)
+		t.Fatalf("floorPrincipal.Attributes: %v", err)
 	}
-	if len(bag) != 1 || bag["id"] != "svc-1" {
-		t.Errorf("floor bag = %v, want only the id", bag)
+	if len(contributed) != 0 {
+		t.Errorf("the default resolver contributed %v, want nothing", contributed)
+	}
+	bag := principalBag(contributed, "machine", "svc-1")
+	if len(bag) != 2 || bag["id"] != "svc-1" || bag["kind"] != "machine" {
+		t.Errorf("floor bag = %v, want exactly {id, kind}", bag)
 	}
 }

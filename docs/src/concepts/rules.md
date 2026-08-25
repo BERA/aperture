@@ -77,7 +77,7 @@ anything else is an unknown variable:
 | Root | Type | Contents |
 |---|---|---|
 | `object` | map | the object's metadata snapshot (host-defined fields, e.g. `object.classification`) |
-| `principal` | map | the principal's attribute bag (e.g. `principal.tier`); default exposes only `principal.id` |
+| `principal` | map | the principal's attribute bag (e.g. `principal.tier`); the floor `{id, kind}` is always present |
 | `account` | map | account attributes |
 | `action` | string | the action verb (`action == "read"`) |
 
@@ -469,13 +469,59 @@ in-memory default; a missing reference yields `APERTURE_RULE_NOT_FOUND`) and a
 [provider registry](providers.md) wires in directly as the object-metadata
 source without the rules package importing `provider`). An optional
 `PrincipalResolver` supplies principal attributes, keyed by
-`Attributes(ctx, kind, principal)`; the default exposes only `principal.id`, and
-takes the kind without publishing it. The `kind` is `model.PrincipalKind`'s
+`Attributes(ctx, kind, principal)`. A resolver returns the **host's bag alone**;
+returning `nil` is a complete answer, because the engine stamps the floor over
+whatever comes back. The `kind` is `model.PrincipalKind`'s
 spelling (`"user"` / `"machine"`) carried as a string, so one resolver can
 dispatch to a different attribute source per kind — a human directory and a
 service-account registry are rarely the same store. An **empty** kind means the
 caller did not have the principal's record in hand: treat it as unknown, never
 as a default, or a machine gets answered for out of the human directory.
+
+### The floor bag, and `principal.kind`
+
+`principal` always carries `{id, kind}`, whatever is wired. The floor is stamped
+**last**, so a host bag with its own `id` or `kind` key cannot shadow it — the
+realistic collision is innocent (a directory with an internal `id` column), and a
+floor that can be shadowed silently changes what `principal.id == object.owner`
+compares. An unknown kind is published as the empty string rather than omitted,
+so "unknown" is a value a rule can compare against.
+
+`kind` is published because attribute providers are registered **per kind**,
+which makes a rule silently kind-dependent: a rule reading the user directory
+finds nothing for a machine principal. In an **inclusive** grant that denies
+safely; in an **exclusive** one — where being selected means being *excluded* — a
+rule that quietly stops selecting **widens** access. `principal.kind` is how an
+author states the dependence instead of hiding it:
+
+```text
+principal.kind == "user" && principal.tier == "gold"
+```
+
+### Wiring a `*provider.AttributeRegistry`
+
+A `provider.AttributeRegistry` — the host seam that maps each of the three
+attribute slots (`user`, `machine`, `account`) to a provider plus a per-slot
+cache — is a `PrincipalResolver` as it stands, structurally, with `provider`
+importing nothing from `rules`:
+
+```go
+attrs := provider.NewAttributeRegistry()
+attrs.MustRegister(provider.AttributeSlotUser, userDirectory)
+eng := rules.NewEngine(source, objects, rules.WithPrincipalResolver(attrs))
+```
+
+The kind picks the **slot**: `"user"` resolves the user slot, `"machine"` the
+machine slot. `"account"` is a real slot but is **not** a principal kind, so it
+never resolves here — a tenant's bag must never be served as a principal's.
+
+A **missing source is not a failed decision**. A slot with no registered
+provider, and a registered provider with no record for the key, both yield the
+floor and no error, so a deployment with a human directory and no machine
+directory keeps deciding normally. Everything else — an unreachable directory, a
+bag the value model rejects — surfaces verbatim with its code and fixups intact
+and is treated as a non-decision, because an outage must not read as "this
+principal has no attributes".
 
 `Engine.Selected(ctx, rule, object, account, principalKind, principal, action)`
 is the full path:
@@ -483,7 +529,9 @@ is the full path:
 1. resolve the rule reference through the `RuleSource`;
 2. compile-and-cache its AST;
 3. fetch the object's metadata (empty when no fetcher is configured);
-4. resolve the principal's attributes for its kind;
+4. resolve the principal's attributes for its kind, and stamp the floor over them
+   into a fresh map (the resolver's bag may be cached and shared, and is
+   read-only, transitively);
 5. build the `Input` and evaluate.
 
 `account` is accepted and **not yet read** — `Input.Account` is still the empty

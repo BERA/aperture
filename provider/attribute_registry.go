@@ -282,6 +282,78 @@ func (r *AttributeRegistry) Enumerate(ctx context.Context, slot AttributeSlot, f
 	return out, nil
 }
 
+// principalSlot maps a PRINCIPAL KIND to the slot that serves it. It is a
+// deliberately narrower door than ParseAttributeSlot: only user and machine are
+// principal kinds, and "account" — a real slot — is not one.
+//
+// Routing a principal fetch through ParseAttributeSlot would let the string
+// "account" resolve the ACCOUNT directory and serve a tenant's bag as a
+// principal's. There is no caller that wants that, so the mapping that makes it
+// expressible does not exist. An unrecognised or empty kind reports false rather
+// than defaulting: a machine answered for out of the human directory is exactly
+// the substitution PrincipalResolver's contract forbids.
+func principalSlot(kind string) (AttributeSlot, bool) {
+	switch AttributeSlot(kind) {
+	case AttributeSlotUser:
+		return AttributeSlotUser, true
+	case AttributeSlotMachine:
+		return AttributeSlotMachine, true
+	default:
+		return "", false
+	}
+}
+
+// Attributes resolves a principal's attribute bag by KIND, so a user principal
+// is answered from the user slot and a machine principal from the machine slot.
+//
+// Its signature is rules.PrincipalResolver's, so an *AttributeRegistry is handed
+// straight to rules.WithPrincipalResolver — structurally, without this package
+// importing rules (provider imports only identity and errors). That direction is
+// the same one *Registry already satisfies rules.MetadataFetcher in.
+//
+// It returns the host's bag alone. The `id` and `kind` a rule reads off
+// `principal` are the rules engine's floor, stamped over whatever comes back —
+// this method never invents them, and a nil return is the correct, complete
+// answer for "the host knows nothing about this principal".
+//
+// # Leniency, and its one deliberate limit
+//
+// A missing SOURCE is not a failed decision. Two cases yield a nil bag and no
+// error:
+//
+//   - the kind names no principal slot (an empty kind is the live case — a
+//     decision path that never had the principal's record in hand), and
+//   - the slot has no registered provider (APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED),
+//     or a registered one has no record for this key (APERTURE_NOT_FOUND).
+//
+// A deployment that wires a user directory and no machine directory must keep
+// deciding, and it does: its machine principals evaluate against the floor. This
+// mirrors internal/cli's lenientFetcher, which collapses the same two codes for
+// object metadata and for the same reason — an absent source must not become a
+// non-decision.
+//
+// Everything else — a directory that is unreachable, a bag the value model
+// rejects — surfaces VERBATIM, keeping its code and its registry fixups, and the
+// caller treats it as a non-decision. An outage must not read as "this principal
+// has no attributes", because that is an authorization change wearing an
+// infrastructure failure's clothes.
+func (r *AttributeRegistry) Attributes(ctx context.Context, kind, principal string) (map[string]any, error) {
+	slot, ok := principalSlot(kind)
+	if !ok {
+		return nil, nil
+	}
+	md, err := r.Fetch(ctx, slot, principal)
+	if err != nil {
+		switch aerr.CodeOf(err) {
+		case aerr.APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED, aerr.APERTURE_NOT_FOUND:
+			return nil, nil
+		default:
+			return nil, err
+		}
+	}
+	return md, nil
+}
+
 // Stats returns the cache counters for slot, or false when the slot has no
 // registered provider. The counters are per slot and never pooled: a user
 // directory's hit rate says nothing about an account cache's, and one number
