@@ -1,8 +1,10 @@
 # CLAUDE.md — Aperture
 
-Conventions catalog for `github.com/frankbardon/aperture`. Authority order:
-`.planning/access-control/context.md` > `.planning/access-control/brief.md` >
-this file > the orbit/pulse reference repos.
+Conventions catalog for `github.com/frankbardon/aperture`. **This file is the
+authority.** It supersedes the per-effort planning artifacts under `.planning/`,
+which are story scratch and must never be cited as conventions — several of them
+predate decisions this file records (the Pulse dependency, SQLite-only storage).
+Where this file is silent, `skills/*.md` and `docs/src/` govern.
 
 ## Project overview
 
@@ -224,6 +226,56 @@ Gated, NOT in `make test` (a loaded runner would flake them):
   of `APERTURE_PG_INTEGRATION` also fails rather than skipping. `make test`
   cannot prove this backend behaves — only that it has not fallen behind its
   twin (the parity gates above).
+
+## House rules not derivable from the code
+
+These are conventions a reader cannot infer by reading the repo, so they are
+written down here rather than rediscovered.
+
+### Commits
+
+`<type>(<effort-slug>/<epic>-<story>): <sentence-case subject>`
+
+```
+feat(schema-time-and-keys/E4-S2): two processes can boot against one database
+fix(schema-time-and-keys/E3-S1): every service and delegation delete path survives RESTRICT
+test(schema-time-and-keys/E5-S2): a dialect cannot drift from its twin
+docs(schema-time-and-keys/E6-S1): the schema, time and key contracts get a permanent home
+```
+
+Types in use: `feat`, `fix`, `test`, `docs`, `refactor`. When an epic closes, a
+`milestone` commit records the slice:
+
+```
+milestone(schema-time-and-keys/E5): vertical slice complete — Guardrails that keep the dialects honest
+```
+
+Subjects are declarative sentences about what is now true, not imperatives about
+what was done.
+
+### Security non-negotiables
+
+- **Account isolation is a hard line.** Account-scoped grants — bestowed or
+  direct — must never leak across a principal that belongs to several accounts.
+  The lone deliberate exception is `model.AccountWildcard`.
+- **Authentication is always external.** Aperture consumes credentials and never
+  issues them. `auth/` ships an OIDC/JWT verifier, a Parsec broker adapter, and a
+  dev/static authenticator (bearer token = principal id, for local use only).
+- **The MCP surface is read + decide + simulate only** — no mutations, ever.
+- **No cross-account data in error messages.**
+
+### Frontend
+
+No node build pipeline in development or CI. Everything under
+`internal/server/static/vendor/` is a committed pre-built blob, `//go:embed`-ed,
+so the binary ships self-contained. Visual conventions — including the
+load-bearing "AI-pink is reserved for AI affordances" and "no emoji" rules — are
+in [`docs/src/contributing/design-system.md`](docs/src/contributing/design-system.md).
+
+### Example domain
+
+Fixtures, tests, docs, and demos use one generic hierarchy: `org → project →
+document`, spelled `account:acme/project:atlas/document:42`.
 
 ## What NOT to do
 

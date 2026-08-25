@@ -73,5 +73,6 @@
 - [Development setup](contributing/development-setup.md)
 - [Build, test & lint gates](contributing/gates.md)
 - [Style & testing conventions](contributing/conventions.md)
+- [Admin UI design system](contributing/design-system.md)
 - [Regenerating artifacts](contributing/regenerating-artifacts.md)
 - [Pull requests](contributing/pull-requests.md)
