@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/frankbardon/aperture/csvprovider"
 	aerr "github.com/frankbardon/aperture/errors"
 	"github.com/frankbardon/aperture/provider"
 )
@@ -215,11 +216,11 @@ type attributeSource struct {
 // attributeSourceOpener turns one resolved entry into the live
 // provider.AttributeProvider that serves its slot.
 //
-// It is the seam the loader adapters plug into: E3-S2 fills in the kind: csv
-// arm (an adapter over csvprovider) and E3-S3 the kind: sql arm (an adapter over
-// sqlprovider). Everything ABOVE the seam — the block, its validation, the
-// connection lookup, the slot precedence, the cache options — is settled here
-// and does not move when they land.
+// It is the seam the loader adapters plug into: the kind: csv arm is an adapter
+// over csvprovider, and the kind: sql arm is E3-S3's over sqlprovider.
+// Everything ABOVE the seam — the block, its validation, the connection lookup,
+// the slot precedence, the cache options — is settled here and does not move
+// when a loader lands.
 //
 // It is unexported on purpose. WithConnectionOpener is exported because a host
 // legitimately owns its database handles; a host that owns its attribute SOURCE
@@ -246,15 +247,34 @@ func openAttributeSource(src attributeSource) (provider.AttributeProvider, error
 }
 
 // csvAttributeSource builds the file-backed attribute provider for a kind: csv
-// entry.
+// entry, from the absolute path resolveAttributeSource already made.
 //
-// The adapter it needs — a csvprovider reader whose id column holds BARE subject
-// ids rather than identities — is E3-S2's, and until that lands this arm refuses
-// rather than pretending. The refusal is a build-time error naming the slot, so
-// a document declaring the kind cannot boot into a deployment where the slot
-// silently answers nothing.
+// The file is read HERE, not on the first decision that needs it, so a malformed
+// one is a coded error at build naming the file and the row. An attribute bag is
+// read by every rule against every object in a decision, so an unreadable file
+// is not one object type failing to answer — it is every decision for the slot —
+// and boot is where the operator is present to fix it.
+//
+// The error passes through verbatim. csvprovider's rejections are already coded
+// and already say which file, which line, and which column is wrong;
+// re-stamping to add the subject would trade APERTURE_METADATA_INVALID's fixups
+// (or APERTURE_ATTRIBUTE_PROVIDER_INVALID's) for a generic code, or, at the same
+// code, bury the real one a layer deeper. The slot is one grep away in the seed
+// file; the offending cell is not.
+//
+// Nothing here re-derives what the block settled: id_column: is not consulted,
+// because it names a result column of a kind: sql get_all — a CSV's id column is
+// spelled "id", the same spelling an object CSV uses.
 func csvAttributeSource(src attributeSource) (provider.AttributeProvider, error) {
-	return nil, unwiredAttributeKind(src)
+	impl, err := csvprovider.NewAttributes(src.Path)
+	if err != nil {
+		if aerr.CodeOf(err) != "" {
+			return nil, err
+		}
+		return nil, aerr.Wrapf(aerr.APERTURE_CONFIG_INVALID, err,
+			"seed: csv attribute provider for subject %q cannot be loaded", src.Slot)
+	}
+	return impl, nil
 }
 
 // sqlAttributeSource builds the database-backed attribute provider for a kind:

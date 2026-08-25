@@ -10,6 +10,22 @@
 //	reg.MustRegister("app",   csvprovider.New("apps.csv"),   provider.WithTTL(0))
 //	// swapping to a database later changes only these two lines.
 //
+// # Two seams, one file format
+//
+// The same file format also serves the ATTRIBUTE seam: Attributes
+// (attributes.go) is a provider.AttributeProvider for one attribute slot, built
+// from a file whose id column holds BARE subject ids rather than identities.
+//
+//	attrs, err := csvprovider.NewAttributes("users.csv")
+//	areg.MustRegister(provider.AttributeSlotUser, attrs, provider.WithTTL(0))
+//
+// Everything documented below — the header grammar, the type suffixes, the
+// coercions, the empty-cell policy, the errors — is the shared value model's
+// spelling and holds identically for both, because both read through one walk
+// (parseTable). One model, one spelling, whether the row describes a document or
+// a user. The id column is where the two differ, and only there; see the
+// Attributes type doc.
+//
 // # File shape
 //
 // The first row is a header. One column MUST be named "id" and holds each
@@ -415,8 +431,43 @@ func parseFile(path string) (map[string]provider.Metadata, []identity.Identity, 
 }
 
 // parse reads a whole CSV document into an id-keyed metadata map plus the file's
-// id order.
+// id order. It is parseTable keyed the OBJECT way — see objectKey.
 func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, error) {
+	return parseTable(r, objectKey)
+}
+
+// objectKey is the object seam's row key: the id cell is a canonical IDENTITY,
+// and a malformed one passes through as the identity package's
+// APERTURE_IDENTITY_INVALID rather than being reclassified here.
+func objectKey(raw string, _ int) (identity.Identity, string, error) {
+	id, err := identity.Parse(raw)
+	if err != nil {
+		return identity.Identity{}, "", err
+	}
+	return id, id.String(), nil
+}
+
+// rowKey turns one row's raw id cell into the key its seam indexes by, plus the
+// canonical STRING that keys the metadata map. The two differ because the object
+// seam is ordered by identity.Identity while its map is keyed by that identity's
+// canonical text, and the attribute seam's key is a bare string that is both.
+//
+// It also decides what a legal key IS for the seam, which is the whole reason
+// this indirection exists: an object id is an identity and is parsed, an
+// attribute key is an opaque handle and is not (see attributes.go).
+type rowKey[K any] func(raw string, line int) (K, string, error)
+
+// parseTable is the ONE CSV walk, shared by both seams this package serves.
+//
+// Everything below the key — the header, the type suffixes, the coercions, the
+// list/json/date rules, the value-model check, the empty-cell policy — is the
+// value model's spelling and is identical whether the row describes a document
+// or a user. There is one model and one spelling, so there is one walk; the seam
+// supplies only how a row is KEYED.
+//
+// Errors name the line, and the row's own key rejection is returned verbatim so
+// its code and its fixups survive.
+func parseTable[K any](r io.Reader, keyOf rowKey[K]) (map[string]provider.Metadata, []K, error) {
 	cr := csv.NewReader(r)
 	cr.TrimLeadingSpace = true
 	rows, err := cr.ReadAll()
@@ -435,7 +486,7 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 	}
 
 	byID := make(map[string]provider.Metadata, len(rows)-1)
-	order := make([]identity.Identity, 0, len(rows)-1)
+	order := make([]K, 0, len(rows)-1)
 	for i, row := range rows[1:] {
 		line := i + 2 // 1-based, past the header
 		if len(row) != len(header) {
@@ -448,11 +499,15 @@ func parse(r io.Reader) (map[string]provider.Metadata, []identity.Identity, erro
 			return nil, nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
 				"csvprovider: row has an empty id", map[string]any{"line": line})
 		}
-		id, err := identity.Parse(rawID)
+		id, key, err := keyOf(rawID, line)
 		if err != nil {
-			return nil, nil, err // passes through APERTURE_IDENTITY_INVALID
+			// Verbatim: the seam's key rejection already carries the code whose
+			// fixups the author needs (APERTURE_IDENTITY_INVALID for an object,
+			// APERTURE_ATTRIBUTE_PROVIDER_INVALID for an attribute key that names
+			// nobody), and re-stamping it here would replace the remedy with this
+			// package's generic one.
+			return nil, nil, err
 		}
-		key := id.String()
 		if _, dup := byID[key]; dup {
 			return nil, nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
 				"csvprovider: duplicate id", map[string]any{"line": line, "id": key})
