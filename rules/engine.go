@@ -71,12 +71,100 @@ type PrincipalResolver interface {
 	Attributes(ctx context.Context, kind, principal string) (map[string]any, error)
 }
 
+// AccountResolver supplies the ACTIVE account's attribute bag for the evaluation
+// context — the tenant's plan, region, feature flags a rule reads off `account`.
+// A host wires one (a *provider.AttributeRegistry) when its rules need account
+// attributes; without one, `account` is exactly the floor bag. The returned map
+// is treated as read-only, transitively — the engine copies it rather than
+// writing into it, and no other holder writes to it at any depth.
+//
+// Like PrincipalResolver it returns ONLY what the host knows: the `id` a rule
+// reads off `account` is the engine's floor, stamped over whatever comes back
+// (see accountBag), so a resolver that returns nil is not an error and not an
+// empty `account` — it is the floor.
+//
+// # Why the method is not called Attributes
+//
+// So that ONE type can satisfy both seams. A *provider.AttributeRegistry serves
+// the principal slots and the account slot, and Go has no overloading: reusing
+// the name would force a host to wire two objects, or to wrap one, where the
+// registry already holds both directories and both caches. The distinct name is
+// what keeps `rules.WithPrincipalResolver(reg)` and
+// `rules.WithAccountResolver(reg)` the same reg.
+//
+// # The wildcard is not an account
+//
+// account is a concrete account id. The account wildcard "*" never reaches a
+// resolver — the engine resolves it to the floor without consulting one (see
+// Engine.accountAttributes) — so an implementation never has to decide what
+// "the attributes of every account" would mean.
+type AccountResolver interface {
+	AccountAttributes(ctx context.Context, account string) (map[string]any, error)
+}
+
 // The floor keys. `principal` always carries these two, whatever resolver is
 // wired and whether or not it answered.
 const (
 	principalKeyID   = "id"
 	principalKeyKind = "kind"
 )
+
+// accountKeyID is the `account` root's single floor key. It is spelled
+// separately from principalKeyID rather than shared: the two floors are
+// independent contracts that happen to agree on one word today, and a shared
+// constant would make renaming one silently rename the other.
+const accountKeyID = "id"
+
+// accountWildcard is model.AccountWildcard ("*") spelled as a literal, because
+// rules imports no model — the same reason provider spells it out in
+// attribute.go.
+//
+// It is a grant/membership SENTINEL meaning "every account", never an account
+// that exists: model.ValidateAccount refuses to store a row under it. A decision
+// can still be made with it as the active account — that is how platform-tier
+// authority is anchored — and what `account` means there is handled in
+// Engine.accountAttributes.
+const accountWildcard = "*"
+
+// accountBag builds the `account` root: a FRESH map holding the resolver's
+// attributes with the floor — the account id — stamped over them.
+//
+// # Why the floor is {id} and not {id, kind}
+//
+// `principal` publishes a kind because attribute providers are registered per
+// principal kind, so which directory answered is a fact a rule author needs in
+// order to state a rule's dependence on it. An account has no such fact: there
+// is one account slot, it answers for every account, and a `kind` key would be
+// the same constant in every bag in every deployment — a value that can never
+// discriminate is not information, it is noise a rule author would eventually
+// write a comparison against.
+//
+// What remains is `id`, and it earns its place for the reason the floor exists
+// at all: it is the part of `account` that does not depend on what the host
+// happened to configure, so `account.id == "acme"` is writable against ANY
+// deployment, wired or not.
+//
+// # Why the floor wins on collision
+//
+// The floor is stamped LAST, exactly as principalBag does it and for the same
+// reason. A host's account table with its own internal `id` column is an
+// ordinary accident, not an attack; if it could shadow the floor then
+// `account.id == object.account` would silently start comparing a surrogate key
+// against an account id and the rule would answer a different question with no
+// error anywhere. A floor that can be shadowed is not a floor.
+//
+// # Why a fresh map
+//
+// bag may be a cached attribute bag shared across every object in this decision
+// and every concurrent decision in the same account — which, for the account
+// slot, is every decision the tenant is making at once. Stamping into it would
+// be a write through a read-only value at the widest blast radius Aperture has.
+func accountBag(bag map[string]any, account string) map[string]any {
+	out := make(map[string]any, len(bag)+1)
+	maps.Copy(out, bag)
+	out[accountKeyID] = account
+	return out
+}
 
 // principalBag builds the `principal` root: a FRESH map holding the resolver's
 // attributes with the floor — id and kind — stamped over them.
@@ -137,6 +225,7 @@ type Engine struct {
 	source    RuleSource
 	fetcher   MetadataFetcher
 	principal PrincipalResolver
+	account   AccountResolver
 	compiler  *Compiler
 	cache     *compiledCache
 	// clock is the engine's single time source: the compiled-rule cache expires
@@ -153,6 +242,7 @@ type engineConfig struct {
 	ttl          time.Duration
 	clock        Clock
 	principal    PrincipalResolver
+	account      AccountResolver
 }
 
 // WithFunction registers a pure host function callable from rules (expr-lang's
@@ -194,6 +284,14 @@ func WithPrincipalResolver(r PrincipalResolver) Option {
 	return func(c *engineConfig) { c.principal = r }
 }
 
+// WithAccountResolver supplies the active account's attributes to the evaluation
+// context. Without it, `account` is the floor bag alone: the account id. A
+// *provider.AttributeRegistry is wired straight in here — the same registry that
+// serves WithPrincipalResolver — and it reads the account slot.
+func WithAccountResolver(r AccountResolver) Option {
+	return func(c *engineConfig) { c.account = r }
+}
+
 // NewEngine builds an Engine over a rule source and a metadata fetcher. A nil
 // fetcher means object metadata is empty (for rules that read only the
 // principal/action context). Pass a *provider.Registry as the fetcher to read
@@ -207,6 +305,10 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 	if cfg.principal != nil {
 		principal = cfg.principal
 	}
+	var account AccountResolver = floorAccount{}
+	if cfg.account != nil {
+		account = cfg.account
+	}
 	// One clock, resolved once here and shared: the cache and the decision
 	// instant must never be able to read different sources.
 	var clock Clock = realClock{}
@@ -217,6 +319,7 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 		source:    source,
 		fetcher:   fetcher,
 		principal: principal,
+		account:   account,
 		compiler:  NewCompiler(cfg.compilerOpts...),
 		cache:     newCompiledCache(cfg.ttl, clock),
 		clock:     clock,
@@ -233,13 +336,12 @@ func NewEngine(source RuleSource, fetcher MetadataFetcher, opts ...Option) *Engi
 // instant), and evaluate. Any failure is an APERTURE_* coded error and the
 // resolver treats it as a non-decision — there is no select-on-error.
 //
-// account is accepted and not yet read. It is here now, ahead of the account
-// attribute source that will consume it, because the alternative is breaking this
-// exported signature twice: once for the principal's kind and again, later, for
-// the account. One break is cheaper for every host than two, and an argument that
-// is present-but-unread cannot change a decision — an argument absent from the
-// interface is the one that later gets smuggled in through a context value and
-// degrades to an empty account without saying so.
+// account is the ACTIVE account the decision is being made in, and it is what
+// `account` resolves against: the bag describes the tenancy the decision is
+// happening in, never the account a grant happens to be stamped to. A
+// wildcard-stamped grant ("*", the all-accounts sentinel) is evaluated inside
+// whatever account is active, so reading its attributes from the stamp would give
+// one tenant's decision another tenant's plan.
 func (e *Engine) Selected(ctx context.Context, rule string, object identity.Identity, account, principalKind, principal, action string) (bool, error) {
 	r, err := e.source.Lookup(ctx, rule)
 	if err != nil {
@@ -261,16 +363,19 @@ func (e *Engine) Selected(ctx context.Context, rule string, object identity.Iden
 	if err != nil {
 		return false, err
 	}
+	accountAttrs, err := e.accountAttributes(ctx, account)
+	if err != nil {
+		return false, err
+	}
 	in := Input{
 		Object: metadata,
 		// The resolver's answer with the floor stamped over it, in a fresh map —
 		// the resolver's bag may be cached and shared, and is read-only.
 		Principal: principalBag(principalAttrs, principalKind, principal),
-		// Deliberately still empty. The account arrives as an argument now, but
-		// populating account.* from an attribute source is a separate change:
-		// plumbing that also altered what a rule sees would make its own
-		// correctness impossible to test in isolation.
-		Account: map[string]any{},
+		// Same contract on the account side: the account resolver's bag is cached
+		// and shared across the whole tenancy, and the floor is stamped into a
+		// copy of it, never into it.
+		Account: accountBag(accountAttrs, account),
 		Action:  action,
 		// The reference instant, read from the engine's one clock. Under a
 		// decision scope (the decision engine opens one per Check / Enumerate /
@@ -345,6 +450,40 @@ func (e *Engine) metadata(ctx context.Context, object identity.Identity) (map[st
 	return md, nil
 }
 
+// accountAttributes resolves the active account's bag, and is the one place that
+// decides an account is not something to ask a directory about.
+//
+// # The wildcard never reaches a resolver
+//
+// "*" is the all-accounts grant sentinel, not an account: there is no row for it
+// (model.ValidateAccount refuses to store one) and nothing could answer "the
+// attributes of every account" except one tenant's data served as every other's.
+// It is nonetheless a live value here — platform-tier authority is anchored at
+// the wildcard account, so authz.Gate.RequireSystemAdmin really does run a Check
+// with it active — so the question is what a decision made at platform scope sees
+// on `account`, and the answer is: the floor, and nothing else.
+//
+// Short-circuiting rather than erroring is deliberate. The bag is built for EVERY
+// evaluation, whatever the rule reads, so refusing here would make every
+// rule-backed grant undecidable at platform scope — including the overwhelming
+// majority that never mention `account` — and turn one invariant about attribute
+// keys into a restriction on which strategies may guard the system anchor. The
+// floor is the honest answer instead: `account.id` is "*", which truthfully says
+// "this decision is not scoped to a tenant", and every host-defined field is
+// absent exactly as it is for an unwired slot.
+//
+// The refusal still exists, one layer down: presenting "*" to
+// provider.AttributeRegistry (AccountAttributes, or Fetch on any slot) is
+// APERTURE_ATTRIBUTE_PROVIDER_INVALID, so a caller that DOES reach a fetch with
+// it gets a diagnostic rather than a bag. This short-circuit is what keeps that
+// refusal a backstop instead of the mechanism.
+func (e *Engine) accountAttributes(ctx context.Context, account string) (map[string]any, error) {
+	if account == accountWildcard {
+		return nil, nil
+	}
+	return e.account.AccountAttributes(ctx, account)
+}
+
 // CacheStats exposes the compiled-rule cache counters for observability and the
 // latency benchmark (E4-S4).
 func (e *Engine) CacheStats() CacheStats { return e.cache.stats() }
@@ -377,5 +516,16 @@ func (e *Engine) Invalidate(n *Node) (bool, error) {
 type floorPrincipal struct{}
 
 func (floorPrincipal) Attributes(context.Context, string, string) (map[string]any, error) {
+	return nil, nil
+}
+
+// floorAccount is the default AccountResolver, and it is floorPrincipal's
+// counterpart in every respect: it contributes NOTHING, so an unwired engine's
+// `account` is exactly the floor the engine stamps — the account id (see
+// accountBag) — and it returns nil rather than the floor map itself so there is
+// only ever one definition of what that floor is.
+type floorAccount struct{}
+
+func (floorAccount) AccountAttributes(context.Context, string) (map[string]any, error) {
 	return nil, nil
 }

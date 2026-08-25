@@ -354,6 +354,54 @@ func (r *AttributeRegistry) Attributes(ctx context.Context, kind, principal stri
 	return md, nil
 }
 
+// AccountAttributes resolves the ACTIVE account's attribute bag from the account
+// slot — the tenant's plan, region, feature flags a rule reads off `account`.
+//
+// Its signature is rules.AccountResolver's, so an *AttributeRegistry is handed
+// straight to rules.WithAccountResolver, structurally, without this package
+// importing rules. It is spelled AccountAttributes rather than Attributes so that
+// ONE registry can satisfy both resolver seams: Go has no overloading, and
+// Attributes is already the principal seam's method. A host wires the same reg
+// into WithPrincipalResolver and WithAccountResolver and gets both directories
+// and both caches from it.
+//
+// It returns the host's bag alone. The `id` a rule reads off `account` is the
+// rules engine's floor, stamped over whatever comes back, and a nil return is the
+// correct, complete answer for "the host knows nothing about this account".
+//
+// # The wildcard is a call-site bug, not a wiring gap
+//
+// account is a concrete account id. "*" — the all-accounts grant sentinel — is
+// refused with APERTURE_ATTRIBUTE_PROVIDER_INVALID (by Fetch's shared key guard,
+// so the refusal has exactly one definition), and it is refused rather than
+// answered leniently because the two failures are not the same kind of thing. An
+// unregistered slot is a deployment that has no account directory and must keep
+// deciding; a wildcard key is a caller that has not resolved the sentinel to the
+// account the decision is actually in, and the only bag that could satisfy it is
+// one account's data served as another's. The rules engine resolves the sentinel
+// to the floor before it ever gets here, so this is the backstop.
+//
+// # Leniency, otherwise identical to the principal seam
+//
+// APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED (no account directory wired) and
+// APERTURE_NOT_FOUND (a directory that has no record for this account) both yield
+// a nil bag and no error: the decision proceeds against the floor. Everything
+// else — an unreachable directory, a bag the value model rejects — surfaces
+// VERBATIM with its code and its registry fixups, and the caller treats it as a
+// non-decision. An outage must not read as "this account has no attributes".
+func (r *AttributeRegistry) AccountAttributes(ctx context.Context, account string) (Metadata, error) {
+	md, err := r.Fetch(ctx, AttributeSlotAccount, account)
+	if err != nil {
+		switch aerr.CodeOf(err) {
+		case aerr.APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED, aerr.APERTURE_NOT_FOUND:
+			return nil, nil
+		default:
+			return nil, err
+		}
+	}
+	return md, nil
+}
+
 // Stats returns the cache counters for slot, or false when the slot has no
 // registered provider. The counters are per slot and never pooled: a user
 // directory's hit rate says nothing about an account cache's, and one number

@@ -78,7 +78,7 @@ anything else is an unknown variable:
 |---|---|---|
 | `object` | map | the object's metadata snapshot (host-defined fields, e.g. `object.classification`) |
 | `principal` | map | the principal's attribute bag (e.g. `principal.tier`); the floor `{id, kind}` is always present |
-| `account` | map | account attributes |
+| `account` | map | the **active** account's attribute bag (e.g. `account.plan`); the floor `{id}` is always present |
 | `action` | string | the action verb (`action == "read"`) |
 
 The three metadata roots are `map[string]any` so a rule reads host-defined
@@ -478,6 +478,13 @@ service-account registry are rarely the same store. An **empty** kind means the
 caller did not have the principal's record in hand: treat it as unknown, never
 as a default, or a machine gets answered for out of the human directory.
 
+An optional `AccountResolver` supplies the **active** account's attributes,
+keyed by `AccountAttributes(ctx, account)`. It is the same contract one root
+over: the host's bag alone, `nil` is a complete answer, the engine stamps the
+floor. The method is spelled `AccountAttributes` rather than `Attributes` so
+that **one** `*provider.AttributeRegistry` can satisfy both seams — Go has no
+overloading, and the registry already holds both directories and both caches.
+
 ### The floor bag, and `principal.kind`
 
 `principal` always carries `{id, kind}`, whatever is wired. The floor is stamped
@@ -498,22 +505,55 @@ author states the dependence instead of hiding it:
 principal.kind == "user" && principal.tier == "gold"
 ```
 
+### The `account` floor, and the wildcard
+
+`account` always carries `{id}` — the **active** account, the tenancy the
+decision is being made in, never the account a grant happens to be stamped to. A
+wildcard-stamped grant is evaluated inside whatever account is active, so reading
+its attributes off the stamp would give one tenant's decision another tenant's
+plan.
+
+The floor is `{id}` and deliberately **not** `{id, kind}`: there is one account
+slot, so a `kind` key would be the same constant in every bag in every
+deployment, and a value that can never discriminate is noise a rule author would
+eventually compare against. As with `principal`, the floor is stamped **last**,
+so a host account table with its own internal `id` column cannot silently change
+what `account.id == object.account` compares.
+
+`"*"` — the all-accounts grant sentinel — is **never** an attribute fetch key.
+There is no account row for it (`ValidateAccount` refuses to store one), and the
+only bag that could answer "the attributes of every account" is one tenant's data
+served as every other's. It is nonetheless a live *active* account: platform-tier
+authority is anchored there, so `authz.Gate.RequireSystemAdmin` really does run a
+`Check` with it. A decision made at platform scope therefore sees the **floor and
+nothing else** — `account.id` is `"*"`, which truthfully says "not scoped to a
+tenant", and every host-defined field is absent exactly as it is for an unwired
+slot. The engine short-circuits before any resolver is consulted, so a
+rule-backed grant guarding the system anchor stays decidable; presenting `"*"` to
+`provider.AttributeRegistry` directly is `APERTURE_ATTRIBUTE_PROVIDER_INVALID`,
+which makes that refusal a backstop rather than the mechanism.
+
 ### Wiring a `*provider.AttributeRegistry`
 
 A `provider.AttributeRegistry` — the host seam that maps each of the three
 attribute slots (`user`, `machine`, `account`) to a provider plus a per-slot
-cache — is a `PrincipalResolver` as it stands, structurally, with `provider`
-importing nothing from `rules`:
+cache — is both a `PrincipalResolver` and an `AccountResolver` as it stands,
+structurally, with `provider` importing nothing from `rules`:
 
 ```go
 attrs := provider.NewAttributeRegistry()
 attrs.MustRegister(provider.AttributeSlotUser, userDirectory)
-eng := rules.NewEngine(source, objects, rules.WithPrincipalResolver(attrs))
+attrs.MustRegister(provider.AttributeSlotAccount, tenantDirectory)
+eng := rules.NewEngine(source, objects,
+    rules.WithPrincipalResolver(attrs),
+    rules.WithAccountResolver(attrs))
 ```
 
 The kind picks the **slot**: `"user"` resolves the user slot, `"machine"` the
 machine slot. `"account"` is a real slot but is **not** a principal kind, so it
-never resolves here — a tenant's bag must never be served as a principal's.
+never resolves through `WithPrincipalResolver` — a tenant's bag must never be
+served as a principal's. `WithAccountResolver` is the only door to it, and it is
+keyed on the active account, not on any principal.
 
 A deployment that has no directory to point at declares the bags **in the seed
 file** instead, under [`attributes:`](seed.md#inline-subject-attributes), and
@@ -537,11 +577,9 @@ is the full path:
 4. resolve the principal's attributes for its kind, and stamp the floor over them
    into a fresh map (the resolver's bag may be cached and shared, and is
    read-only, transitively);
-5. build the `Input` and evaluate.
-
-`account` is accepted and **not yet read** — `Input.Account` is still the empty
-map. It is in the signature ahead of the account attribute source that will
-consume it so this exported signature breaks once rather than twice.
+5. resolve the active account's attributes the same way, through the same
+   read-only contract, and stamp `{id}` over them into a fresh map;
+6. build the `Input` and evaluate.
 
 Any step's failure is an `APERTURE_*` coded error, and the caller treats it as a
 **non-decision** — there is no select-on-error. That signature is exactly

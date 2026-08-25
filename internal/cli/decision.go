@@ -37,11 +37,12 @@ type decisionStack struct {
 	// `identifiers` can enumerate a type.
 	registry *provider.Registry
 	// attributes is the SUBJECT-attribute registry built from the seed's
-	// `attributes:` section — the bags a rule reads off `principal`. It is always
-	// non-nil (BuildAttributeRegistry returns an empty registry for a seed
-	// declaring none) and is wired into the rules engine as the principal
-	// resolver, so the CLI and `serve` cannot disagree about what a principal
-	// knows any more than they can disagree about a rule.
+	// `attributes:` section — the bags a rule reads off `principal` and off
+	// `account`. It is always non-nil (BuildAttributeRegistry returns an empty
+	// registry for a seed declaring none) and is wired into the rules engine as
+	// BOTH the principal resolver and the account resolver, so the CLI and `serve`
+	// cannot disagree about what a principal or a tenant knows any more than they
+	// can disagree about a rule.
 	attributes *provider.AttributeRegistry
 	// ruleSource is the storage-backed rule source the engine resolves rule
 	// references through. `serve` also hands it to the facade (WithRuleSource) so
@@ -173,7 +174,15 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	// declared source, `principal` is exactly its floor — id and kind — and no
 	// attribute machinery is consulted at all.
 	if doc.HasAttributeSources() {
-		ruleOpts = append(ruleOpts, rules.WithPrincipalResolver(attrs))
+		// One registry, both resolver seams. The principal seam reads the user and
+		// machine slots keyed on the principal's kind; the account seam reads the
+		// account slot keyed on the ACTIVE account. They are separate options
+		// because a rule's `principal` and `account` roots are separate contracts,
+		// but wiring them from the same registry is what keeps the caches, the
+		// value model and the leniency identical for both.
+		ruleOpts = append(ruleOpts,
+			rules.WithPrincipalResolver(attrs),
+			rules.WithAccountResolver(attrs))
 	}
 
 	// The rules engine resolves references against the SAME store the node editor

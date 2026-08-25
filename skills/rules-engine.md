@@ -368,10 +368,33 @@ an unknown variable, rejected at validation:
   access in an **exclusive** one, where not-selected means not-excluded. Say the
   dependence out loud:
   `principal.kind == "user" && principal.tier == "gold"`.
-- `account` — account attributes (reserved; empty until wired). `Selected` now
-  takes the account, but `Input.Account` stays empty until an account attribute
-  source is wired — the argument travels ahead of its reader on purpose, so the
-  exported signature breaks once rather than twice.
+- `account` — the **active** account's attributes: the tenancy the decision is
+  being made in, never the account a grant is stamped to (a wildcard-stamped
+  grant evaluates inside whatever account is active, so reading the stamp would
+  give one tenant's decision another tenant's plan). The **floor** is `{id}` and
+  the engine stamps it over every resolver's answer, so a host account table with
+  its own `id` column cannot shadow it. It is `{id}` and not `{id, kind}` on
+  purpose: there is one account slot, so a `kind` key would be the same constant
+  in every bag in every deployment — a value that can never discriminate is
+  noise, not information. Richer attributes come from an `AccountResolver`
+  (`WithAccountResolver`), whose `AccountAttributes(ctx, account)` is spelled with
+  that name — not `Attributes` — precisely so ONE `*provider.AttributeRegistry`
+  can satisfy both this seam and `PrincipalResolver`; Go has no overloading, and
+  the registry already holds both directories and both caches. The account slot
+  with **no registered provider**, and a registered one with no record for the
+  account, both yield the floor and **no error**, exactly as for a principal.
+  **`"*"` is never an attribute fetch key.** It is the all-accounts grant
+  sentinel, not an account — `ValidateAccount` refuses to store a row for it, and
+  the only bag that could answer "the attributes of every account" is one
+  tenant's data served as every other's. It is still a live *active* account
+  (platform authority is anchored there, so `Gate.RequireSystemAdmin` runs a
+  `Check` with it), so a platform-scope decision sees the floor and nothing else:
+  `account.id == "*"`, every host field absent. The engine short-circuits before
+  consulting a resolver — refusing instead would make every rule-backed grant
+  undecidable at platform scope, including the ones that never mention `account`
+  — and `provider.AttributeRegistry` refuses `"*"` with
+  `APERTURE_ATTRIBUTE_PROVIDER_INVALID`, so that refusal is the backstop rather
+  than the mechanism.
 - `action` — the action verb (a string).
 
 There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per
