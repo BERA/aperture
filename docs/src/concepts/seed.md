@@ -25,6 +25,7 @@ connections:   { ... }   # named database connections — runtime wiring (see be
 providers:     [ ... ]   # runtime wiring, not model state (see below)
 objects:       [ ... ]   # inline object metadata — also wiring, not model state
 field_types:   [ ... ]   # declared types for inline metadata fields — also wiring
+attributes:    [ ... ]   # inline SUBJECT attributes (principal / account) — also wiring
 ```
 
 `connections:` is a **map** keyed by name, not a list: the name is what a
@@ -33,9 +34,9 @@ provider entry's `connection:` refers to, and a map cannot declare one twice.
 Every field mirrors its `model` counterpart in declarative form. The `Document`
 started as a minimal seed shape and was generalized to the complete model, so **an
 export file is a strict superset of a seed file**: a seed that omits
-`templates`/`rules`/`providers`/`objects`/`field_types` loads unchanged, and a full export
-reloads through the very same path. The field set is additive-only, so old seeds
-keep loading.
+`templates`/`rules`/`providers`/`objects`/`field_types`/`attributes` loads
+unchanged, and a full export reloads through the very same path. The field set is
+additive-only, so old seeds keep loading.
 
 Rule ASTs are carried as **raw JSON** — exactly the `rules` package's canonical
 `Node` serialization — so the file never invents a second rule format; it is the
@@ -477,6 +478,84 @@ state**: `Apply` writes nothing for it and an export reproduces none of it. See
 [Declared references](providers.md#declared-references) for what a declaration
 buys and the security semantics of enumerating through one.
 
+## Inline subject attributes
+
+`objects:` says what Aperture knows about the thing being acted on. `attributes:`
+says what it knows about the party **asking** — a principal's department, an
+account's plan — so a small deployment can make `principal.department` mean
+something with no directory, no CSV, and no Go:
+
+```yaml
+attributes:
+  - subject: user
+    id: alice
+    metadata:
+      department: eng
+      clearance: 3
+      teams: [platform, infra]
+  - subject: machine
+    id: ci-runner
+    metadata: { department: eng }
+  - subject: account
+    id: acme
+    metadata: { plan: enterprise }
+```
+
+`subject:` names one of the three **attribute slots** — `user` or `machine` for a
+principal, `account` for the tenant a decision is made in. The set is closed: it
+is the parties a decision has. It is spelled `subject:` rather than `kind:`
+because `account` is a slot but **not** a principal kind, and a key called `kind:`
+would read as `model.PrincipalKind`. An unknown value is
+`APERTURE_ATTRIBUTE_SLOT_UNKNOWN` naming the entry and the three legal subjects.
+
+`id:` is the bare attribute **key** — a principal id, or an account id — and
+Aperture never parses it. There is no type to derive from it the way an `objects:`
+id derives its object-type from its terminal segment: an attribute key is an
+opaque handle into the host's directory with no segment structure, which is
+exactly why the slot has to be declared. Keys are deduplicated **per slot**, not
+across the section: a tenant called `acme` and a service principal called `acme`
+are two unrelated subjects, while the same key twice under one subject would let
+the last writer silently win.
+
+`metadata:` is the ordinary [value model](providers.md#the-metadata-value-model),
+validated at build and with numbers normalised exactly as `objects:` normalises
+them — there is one value model in Aperture and an attribute bag is a value in it.
+A rejected value keeps the model's own `APERTURE_METADATA_INVALID` (the code whose
+fixups name the legal shapes and the two caps), with the offending entry added to
+the message; a missing `subject:`/`id:`, a duplicate pair, or a `metadata:` that
+is not a mapping is `APERTURE_CONFIG_INVALID`. The account wildcard `"*"` is never
+a legal key — it would ask for the attributes of every account at once — and is
+refused with `APERTURE_ATTRIBUTE_PROVIDER_INVALID`.
+
+`Document.BuildAttributeRegistry(baseDir)` turns the block into a live
+`*provider.AttributeRegistry`, registering one in-memory provider per declared
+slot with a TTL of 0. It always returns a usable registry, so a host wires it
+unconditionally:
+
+```go
+attrs, err := doc.BuildAttributeRegistry(filepath.Dir(seedPath))
+if err != nil {
+    return err
+}
+eng := rules.NewEngine(ruleSource, objectFetcher, rules.WithPrincipalResolver(attrs))
+```
+
+The kind picks the slot, and **a missing source is not a failed decision**: a
+subject with no entry — or a slot with no provider at all — evaluates against the
+floor bag (`{id, kind}`), so a rule reading an attribute nobody declared is
+deny-safe rather than a non-decision. See
+[Wiring a `*provider.AttributeRegistry`](rules.md#wiring-a-providerattributeregistry).
+
+### Why it is not a `metadata:` field on `principals:`
+
+`principals:` and `accounts:` are **model state** — rows `Apply` writes and
+`Export` reads back. An attribute bag is not: it belongs to the host's directory,
+and Aperture persists none of it (there is no column for it, by design). Hanging
+the bag off a model entry would put wiring inside state, and the export would then
+be one of two bad things — **lossy**, because it silently dropped the bags it
+could not read out of storage, or **untruthful**, because it invented them. Its
+own key keeps the line exactly where the other wiring sections already keep it.
+
 ## What is *not* in the file
 
 Two things are deliberately excluded from the model state file:
@@ -484,13 +563,18 @@ Two things are deliberately excluded from the model state file:
 - **Live host domain-object metadata** — that is the [provider](providers.md)
   cache: derived, disposable, never source of truth. Because `Export` reads storage
   back, and a provider produces no model rows, it is never reproduced.
-- **Runtime *wiring*** — the `connections:`, `providers:`, `objects:`, and
-  `field_types:` sections are runtime wiring, not model state. `Apply` never
-  writes any of them to storage; instead `Document.BuildRegistry(baseDir)` — or
-  `BuildRegistryWithConnections` when the document declares `connections:` —
-  turns them into a live `*provider.Registry`. **The seed file is the source of
-  truth for them**, exactly as auth config is — and an export reproduces none of
-  them. A declared provider names an `object_type`, a `kind` (`csv` or `sql`),
+- **Live subject attributes** — a principal's or an account's bag is the host
+  directory's, for the same reason and with the same consequence: `Apply` writes
+  no row for `attributes:` and an export reproduces none of it.
+- **Runtime *wiring*** — the `connections:`, `providers:`, `objects:`,
+  `field_types:` and `attributes:` sections are runtime wiring, not model state.
+  `Apply` never writes any of them to storage; instead
+  `Document.BuildRegistry(baseDir)` — or `BuildRegistryWithConnections` when the
+  document declares `connections:` — turns the first four into a live
+  `*provider.Registry`, and `Document.BuildAttributeRegistry(baseDir)` turns the
+  fifth into a live `*provider.AttributeRegistry`. **The seed file is the source
+  of truth for them**, exactly as auth config is — and an export reproduces none
+  of them. A declared provider names an `object_type`, a `kind` (`csv` or `sql`),
   optional cache `ttl`/`max_size`, and then either a `path` (for `csv`, resolved
   relative to the seed file) or a `connection` plus `get_one` / `get_all`
   statements (for `sql` — see

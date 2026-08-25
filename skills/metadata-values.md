@@ -503,6 +503,57 @@ and **deep-copies its input** so a caller that keeps and mutates those maps cann
 reach into metadata the Registry has already cached. Reads hand out its own maps
 **by reference**, exactly as `csvprovider` does.
 
+### The seed document's `attributes:` section
+
+The same YAML spelling, pointed at the party **asking** rather than the thing
+being acted on:
+
+```yaml
+attributes:
+  - subject: user
+    id: alice
+    metadata:
+      department: eng
+      clearance: 3
+      teams: [platform, infra]
+  - subject: account
+    id: acme
+    metadata: { plan: enterprise }
+```
+
+Two keys differ from `objects:`, and both differences follow from what an
+attribute key *is*:
+
+- **`subject:` is declared, not derived.** An `objects:` id is a segmented
+  identity, so its terminal segment names its type. An attribute key is a bare
+  opaque handle into the host's directory with no segments to derive anything
+  from, so the slot — `user`, `machine`, or `account`, a **closed** set — is
+  stated. An unknown one is `APERTURE_ATTRIBUTE_SLOT_UNKNOWN` naming the entry and
+  the three legal subjects.
+- **Keys are deduplicated per slot**, not across the whole section: a tenant
+  called `acme` and a service principal called `acme` are unrelated subjects.
+
+Everything about the VALUE is identical, and deliberately so — one value model,
+one normalisation, one rejection:
+
+- **Numbers normalise identically** (raw JSON, `UseNumber`, exact `int64` else
+  `float64`), so `principal.clearance == 3` answers the same in YAML and JSON;
+- **`metadata:` must be a mapping**, and an omitted or null one is a subject that
+  exists and carries nothing — not a missing subject;
+- **the bag goes through `provider.ValidateMetadata`** at build. A rejection keeps
+  the value model's own **`APERTURE_METADATA_INVALID`**, with the offending entry
+  added to the message: `aerr.Wrap` re-stamps, so re-coding it
+  `APERTURE_CONFIG_INVALID` would replace the fixups that name the legal shapes
+  and the two caps with generic ones. A missing `subject:`/`id:`, a duplicate
+  pair, or a non-mapping `metadata:` **is** `APERTURE_CONFIG_INVALID`; the account
+  wildcard `"*"` as a key is `APERTURE_ATTRIBUTE_PROVIDER_INVALID`, refused by
+  `provider.NewStaticAttributes`, which this loader does not restate.
+
+`Document.BuildAttributeRegistry(baseDir)` registers one
+`provider.StaticAttributes` per declared slot with a TTL of 0. Like every other
+wiring section: no storage row, no `Apply` write, no export
+(`TestAttributeWiringIsNotModelState`).
+
 ## Querying the model: `Filter.Fields`
 
 The shape a field holds decides how a `provider.Filter.Fields` predicate compares
@@ -597,6 +648,7 @@ Changing the value model means changing all of these in the same PR:
 | The **SQL driver-value mapping** (`metadataValue`'s type switch or `mappedDriverTypes` in `sqlprovider/values.go`) | the "`sqlprovider`" section above + `skills/sql-provider.md` + the `sqlprovider` package doc + `docs/src/concepts/providers.md` — gated by `TestDriverValueMappingTableMatchesTheTypeSwitch`, which parses the source with `go/ast` |
 | The seed `field_types:` section (its spelling, its vocabulary, what it applies to) | "The seed document's `field_types:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and its two type words must stay identical to the CSV `:date`/`:datetime` suffixes, which is the whole reason it exists |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
+| The seed `attributes:` shape (a key, the subject vocabulary, the dedup rule), or `provider.StaticAttributes` | "The seed document's `attributes:` section" above + `docs/src/concepts/seed.md` ("Inline subject attributes") + the `Attribute` / `BuildAttributeRegistry` doc comments in `seed/attribute.go` — and it must stay **wiring**: no storage table, no `Apply` row, no export, and no `metadata:` key on `principals:`/`accounts:` |
 | The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the

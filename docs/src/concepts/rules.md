@@ -515,6 +515,11 @@ The kind picks the **slot**: `"user"` resolves the user slot, `"machine"` the
 machine slot. `"account"` is a real slot but is **not** a principal kind, so it
 never resolves here — a tenant's bag must never be served as a principal's.
 
+A deployment that has no directory to point at declares the bags **in the seed
+file** instead, under [`attributes:`](seed.md#inline-subject-attributes), and
+`Document.BuildAttributeRegistry` returns exactly the registry above — so
+`aperture check` decides on principal attributes with no Go written by the host.
+
 A **missing source is not a failed decision**. A slot with no registered
 provider, and a registered provider with no record for the key, both yield the
 floor and no error, so a deployment with a human directory and no machine

@@ -58,13 +58,16 @@ const (
 // stable order (sorted by id/name) so a round-trip is byte-stable and
 // human-diffable.
 //
-// Four sections are runtime WIRING rather than model state, and are the seed
-// FILE's own source of truth: Connections, Providers, Objects, and FieldTypes.
-// BuildRegistry turns them into a live *provider.Registry; Apply writes none of
-// them to storage, and because Export reads the model back OUT of storage, none
-// is ever reproduced by an export. Live host domain-object metadata is
-// deliberately not exportable state — that is the provider cache, derived and
-// disposable, never source of truth.
+// Five sections are runtime WIRING rather than model state, and are the seed
+// FILE's own source of truth: Connections, Providers, Objects, FieldTypes, and
+// Attributes. BuildRegistry turns the first four into a live *provider.Registry
+// and BuildAttributeRegistry turns the fifth into a live
+// *provider.AttributeRegistry; Apply writes none of them to storage, and because
+// Export reads the model back OUT of storage, none is ever reproduced by an
+// export. Live host domain-object metadata is deliberately not exportable state —
+// that is the provider cache, derived and disposable, never source of truth. The
+// same is true of a subject's attribute bag: it belongs to the host's directory,
+// and Aperture has no column for it.
 type Document struct {
 	Accounts    []Account    `yaml:"accounts" json:"accounts"`
 	Memberships []Membership `yaml:"memberships" json:"memberships"`
@@ -84,6 +87,13 @@ type Document struct {
 	Providers   []Provider            `yaml:"providers,omitempty" json:"providers,omitempty"`
 	Objects     []Object              `yaml:"objects,omitempty" json:"objects,omitempty"`
 	FieldTypes  []FieldType           `yaml:"field_types,omitempty" json:"field_types,omitempty"`
+	// Attributes declares the bags a decision's SUBJECTS carry — a principal's
+	// department, an account's plan — inline, served from memory by
+	// BuildAttributeRegistry. It is the fifth wiring section and obeys the same
+	// rule as the other four: Apply writes nothing for it and an export reproduces
+	// none of it. See attribute.go for why it is its own key rather than a
+	// metadata: field on principals:/accounts:.
+	Attributes []Attribute `yaml:"attributes,omitempty" json:"attributes,omitempty"`
 }
 
 // Account mirrors model.Account in declarative form.

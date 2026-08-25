@@ -36,6 +36,13 @@ type decisionStack struct {
 	// empty registry for a seed declaring neither) and is handed to the facade so
 	// `identifiers` can enumerate a type.
 	registry *provider.Registry
+	// attributes is the SUBJECT-attribute registry built from the seed's
+	// `attributes:` section — the bags a rule reads off `principal`. It is always
+	// non-nil (BuildAttributeRegistry returns an empty registry for a seed
+	// declaring none) and is wired into the rules engine as the principal
+	// resolver, so the CLI and `serve` cannot disagree about what a principal
+	// knows any more than they can disagree about a rule.
+	attributes *provider.AttributeRegistry
 	// ruleSource is the storage-backed rule source the engine resolves rule
 	// references through. `serve` also hands it to the facade (WithRuleSource) so
 	// the node editor's what-if can preview an UNSAVED rule; the one-shot commands
@@ -89,9 +96,9 @@ func (s decisionStack) reportCollisions(w io.Writer) {
 // buildDecisionStack wires the decision graph over an already-seeded store.
 //
 // seedPath is the same --seed value buildStore was given: the seed file is read a
-// second time as a Document because two of its sections — `providers:` and
-// `objects:` — are runtime WIRING that Apply never writes to storage, so the file
-// is their only source of truth.
+// second time as a Document because several of its sections — `providers:`,
+// `objects:` and `attributes:` — are runtime WIRING that Apply never writes to
+// storage, so the file is their only source of truth.
 //
 // Both sections feed ONE *provider.Registry, which in turn feeds BOTH the rules
 // engine's metadata fetcher (so a rule can read object.category_id) AND the scope
@@ -141,11 +148,39 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		metaSource = reg
 	}
 
+	// The seed's `attributes:` section is the second wiring section this builder
+	// reads out of the same file, and it feeds a DIFFERENT registry: an attribute
+	// bag is keyed by a bare subject id and is never an enumerable object set, so
+	// it deliberately cannot reach the scope resolver's object lister.
+	attrs, err := doc.BuildAttributeRegistry(seedBaseDir(seedPath))
+	if err != nil {
+		// bootError, not a bare wrap: an attribute declaration fails with
+		// APERTURE_ATTRIBUTE_SLOT_UNKNOWN (naming the three legal slots) or
+		// APERTURE_METADATA_INVALID (naming the field and the cap it broke), and
+		// re-stamping either APERTURE_BOOT would hand the operator "aperture
+		// failed to start" instead of the remedy.
+		_ = conns.Close()
+		return decisionStack{}, bootError("cli: building attribute providers failed", err)
+	}
+	var ruleOpts []rules.Option
+	// The gate MUST count every attribute source the document can declare, which
+	// is why it is asked of the document rather than re-derived here — see
+	// seed.Document.HasAttributeSources, and hasObjectSources below it for the bug
+	// that taught us why a gate written over one section of two is a silent one.
+	//
+	// Wiring the resolver unconditionally would be harmless today (an unfilled
+	// slot resolves to the floor bag), but the gate states the intent: with no
+	// declared source, `principal` is exactly its floor — id and kind — and no
+	// attribute machinery is consulted at all.
+	if doc.HasAttributeSources() {
+		ruleOpts = append(ruleOpts, rules.WithPrincipalResolver(attrs))
+	}
+
 	// The rules engine resolves references against the SAME store the node editor
 	// saves through PutRule, so a saved rule takes effect on the next decision and
 	// there is no second rule store to keep in sync.
 	ruleSource := service.NewStorageRuleSource(store)
-	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher)
+	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher, ruleOpts...)
 
 	opts := make([]engine.Option, 0, len(engOpts)+3)
 	opts = append(opts, engine.WithScopeResolution(nil, scopeDeps))
@@ -165,6 +200,7 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	return decisionStack{
 		eng:        engine.New(store, opts...),
 		registry:   reg,
+		attributes: attrs,
 		ruleSource: ruleSource,
 		fetcher:    fetcher,
 		collisions: doc.ProviderCollisions(),

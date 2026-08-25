@@ -319,8 +319,12 @@ func decodeObjectMetadata(id string, raw json.RawMessage) (provider.Metadata, er
 
 // normalizeNumbers rewrites every json.Number in a decoded value, at every depth,
 // to the int64/float64 the rest of Aperture compares against. The containers are
-// the ones just decoded for this object, so rewriting them in place shares
-// nothing with any other object.
+// the ones just decoded for this entry, so rewriting them in place shares nothing
+// with any other entry.
+//
+// It is shared by the objects: and attributes: sections — there is one value
+// model, so there is one normalisation. id names whichever entry is being
+// decoded; the message therefore says "metadata" rather than "object metadata".
 func normalizeNumbers(id, field string, v any) (any, error) {
 	switch x := v.(type) {
 	case json.Number:
@@ -331,7 +335,7 @@ func normalizeNumbers(id, field string, v any) (any, error) {
 			return f, nil // matches a CSV :float column and a :json non-integer
 		}
 		return nil, aerr.WithContext(aerr.APERTURE_CONFIG_INVALID,
-			"seed: object metadata holds a number no int64 or float64 can represent",
+			"seed: metadata holds a number no int64 or float64 can represent",
 			map[string]any{"id": id, "field": field})
 	case map[string]any:
 		for k, elem := range x {
