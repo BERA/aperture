@@ -37,8 +37,8 @@ type decisionStack struct {
 	// `identifiers` can enumerate a type.
 	registry *provider.Registry
 	// attributes is the SUBJECT-attribute registry built from the seed's
-	// `attributes:` section — the bags a rule reads off `principal` and off
-	// `account`. It is always non-nil (BuildAttributeRegistry returns an empty
+	// `attribute_providers:` and `attributes:` sections — the bags a rule reads off
+	// `principal` and off `account`. It is always non-nil (BuildAttributeRegistry returns an empty
 	// registry for a seed declaring none) and is wired into the rules engine as
 	// BOTH the principal resolver and the account resolver, so the CLI and `serve`
 	// cannot disagree about what a principal or a tenant knows any more than they
@@ -59,6 +59,13 @@ type decisionStack struct {
 	// silently would be hostile, and `seed` has no logging path of its own, so it
 	// reports the fact and the caller surfaces it (reportCollisions).
 	collisions []string
+	// attributeCollisions are the attribute SLOTS declared in BOTH the seed's
+	// `attribute_providers:` and `attributes:` sections. The external source wins
+	// and the inline bags for those slots are discarded entirely — the same
+	// documented default, at slot granularity — and it is reported for the same
+	// reason: discarding data silently would be hostile, and `seed` has no logging
+	// path of its own.
+	attributeCollisions []string
 	// conns are the database pools BuildRegistryWithConnections opened for the
 	// seed's `connections:` block — one per named connection, shared by every
 	// `kind: sql` provider entry referencing it. It is the only part of the stack
@@ -82,16 +89,25 @@ func (s decisionStack) Close() error {
 
 // reportCollisions writes a warning naming every object type whose inline
 // `objects:` entries were discarded because a `providers:` entry claimed the same
-// type. Nothing is written when there is no collision, so a normal boot stays
-// silent. Only object TYPES are named — never ids — so the warning cannot leak
-// cross-account data.
+// type, and every attribute SLOT whose inline `attributes:` entries were
+// discarded because an `attribute_providers:` entry claimed the same slot.
+// Nothing is written when there is no collision, so a normal boot stays silent.
+// Only object TYPES and slot NAMES are named — never ids, never keys — so the
+// warning cannot leak cross-account data or a directory's contents.
 func (s decisionStack) reportCollisions(w io.Writer) {
-	if len(s.collisions) == 0 || w == nil {
+	if w == nil {
 		return
 	}
-	fmt.Fprintf(w, "warning: seed declares %d object type(s) in both providers: and objects: — "+
-		"the providers: entry wins and the inline entries were discarded: %s\n",
-		len(s.collisions), strings.Join(s.collisions, ", "))
+	if len(s.collisions) > 0 {
+		fmt.Fprintf(w, "warning: seed declares %d object type(s) in both providers: and objects: — "+
+			"the providers: entry wins and the inline entries were discarded: %s\n",
+			len(s.collisions), strings.Join(s.collisions, ", "))
+	}
+	if len(s.attributeCollisions) > 0 {
+		fmt.Fprintf(w, "warning: seed declares %d attribute slot(s) in both attribute_providers: and attributes: — "+
+			"the attribute_providers: entry wins and the inline bags were discarded: %s\n",
+			len(s.attributeCollisions), strings.Join(s.attributeCollisions, ", "))
+	}
 }
 
 // buildDecisionStack wires the decision graph over an already-seeded store.
@@ -149,11 +165,16 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		metaSource = reg
 	}
 
-	// The seed's `attributes:` section is the second wiring section this builder
-	// reads out of the same file, and it feeds a DIFFERENT registry: an attribute
-	// bag is keyed by a bare subject id and is never an enumerable object set, so
-	// it deliberately cannot reach the scope resolver's object lister.
-	attrs, err := doc.BuildAttributeRegistry(seedBaseDir(seedPath))
+	// The seed's `attributes:` and `attribute_providers:` sections feed a DIFFERENT
+	// registry: an attribute bag is keyed by a bare subject id and is never an
+	// enumerable object set, so it deliberately cannot reach the scope resolver's
+	// object lister.
+	//
+	// The pools are PASSED IN, not re-opened. `connections:` is the document's
+	// single pool set, shared by every `kind: sql` entry of EITHER section — a
+	// second set opened here would double every deployment's connections, and half
+	// of them would be held by a registry this stack has no handle to close.
+	attrs, err := doc.BuildAttributeRegistryWithConnections(seedBaseDir(seedPath), conns)
 	if err != nil {
 		// bootError, not a bare wrap: an attribute declaration fails with
 		// APERTURE_ATTRIBUTE_SLOT_UNKNOWN (naming the three legal slots) or
@@ -213,7 +234,9 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		ruleSource: ruleSource,
 		fetcher:    fetcher,
 		collisions: doc.ProviderCollisions(),
-		conns:      conns,
+
+		attributeCollisions: doc.AttributeCollisions(),
+		conns:               conns,
 	}, nil
 }
 

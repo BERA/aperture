@@ -411,13 +411,19 @@ func (d *Document) openConnections(open ConnectionOpener) (*Connections, error) 
 	return conns, nil
 }
 
-// rejectLiteralDSN fails a document that spells a connection's credentials
-// inline. It runs in Parse — before Apply, before BuildRegistry, before the
-// document is usable for anything — because the harm of a literal DSN is that it
-// was written down at all, and a load that "worked" is what makes a reviewer
-// stop looking.
+// rejectLiteralDSN fails a document that spells credentials inline. It runs in
+// Parse — before Apply, before BuildRegistry, before the document is usable for
+// anything — because the harm of a literal DSN is that it was written down at
+// all, and a load that "worked" is what makes a reviewer stop looking.
 //
-// The offending connection is named. The value never is.
+// It scans BOTH places a dsn: key can be written: a connections: entry, where it
+// is the forbidden spelling of dsn_env:, and an attribute_providers: entry, where
+// it is doubly wrong — credentials never belong to a provider entry at all, since
+// the pool is the document's and is named with connection:. Both are refused by
+// name rather than ignored, because a key that is quietly dropped looks like it
+// worked and then fails to connect, which is the worst of both outcomes.
+//
+// The offending entry is named. The value never is.
 func (d *Document) rejectLiteralDSN() error {
 	var offenders []string
 	for name, c := range d.Connections {
@@ -425,14 +431,27 @@ func (d *Document) rejectLiteralDSN() error {
 			offenders = append(offenders, name)
 		}
 	}
-	if len(offenders) == 0 {
+	if len(offenders) > 0 {
+		sort.Strings(offenders)
+		return aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_DSN_LITERAL,
+			fmt.Sprintf("seed: connection %s carries a literal dsn: key; use dsn_env: naming the environment variable that holds the DSN, because a seed file is committed and a DSN carries a password",
+				strings.Join(quoteAll(offenders), ", ")),
+			map[string]any{"connections": offenders, "forbidden_key": "dsn", "use_instead": "dsn_env"})
+	}
+	var subjects []string
+	for _, ap := range d.AttributeProviders {
+		if strings.TrimSpace(ap.DSNLiteral) != "" {
+			subjects = append(subjects, strings.TrimSpace(ap.Subject))
+		}
+	}
+	if len(subjects) == 0 {
 		return nil
 	}
-	sort.Strings(offenders)
+	sort.Strings(subjects)
 	return aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_DSN_LITERAL,
-		fmt.Sprintf("seed: connection %s carries a literal dsn: key; use dsn_env: naming the environment variable that holds the DSN, because a seed file is committed and a DSN carries a password",
-			strings.Join(quoteAll(offenders), ", ")),
-		map[string]any{"connections": offenders, "forbidden_key": "dsn", "use_instead": "dsn_env"})
+		fmt.Sprintf("seed: attribute provider for subject %s carries a literal dsn: key; a provider entry never carries credentials — declare the database once in connections: with dsn_env: and name it with connection:, because a seed file is committed and a DSN carries a password",
+			strings.Join(quoteAll(subjects), ", ")),
+		map[string]any{"subjects": subjects, "forbidden_key": "dsn", "use_instead": "connection"})
 }
 
 // quoteAll quotes each name so a multi-connection message stays readable.

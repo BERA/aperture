@@ -97,80 +97,78 @@ type Attribute struct {
 // was in a different package from the field list, so adding the field did not
 // look like touching the gate.
 //
-// The attribute seam is about to grow exactly that second section: E3-S1 adds
-// `attribute_providers:` for external sources (kind: csv | sql). When it lands it
-// MUST be OR'd in here, in this method, next to the field it adds — and because
-// the method is in the same file as the section declarations, that is one edit in
-// one place rather than a cross-package coincidence.
+// The second section has now landed: `attribute_providers:` (kind: csv | sql,
+// see attribute_provider.go) is OR'd in below, in this method, and it counts
+// exactly as much as an inline entry does — a seed whose only attribute source is
+// an external one must wire the resolvers, or the directory it named would be
+// read by nothing. Any THIRD section owes the same one-line edit here, and it is
+// one edit in one place because the gate lives beside the fields it counts.
 func (d *Document) HasAttributeSources() bool {
 	if d == nil {
 		return false
 	}
-	return len(d.Attributes) > 0
+	return len(d.Attributes) > 0 || len(d.AttributeProviders) > 0
 }
 
 // BuildAttributeRegistry constructs a live *provider.AttributeRegistry from the
-// document's attributes: section: one in-memory provider.StaticAttributes per
-// declared slot, registered with a TTL of 0 (inline data is fixed for the life of
-// the process, so a freshness window would only buy re-reads of a value that
-// cannot have changed).
+// document's TWO attribute wiring sections, the way BuildRegistry constructs an
+// object registry from providers: and objects::
 //
-// It always returns a usable registry — empty when the document declares no
-// attributes — so a caller can wire it unconditionally, exactly as BuildRegistry
-// does for object providers. An empty registry is not the same as no registry: a
-// fetch against an unfilled slot reports
+//   - attribute_providers: declares an EXTERNAL source per slot (kind: csv | sql,
+//     see attribute_provider.go), and
+//   - attributes: declares bags INLINE, served per slot by an in-memory
+//     provider.StaticAttributes registered with a TTL of 0 (inline data is fixed
+//     for the life of the process, so a freshness window would only buy re-reads
+//     of a value that cannot have changed).
+//
+// A slot claimed by BOTH sections is not an error: the attribute_providers:
+// entry WINS and every inline entry for that slot is discarded entirely. The
+// discarded slots are reported by Document.AttributeCollisions, whose doc gives
+// the reasoning — it is Document.ProviderCollisions' rule at slot granularity.
+//
+// It always returns a usable registry — empty when the document declares neither
+// section — so a caller can wire it unconditionally. An empty registry is not
+// the same as no registry: a fetch against an unfilled slot reports
 // APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED, which the rules layer reads as "the
 // host knows nothing here" and evaluates against the floor bag rather than
 // failing the decision.
 //
-// Slots are registered in provider.AttributeSlots() order, not in the order the
-// file happens to list them, so a document with two bad slots always fails on the
-// same one and a build is reproducible. Within a slot, DECLARATION ORDER is
-// preserved — it is the order Enumerate returns.
+// Slots are filled in provider.AttributeSlots() order, not in the order the file
+// happens to list them, so a document with two bad slots always fails on the same
+// one and a build is reproducible. Within a slot, an inline section's DECLARATION
+// ORDER is preserved — it is the order Enumerate returns.
 //
 // A missing or unknown subject:, a missing id:, a duplicate (subject, id) pair,
 // metadata that is not a mapping, and a number no int64 or float64 can represent
-// are APERTURE_CONFIG_INVALID naming the entry. A value the shared value model
-// rejects keeps the model's own APERTURE_METADATA_INVALID (see
-// decodeAttributeMetadata for why that code is not replaced), and the account
-// wildcard "*" as an id is APERTURE_ATTRIBUTE_PROVIDER_INVALID from the provider
-// that refuses it — this loader does not restate the rules about what a KEY may
-// be, because provider is their one authority.
+// are APERTURE_CONFIG_INVALID naming the entry. So are a missing or unknown
+// kind:, a csv entry with no path:, a sql entry with no get_one: or no
+// connection:, a slot declared twice, and an unparseable ttl:. A value the shared
+// value model rejects keeps the model's own APERTURE_METADATA_INVALID (see
+// decodeAttributeMetadata for why that code is not replaced); an unknown
+// subject: keeps APERTURE_ATTRIBUTE_SLOT_UNKNOWN; a connection: naming nothing
+// the connections: block declares is APERTURE_SQL_PROVIDER_CONNECTION; and the
+// account wildcard "*" as an id is APERTURE_ATTRIBUTE_PROVIDER_INVALID from the
+// provider that refuses it — this loader does not restate the rules about what a
+// KEY may be, because provider is their one authority.
 //
 // baseDir is the directory relative paths resolve against — typically the seed
-// file's directory, "" for the process CWD. Nothing in the inline path reads a
-// file, so it is unread today; it is in the signature NOW because E3-S1's
-// `attribute_providers:` block declares kind: csv entries whose path: resolves
-// against exactly this directory, and the alternative is breaking an exported
-// signature every host has already called. The same reasoning put account into
-// rules.Engine.Selected one story before it was read: an argument that is
-// present-but-unread cannot change a behaviour, while an argument added later is
-// a break for everyone.
+// file's directory, "" for the process CWD. It is what a kind: csv entry's path:
+// is joined to when it is not absolute; it was reserved in this signature one
+// story before it was read, so that adding the file-backed sections broke no
+// caller.
+//
+// # A kind: sql entry needs the document's pools, which this form does not have
+//
+// connections: is ONE shared pool set: the object providers and the attribute
+// providers read through the same pools, and opening a second set behind the
+// caller's back would double every deployment's connections and hand nothing back
+// to close them. So this form passes no connections at all, and a kind: sql
+// attribute provider fails here with APERTURE_SQL_PROVIDER_CONNECTION naming
+// BuildAttributeRegistryWithConnections — the form that takes the *Connections
+// BuildRegistryWithConnections already returned. A document whose attribute
+// sources are inline or kind: csv needs no pool and builds fine through this one.
 func (d *Document) BuildAttributeRegistry(baseDir string) (*provider.AttributeRegistry, error) {
-	_ = baseDir // see the doc comment: reserved for E3-S1's file-backed entries.
-	groups, err := d.groupAttributes()
-	if err != nil {
-		return nil, err
-	}
-	reg := provider.NewAttributeRegistry()
-	for _, slot := range provider.AttributeSlots() {
-		records, ok := groups[slot]
-		if !ok {
-			continue
-		}
-		// NewStaticAttributes is the backstop for everything about a KEY that this
-		// loader deliberately does not restate: the empty key, the account
-		// wildcard, and a duplicate within the record set. Its errors pass through
-		// verbatim, keeping their codes and their registry fixups.
-		impl, err := provider.NewStaticAttributes(records)
-		if err != nil {
-			return nil, err
-		}
-		if err := reg.Register(slot, impl, provider.WithTTL(0)); err != nil {
-			return nil, err
-		}
-	}
-	return reg, nil
+	return d.buildAttributeRegistry(baseDir, nil, openAttributeSource)
 }
 
 // groupAttributes validates every inline entry and groups the records by slot.

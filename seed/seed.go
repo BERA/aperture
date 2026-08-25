@@ -58,11 +58,11 @@ const (
 // stable order (sorted by id/name) so a round-trip is byte-stable and
 // human-diffable.
 //
-// Five sections are runtime WIRING rather than model state, and are the seed
-// FILE's own source of truth: Connections, Providers, Objects, FieldTypes, and
-// Attributes. BuildRegistry turns the first four into a live *provider.Registry
-// and BuildAttributeRegistry turns the fifth into a live
-// *provider.AttributeRegistry; Apply writes none of them to storage, and because
+// Six sections are runtime WIRING rather than model state, and are the seed
+// FILE's own source of truth: Connections, Providers, Objects, FieldTypes,
+// Attributes, and AttributeProviders. BuildRegistry turns the first four into a
+// live *provider.Registry and BuildAttributeRegistry turns the last two into a
+// live *provider.AttributeRegistry; Apply writes none of them to storage, and because
 // Export reads the model back OUT of storage, none is ever reproduced by an
 // export. Live host domain-object metadata is deliberately not exportable state —
 // that is the provider cache, derived and disposable, never source of truth. The
@@ -94,6 +94,14 @@ type Document struct {
 	// none of it. See attribute.go for why it is its own key rather than a
 	// metadata: field on principals:/accounts:.
 	Attributes []Attribute `yaml:"attributes,omitempty" json:"attributes,omitempty"`
+	// AttributeProviders declares EXTERNAL sources for those same bags — a CSV of
+	// users, the host's own users table — one entry per attribute slot. It is the
+	// sixth wiring section and the attribute seam's counterpart of Providers:
+	// where Attributes lists bags inline, this points a slot at a file or a
+	// connection. Same rule as the other five: Apply writes nothing for it and an
+	// export reproduces none of it. See attribute_provider.go for why it is its
+	// own top-level key rather than a discriminated variant of providers:.
+	AttributeProviders []AttributeProvider `yaml:"attribute_providers,omitempty" json:"attribute_providers,omitempty"`
 }
 
 // Account mirrors model.Account in declarative form.

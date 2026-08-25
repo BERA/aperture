@@ -342,9 +342,10 @@ attributes:
 }
 
 // The gate a host reads before wiring an attribute registry into its decision
-// stack. E3-S1 adds `attribute_providers:` and MUST be OR'd into this method —
-// the gate lives beside the sections it counts precisely so that edit is one
-// edit in one file.
+// stack. It MUST count EVERY section that can declare an attribute source — the
+// gate lives beside the fields it counts precisely so adding one is one edit in
+// one file. hasObjectSources records the bug that taught us why: a gate written
+// over one section of two is a silent one.
 func TestHasAttributeSources(t *testing.T) {
 	if (*Document)(nil).HasAttributeSources() {
 		t.Error("a nil document declares no attribute source")
@@ -355,5 +356,11 @@ func TestHasAttributeSources(t *testing.T) {
 	doc := &Document{Attributes: []Attribute{{Subject: "user", ID: "alice"}}}
 	if !doc.HasAttributeSources() {
 		t.Error("an inline attributes: block is an attribute source")
+	}
+	// A seed whose ONLY attribute source is external must wire the resolvers too,
+	// or the directory it named would be read by nothing.
+	doc = &Document{AttributeProviders: []AttributeProvider{{Subject: "user", Kind: "csv", Path: "u.csv"}}}
+	if !doc.HasAttributeSources() {
+		t.Error("an attribute_providers: block is an attribute source")
 	}
 }
