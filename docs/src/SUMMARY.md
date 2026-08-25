@@ -18,6 +18,7 @@
   - [Mutations](cli/mutations.md)
   - [Provisioning](cli/provisioning.md)
   - [Portability](cli/portability.md)
+  - [Attributes](cli/attributes.md)
   - [serve](cli/serve.md)
   - [mcp](cli/mcp.md)
 - [Library overview](library/overview.md)

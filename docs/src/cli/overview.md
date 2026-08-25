@@ -25,6 +25,7 @@ name — this guide never re-tabulates them, so the two never drift.
 | [Mutations](mutations.md) | `put`, `get`, `list`, `delete`, `bestow`, `revoke`, `impersonate` | Read and change the model — entities, grants, delegation, impersonation. |
 | [Provisioning](provisioning.md) | `template`, `bulk` | Apply parameterized templates and transactional bulk grant/revoke. |
 | [Portability](portability.md) | `export`, `import` | Serialize the whole model to a state file and apply it back. |
+| [Attributes](attributes.md) | `attributes` | Inspect the host directories a rule reads `principal.*` / `account.*` from, read one, and drop cached bags. |
 | [`serve`](serve.md) | `serve` | Run the HTTP + Twirp server and admin UI. |
 | [`mcp`](mcp.md) | `mcp` | Serve the read-only MCP surface over stdio. |
 

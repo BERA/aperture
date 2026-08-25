@@ -10,10 +10,19 @@
 // (attributes.go): the same Querier, the same statements-in, the same
 // driver-value mapping table and the same value model, serving one attribute
 // SLOT instead of one object-type. Everything below is true of both unless the
-// Attributes doc says otherwise — and it says otherwise about exactly two
-// things, both concerning what a key is: an attribute fetch binds the BARE
-// subject id verbatim rather than an identity's terminal segment, and an
-// attribute "get all" selects a BARE id rather than a composed identity.
+// Attributes doc says otherwise — and it says otherwise about exactly three
+// things, all three concerning what a key is. An attribute fetch binds the BARE
+// subject id verbatim rather than an identity's terminal segment ("brand:42"
+// binds "42", but "alice" binds "alice"). An attribute "get all" selects a BARE
+// id rather than a composed identity — "SELECT u.id AS id", never
+// "SELECT 'user:' || u.id AS id", which is the one mistake with NO error
+// attached: an identity-shaped key enumerates, caches, and then matches no id
+// any Fetch presents, so the slot silently never answers. And
+// AttributeConfig.ListQuery is OPTIONAL where Config.ListQuery is required: an
+// empty one yields a FETCH-ONLY slot, because attribute enumeration never
+// participates in scope resolution, so there is no denial-by-wiring-gap to
+// prevent — and a host gains the ability to serve the principal being decided
+// about without exposing its whole user table to an admin enumeration.
 //
 //	db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 //	brands, err := sqlprovider.New(db, sqlprovider.Config{

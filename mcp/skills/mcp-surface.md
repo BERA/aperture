@@ -1,6 +1,6 @@
 ---
 name: mcp-surface
-description: Aperture's read-only MCP surface — the decide, simulate, and inspect tools an agent drives over stdio, with the SDK-free-core + gosdk-adapter + import-firewall house pattern that keeps the protocol SDK out of the core.
+description: Aperture's read-only MCP surface — the decide, simulate, and inspect tools an agent drives over stdio, what an explain/simulate trace discloses about a principal's and an account's attribute bags (values included, via the ExplainOut = engine.Trace alias) and why there is no attribute-directory tool, with the SDK-free-core + gosdk-adapter + import-firewall house pattern that keeps the protocol SDK out of the core.
 applies_to: [mcp, service, engine, what-if]
 ---
 
@@ -50,6 +50,23 @@ gets the same verdict as every other surface — and a filtered
 - `aperture_explain` — the full decision trace: subject set, every grant
   considered with its per-grant outcome, the deciding grants, the verdict.
 - `aperture_explain_batch` — bulk explain, aligned with queries.
+
+**What a trace discloses about attributes.** `ExplainOut` and `SimulateOut` are
+type ALIASES for `engine.Trace`, so these tools serialize it verbatim — including
+its `Attributes` field, which carries the `principal` and `account` bags the
+decision's rules were evaluated against, VALUES INCLUDED. That disclosure reached
+this surface with no `mcp/` code change at all, which is why it is stated here.
+It is deliberate: the two bags are the subjects of the very request being
+explained, so a trace tells the asker about their own decision and nothing else.
+Gate accordingly — an agent free to explain any (account, principal) pair can
+read that principal's bag for that account.
+
+There is deliberately NO attribute tool. Listing a slot returns the host's whole
+user table, and MCP is where an agent doing that is least defensible, so the
+directory read stays a system-tier CLI operation (`aperture attributes`) and
+never becomes a tool. `aperture_simulate` cannot inject a bag either: the overlay
+has no field for one, and a previewed unsaved rule evaluates against the floor
+bags alone.
 
 ### Simulate (what-if, never persisted)
 - `aperture_simulate` — render the decision (full trace) for a question under a

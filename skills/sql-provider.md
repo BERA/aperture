@@ -1,6 +1,6 @@
 ---
 name: sql-provider
-description: The SQL-backed ObjectProvider — the Querier seam and the two wiring paths (Go sqlprovider.New and a seed document's connections:/kind: sql block), the four casting rules a statement must obey (arrays to_jsonb, day-granular dates ::text, numeric ::float8 or ::text, identity composed in the id column), the un-catchable trap where SELECT tags yields a string that silently fails every membership predicate, the closed driver-value mapping table, what Fetch binds and what List/Query enumerate, filtering in Go rather than SQL, the connection defaults and pool-sharing rule, why BuildRegistry refuses a document declaring connections:, why nothing is pinged at build, the coded errors, and the gated real-Postgres integration run.
+description: The SQL-backed ObjectProvider and AttributeProvider — the Querier seam and the two wiring paths (Go sqlprovider.New and a seed document's connections:/kind: sql block), the four casting rules a statement must obey (arrays to_jsonb, day-granular dates ::text, numeric ::float8 or ::text, identity composed in the id column), the un-catchable trap where SELECT tags yields a string that silently fails every membership predicate, the closed driver-value mapping table, what Fetch binds and what List/Query enumerate, filtering in Go rather than SQL, the connection defaults and pool-sharing rule, why BuildRegistry refuses a document declaring connections:, why nothing is pinged at build, the coded errors, the attribute seam (*Attributes and the attribute_providers: block, whose get_one binds a BARE subject id and whose optional get_all selects one), and the gated real-Postgres integration run.
 applies_to: [library, cli, http, mcp]
 ---
 
@@ -498,6 +498,93 @@ Every mapped row is then checked against the shared value model
 fails the fetch as `APERTURE_METADATA_INVALID` instead of surfacing as an
 evaluation error on the `Check` hot path.
 
+## The attribute seam: `*Attributes`
+
+The same package serves the **attribute** seam — one slot's directory instead of
+one object-type's table — through `sqlprovider.NewAttributes(q, AttributeConfig{…})`,
+registered in a `provider.AttributeRegistry` rather than a `provider.Registry`:
+
+```go
+users, err := sqlprovider.NewAttributes(db, sqlprovider.AttributeConfig{
+	Slot:       provider.AttributeSlotUser,
+	FetchQuery: `SELECT department, clearance FROM users WHERE id = $1`,
+	ListQuery:  `SELECT u.id AS id, u.department, u.clearance FROM users u`,
+})
+if err != nil { return err }
+attrs.MustRegister(provider.AttributeSlotUser, users, provider.WithTTL(60*time.Second))
+```
+
+```yaml
+attribute_providers:            # the declarative path — NOT a providers: entry
+  - subject: user
+    kind: sql
+    connection: main            # the SAME pool set object providers read through
+    get_one: SELECT department, clearance FROM users WHERE id = $1
+    get_all: SELECT u.id AS id, u.department, u.clearance FROM users u
+    ttl: 60s
+```
+
+**Everything above is true here word for word**: the `Querier` seam, engine-native
+placeholders, bound-never-interpolated parameters, columns becoming metadata, the
+driver-value mapping table, the four casting rules, the timeout, the read-only
+`Metadata` contract, filtering in Go. `metadataValue` is literally the same
+function, so a column read through an object provider and the same column read
+through an attribute provider produce the same Go value and therefore the same
+decision.
+
+Three things differ, and all three are about what a **key** is.
+
+**1. `FetchQuery` binds the BARE subject id, verbatim.** An object provider binds
+the identity's terminal segment value, so `brand:42` and `account:acme/brand:42`
+both bind `42`. An attribute key has no segments to strip — it is a principal id
+or an account id, an opaque handle into the host's directory — so it is bound
+exactly as it arrived: `Fetch(ctx, "alice")` → `QueryContext(stmt, "alice")`.
+
+**2. `ListQuery` selects a BARE id — and this is casting rule 4's counterpart,
+with no error attached.**
+
+```sql
+SELECT u.id AS id, u.department FROM users u            -- CORRECT
+SELECT 'user:' || u.id AS id, u.department FROM users u -- WRONG, and SILENT
+```
+
+An identity-shaped key is a perfectly legal opaque string. It enumerates happily,
+caches happily, and then matches **no principal id any `Fetch` ever presents**,
+because the decision path fetches by the bare id. The slot simply never answers
+and nothing anywhere complains. There is no check this package could add — the
+key is opaque, so there is nothing to test it against — which is exactly why the
+asymmetry is written down in the `sqlprovider/attributes.go` file doc, in
+`csvprovider`'s `Attributes`, and on `seed.AttributeProvider.GetAll`. All three
+move together.
+
+**3. `ListQuery` is OPTIONAL, where `Config.ListQuery` is required.**
+`Config.ListQuery` is required because an `ObjectProvider` that can be fetched
+from but not enumerated answers `List` with an error, and an errored enumeration
+reads as "no access" one layer up — a denial caused by a wiring gap. Attribute
+enumeration never participates in scope resolution (a `*provider.AttributeRegistry`
+structurally cannot be a `scope.ObjectLister`), so an empty `ListQuery` yields a
+**fetch-only** provider: every decision path works unchanged and only `List` /
+`Query` refuse, with `APERTURE_CONFIG_INVALID` naming the statement to declare.
+That is a feature — a host can serve the principal currently being decided about
+without exposing its whole user table to an admin enumeration.
+
+`AttributeConfig` otherwise mirrors `Config`: `Slot` replaces `ObjectType` (it is
+not load-bearing per row — an attribute key is opaque — but it is required, since
+it is what a runtime diagnostic names when one of three directories is down),
+`IDColumn` defaults to `"id"` and is removed from the row before the rest becomes
+the bag, and `Timeout` defaults to `DefaultTimeout`. The timeout matters *more*
+here: an attribute bag is read by every rule against every object in a decision,
+so an unbounded statement is not one object type answering slowly, it is the whole
+decision hanging.
+
+A diagnostic names the **slot**, the **column**, the row's **position**, and the
+**key** — never a value, for the reason the object seam never names one. Errors
+are the same set (`APERTURE_SQL_PROVIDER_QUERY` / `_SCAN` / `_AMBIGUOUS` /
+`_ROW_IDENTITY`), plus `APERTURE_NOT_FOUND` for a key the directory does not know
+— which the decision path treats **leniently**, so a subject with no row decides
+against the engine's floor bag rather than failing. See
+`skills/attribute-providers.md` for the leniency contract and the slot set.
+
 ## Timeouts, concurrency, and the read-only contract
 
 Every statement runs under `context.WithTimeout`, `DefaultTimeout` (5s) unless
@@ -595,6 +682,11 @@ that pgx is linked into a `CGO_ENABLED=0` binary and actually connects, and that
 a real Postgres result set lands in the value model the way the mapping table
 claims.
 
+`TestPostgresIntegration` covers **both** seams: `_SeedFileAloneServesRealObjects`
+for `providers:`, and `_AttributeProviderServesASlot` for `attribute_providers:`
+— the latter creating a real `users` table, serving a slot from it through the
+same pool, and reading a bag back through `Fetch` and `Enumerate`.
+
 ## Update-Demand
 
 | Change | Also update |
@@ -605,4 +697,5 @@ claims.
 | `BuildRegistry` / `BuildRegistryWithConnections` behaviour, or `Connections`' lifetime | "BuildRegistry refuses…" above, `docs/src/concepts/seed.md`, and the doc comments in `seed/provider.go` |
 | A `sqlprovider` or connection error code | `errors/codes.go` (`AllCodes` + `Registry` with a Message and Fixups), the error table above, then `make docs-gen` |
 | The `Querier` seam | the interface's doc comment, "The Querier seam" above, and `docs/src/concepts/providers.md` |
+| The attribute statement contract (`AttributeConfig`, what `Fetch` binds, the bare id in `ListQuery`, `ListQuery` staying optional) | "The attribute seam" above, the `sqlprovider/attributes.go` file doc, `seed.AttributeProvider.GetOne`/`GetAll`, `skills/attribute-providers.md`, `skills/metadata-values.md`, `docs/src/concepts/providers.md` ("Attribute providers"), and `docs/src/concepts/seed.md` ("External attribute sources") — the bare-id contract has **no gate and cannot have one**, so every restatement of it moves together |
 | The gated integration run's env vars | this doc, the `Makefile` comment, and the "Gated, NOT in `make test`" list in `CLAUDE.md` |

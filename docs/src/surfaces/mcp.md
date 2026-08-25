@@ -42,6 +42,27 @@ tool identity), so the SDK-free core and the SDK adapter never drift.
 | `aperture_explain` | Return the full structured decision trace for one question: the expanded subject set, every grant considered with its per-grant outcome, which grants decided, and the final verdict. Use to understand *why*. | `service.Explain` |
 | `aperture_explain_batch` | Return decision traces for many questions in one round-trip, aligned with the input queries. | `service.ExplainBatch` |
 
+#### What a trace discloses about attributes
+
+`ExplainOut` — and `SimulateOut` — are **type aliases** for `engine.Trace`, so
+every one of these tools serializes the trace verbatim. That includes its
+`Attributes` field: the `principal` and `account` bags the decision's rules were
+evaluated against, **values included**.
+
+That is a deliberate disclosure, and it reached this surface with no `mcp/` code
+change at all — which is exactly why it is written down here. The two bags are
+the subjects of the very request being explained (the principal and account named
+in the query), so a trace tells the asker about their own decision and nothing
+else; see [the attribute bags](../library/decision-api.md#the-attribute-bags).
+Gate the MCP surface accordingly: an agent that may call `aperture_explain` on an
+arbitrary `(account, principal)` pair can read that principal's attribute bag for
+that account.
+
+There is deliberately **no attribute tool**. Listing a slot returns the host's
+whole user table, and MCP is where an agent doing that is least defensible, so
+the directory read stays a system-tier CLI operation
+([`aperture attributes`](../cli/attributes.md)) and never becomes a tool.
+
 #### `aperture_enumerate`'s `Fields` filter
 
 `Fields` is an **optional** object of metadata predicates that narrows the

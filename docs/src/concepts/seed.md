@@ -26,6 +26,7 @@ providers:     [ ... ]   # runtime wiring, not model state (see below)
 objects:       [ ... ]   # inline object metadata — also wiring, not model state
 field_types:   [ ... ]   # declared types for inline metadata fields — also wiring
 attributes:    [ ... ]   # inline SUBJECT attributes (principal / account) — also wiring
+attribute_providers: [ ... ]  # EXTERNAL sources for those same bags — also wiring
 ```
 
 `connections:` is a **map** keyed by name, not a list: the name is what a
@@ -34,9 +35,9 @@ provider entry's `connection:` refers to, and a map cannot declare one twice.
 Every field mirrors its `model` counterpart in declarative form. The `Document`
 started as a minimal seed shape and was generalized to the complete model, so **an
 export file is a strict superset of a seed file**: a seed that omits
-`templates`/`rules`/`providers`/`objects`/`field_types`/`attributes` loads
-unchanged, and a full export reloads through the very same path. The field set is
-additive-only, so old seeds keep loading.
+`templates`/`rules`/`providers`/`objects`/`field_types`/`attributes`/`attribute_providers`
+loads unchanged, and a full export reloads through the very same path. The field
+set is additive-only, so old seeds keep loading.
 
 Rule ASTs are carried as **raw JSON** — exactly the `rules` package's canonical
 `Node` serialization — so the file never invents a second rule format; it is the
@@ -546,6 +547,10 @@ floor bag (`{id, kind}`), so a rule reading an attribute nobody declared is
 deny-safe rather than a non-decision. See
 [Wiring a `*provider.AttributeRegistry`](rules.md#wiring-a-providerattributeregistry).
 
+To back a slot with the host's real directory instead of an inline list, declare
+it under [`attribute_providers:`](#external-attribute-sources) — and note that
+when both sections claim one slot, the external entry wins it outright.
+
 ### Why it is not a `metadata:` field on `principals:`
 
 `principals:` and `accounts:` are **model state** — rows `Apply` writes and
@@ -556,6 +561,139 @@ be one of two bad things — **lossy**, because it silently dropped the bags it
 could not read out of storage, or **untruthful**, because it invented them. Its
 own key keeps the line exactly where the other wiring sections already keep it.
 
+## External attribute sources
+
+`attributes:` lists bags inline. `attribute_providers:` points a slot at the
+host's **real** directory instead — a CSV export, or the `users` and `accounts`
+tables the deployment already has — one entry per slot:
+
+```yaml
+connections:
+  main:
+    dsn_env: APP_DATABASE_URL
+
+attribute_providers:
+  - subject: user
+    kind: sql
+    connection: main
+    get_one: SELECT department, clearance FROM users WHERE id = $1
+    get_all: SELECT u.id AS id, u.department, u.clearance FROM users u
+    ttl: 60s
+  - subject: machine
+    kind: csv
+    path: machines.csv
+```
+
+`subject:` names the slot exactly as it does on `attributes:` — `user`,
+`machine`, or `account` — and each slot may be declared **at most once**.
+`kind:` is the implementation, `csv` or `sql`; the two words are why the slot is
+spelled `subject:` here rather than `kind:`. Everything Aperture can check
+without reading a file or dialling a database is checked **at build**: the
+subject must name a slot, the kind must be one this build knows, a `csv` entry
+must carry a `path:`, a `sql` entry must carry a `connection:` naming a
+**declared** `connections:` entry plus a `get_one:`, and a `ttl:` must parse. A
+source that only failed under a decision would fail as a *denial*.
+
+`ttl:` and `max_size:` are **per slot**, not per document: the three slots have
+genuinely different change rates and cardinalities, and one number covering all
+of them would tune for whichever entry was declared last. `ttl: "0"` never
+expires. A slot's TTL is the window a **revoked** clearance keeps authorizing
+for — see [`aperture attributes`](../cli/attributes.md), which reads it back and
+can close it.
+
+`dsn:` is refused **by name** wherever it appears, here as on a `providers:`
+entry: credentials belong to a `connections:` entry's `dsn_env:`.
+
+### The bare-id contract
+
+An attribute key is a **bare** principal id or account id — an opaque handle into
+the host's directory that Aperture never parses. An object id is a segmented
+identity. The two statements therefore differ, in both directions:
+
+```sql
+-- providers:            an OBJECT provider selects the FULL IDENTITY
+get_all: SELECT 'user:' || u.id AS id, u.department FROM users u   -- WRONG here
+-- attribute_providers:  an ATTRIBUTE provider selects a BARE ID
+get_all: SELECT u.id AS id, u.department FROM users u              -- CORRECT
+```
+
+`get_one:` differs the same way. An object provider binds the identity's
+**terminal segment value** (`brand:42` and `account:acme/brand:42` both bind
+`42`); an attribute provider binds the **bare subject id verbatim**, because
+there is nothing to strip. The same applies to a `csv` entry's `id` column:
+`alice`, not `user:alice`.
+
+**Nothing can catch a mistake here.** An identity-shaped key is a perfectly legal
+opaque string: it enumerates happily, caches happily, and then matches no
+principal id any fetch ever presents, because the decision path fetches by the
+bare id. The slot simply never answers, and nothing anywhere complains. There is
+no check any package could add — the key is opaque, so there is nothing to test
+it against — which is exactly why the asymmetry is written down here, on
+`seed.AttributeProvider.GetAll`, and in both loaders' package docs. It is also
+why `attribute_providers:` is a separate top-level key rather than a variant of
+`providers:`: sharing one struct would make copying a statement between them a
+silent fault.
+
+### `get_all:` is optional, where an object provider's is required
+
+A `providers:` entry must declare both statements, because an object provider
+that can be fetched from but not enumerated answers `List` with an error, and an
+errored enumeration reads as "no access" one layer up — a denial caused by a
+wiring gap.
+
+That reason does not apply to an attribute slot: attribute enumeration **never**
+participates in scope resolution (see [Attribute
+providers](providers.md#attribute-providers)). Omitting `get_all:` yields a
+**fetch-only** slot — every decision path works unchanged, and only the
+administrative listing refuses, with a coded error naming the statement to
+declare. That is a feature: a host can let Aperture read the attributes of the
+principal currently being decided about **without** exposing its whole user
+table to an admin enumeration.
+
+### Building it, and the shared pool set
+
+```go
+reg, conns, err := doc.BuildRegistryWithConnections(dir)   // object providers
+if err != nil {
+    return err
+}
+defer conns.Close()
+attrs, err := doc.BuildAttributeRegistryWithConnections(dir, conns)
+```
+
+`BuildAttributeRegistryWithConnections` **takes** a `*Connections` rather than
+opening one, and that is the point: `connections:` is the document's **single**
+pool set, and the object registry and the attribute registry read through the
+same pools. An entry point that opened its own would double every deployment's
+connections and hand nothing back to close them. The plain
+`BuildAttributeRegistry(baseDir)` passes no pools — correct for a document whose
+attribute sources are all `csv` or inline — so a `kind: sql` entry fails there
+with `APERTURE_SQL_PROVIDER_CONNECTION` naming the form to call, rather than
+lazily on the first decision that needed the database.
+
+Slots are filled in slot order (`user`, `machine`, `account`), not file order, so
+a document with two bad slots always fails on the same one.
+
+### Precedence: the external source wins, entirely
+
+When both sections declare the same slot, the `attribute_providers:` entry
+**wins and every inline `attributes:` entry for that slot is discarded
+entirely**. There is no per-subject merge and no fallback: an inline id the
+external source happens to lack is simply not resolvable, exactly as if the entry
+had never been written. It is the [`providers:` / `objects:`
+rule](#when-both-sections-claim-a-type) at slot granularity, and for the same
+reason — field-level merging is the most useful-sounding behaviour and the most
+impossible to debug, because a rule reading a department the directory silently
+did not override is a support ticket nobody can reproduce.
+
+The discard is **not silent**. `Document.AttributeCollisions()` reports the
+affected slots and the caller surfaces them (`aperture` prints a warning). Only
+slot **names** are reported, never keys, so the warning cannot leak a directory's
+contents. `Document.AttributeSlotSources()` reports where each slot's bags come
+from — `"csv"`, `"sql"`, or `"inline"` — so a surface that displays the wiring
+reads the precedence rule instead of re-deriving it and eventually disagreeing
+with it.
+
 ## What is *not* in the file
 
 Two things are deliberately excluded from the model state file:
@@ -565,14 +703,17 @@ Two things are deliberately excluded from the model state file:
   back, and a provider produces no model rows, it is never reproduced.
 - **Live subject attributes** — a principal's or an account's bag is the host
   directory's, for the same reason and with the same consequence: `Apply` writes
-  no row for `attributes:` and an export reproduces none of it.
+  no row for `attributes:` or `attribute_providers:` and an export reproduces
+  none of either.
 - **Runtime *wiring*** — the `connections:`, `providers:`, `objects:`,
-  `field_types:` and `attributes:` sections are runtime wiring, not model state.
-  `Apply` never writes any of them to storage; instead
+  `field_types:`, `attributes:` and `attribute_providers:` sections are runtime
+  wiring, not model state. `Apply` never writes any of them to storage; instead
   `Document.BuildRegistry(baseDir)` — or `BuildRegistryWithConnections` when the
   document declares `connections:` — turns the first four into a live
-  `*provider.Registry`, and `Document.BuildAttributeRegistry(baseDir)` turns the
-  fifth into a live `*provider.AttributeRegistry`. **The seed file is the source
+  `*provider.Registry`, and `Document.BuildAttributeRegistry(baseDir)` — or
+  `BuildAttributeRegistryWithConnections` when an attribute source is
+  `kind: sql` — turns the last two into a live `*provider.AttributeRegistry`.
+  **The seed file is the source
   of truth for them**, exactly as auth config is — and an export reproduces none
   of them. A declared provider names an `object_type`, a `kind` (`csv` or `sql`),
   optional cache `ttl`/`max_size`, and then either a `path` (for `csv`, resolved

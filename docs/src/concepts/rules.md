@@ -587,6 +587,46 @@ Any step's failure is an `APERTURE_*` coded error, and the caller treats it as a
 [scope strategies](scopes.md) get their variant: the engine is wired as
 `scope.Deps{Rules: engine}`.
 
+### One bag per decision
+
+`principal` and `account` are constant for the whole decision, so they are
+resolved **once** and memoized for it, exactly as the reference instant `NOW` is
+snapshotted once. The decision engine opens that scope at the same three
+boundaries it opens the instant's — `Check`, `Enumerate`, `Explain`.
+
+It is a **correctness** property, not only a cost one: a bag is served through a
+cache with a TTL, and a TTL expiring halfway through an enumeration would judge
+the first candidates against one version of the principal and the last against
+another — a result set no single view of the principal justifies, with no error
+anywhere. An **absence memoizes** (an unwired slot, or a directory with no
+record, is a complete answer describing a steady state, so a 1,000-object
+enumeration performs one resolution); a **failure does not**, and that costs
+almost nothing, because a failure ends the decision.
+
+The memo is keyed by the subject each bag was resolved for and re-resolves on a
+mismatch, so a scope travelling somewhere its author did not picture cannot serve
+one principal's attributes as another's. There is no API to hand a bag in: a
+caller-supplied principal bag would be a caller-supplied answer to "who is
+asking".
+
+### Under impersonation, `principal.*` is the effective subject
+
+When a decision resolves under an active [impersonation](impersonation.md)
+session, the rule is told about the **effective subject** — the *target* under
+`become`, the *operator* under `augment` — which is the same principal the
+resolved grant set describes. `become` resolves the target's id **and** the
+target's kind, so `principal.*` is read from the target's directory.
+
+The invariant is that the rule and the grant set always describe the same
+principal. A decision resolving the target's grants while reading the operator's
+attributes is an authorization bug that leaves no mark in a trace.
+
+Audit is unaffected: the request and the decision still name the real operator,
+and the trace still records the session. An inert or expired session elevates
+nothing and reads the operator's own bag. Note that `principal.id` therefore
+*changes meaning* under `become` — a rule comparing `principal.id ==
+object.owner` asks "does the target own it", which is what that mode means.
+
 ## Where this leads
 
 Rules are one of two ways a scope strategy can decide object membership; the
