@@ -127,6 +127,35 @@ const (
 	// purpose — an enumeration that silently dropped the value would read as "no
 	// access" and hide the fault.
 	APERTURE_PROVIDER_REFERENCE_MISMATCH Code = "APERTURE_PROVIDER_REFERENCE_MISMATCH"
+	// APERTURE_ATTRIBUTE_SLOT_UNKNOWN — an attribute slot outside the closed set
+	// (user, machine, account) was presented: registered, fetched, enumerated, or
+	// parsed from a bare kind string. The set is closed because it enumerates the
+	// parties a decision HAS, not the types a host happens to define, so an
+	// unknown slot is a call-site bug rather than a wiring gap — and it fails
+	// where it is presented rather than resolving to no provider and then to an
+	// empty attribute bag, which reads as "this subject has no attributes" and
+	// denies silently.
+	APERTURE_ATTRIBUTE_SLOT_UNKNOWN Code = "APERTURE_ATTRIBUTE_SLOT_UNKNOWN"
+	// APERTURE_ATTRIBUTE_PROVIDER_INVALID — an attribute provider registration or
+	// an attribute key is unusable: a nil provider, a second provider for a slot
+	// that already has one, a record declared twice, an empty key, or the account
+	// wildcard "*" as a key. The wildcard is refused at the seam because the only
+	// bag that could answer "the attributes of every account" is one account's
+	// data served as another's.
+	APERTURE_ATTRIBUTE_PROVIDER_INVALID Code = "APERTURE_ATTRIBUTE_PROVIDER_INVALID"
+	// APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED — attributes were requested for a
+	// slot that is within the closed set but has no registered provider. It is
+	// reported rather than answered with an empty bag: an empty bag is
+	// indistinguishable from a subject that genuinely has no attributes, so a
+	// missing wiring would surface as a rule quietly evaluating false.
+	APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED Code = "APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED"
+	// APERTURE_ATTRIBUTE_PROVIDER_FETCH — a host AttributeProvider's
+	// Fetch/List/Query returned a plain (uncoded) error. The cause is wrapped
+	// verbatim; an error already carrying an APERTURE_* code (notably
+	// APERTURE_NOT_FOUND for an unknown key) passes through unwrapped instead, so
+	// "there is no such principal" stays distinguishable from "the directory is
+	// unreachable" — the two mean opposite things for a decision.
+	APERTURE_ATTRIBUTE_PROVIDER_FETCH Code = "APERTURE_ATTRIBUTE_PROVIDER_FETCH"
 	// APERTURE_SQL_PROVIDER_QUERY — a SQL-backed ObjectProvider's statement did
 	// not run: a connection, permission, syntax, placeholder-arity, or timeout
 	// failure reported by the host's database. The driver's error is wrapped
@@ -435,6 +464,38 @@ var Registry = map[Code]Metadata{
 			"Check the declared target against the values the field actually carries: an identity whose terminal segment type is not the declared type is rejected rather than skipped.",
 		},
 	},
+	APERTURE_ATTRIBUTE_SLOT_UNKNOWN: {
+		Message: "not an attribute slot",
+		Fixups: []string{
+			"Use one of the three declared slots: user, machine, or account (provider.AttributeSlotUser / AttributeSlotMachine / AttributeSlotAccount).",
+			"Converting a principal kind that arrived as a bare string? Cross over with provider.ParseAttributeSlot so an unknown kind fails at the conversion instead of resolving to an empty attribute bag.",
+			"The slot set is closed on purpose — it names the parties a decision has. Model a further distinction as a FIELD in the bag, not as a fourth slot.",
+		},
+	},
+	APERTURE_ATTRIBUTE_PROVIDER_INVALID: {
+		Message: "attribute provider registration or attribute key is invalid",
+		Fixups: []string{
+			"Register a non-nil provider, and at most one per slot; a duplicate is refused rather than replaced so one directory cannot silently shadow another.",
+			"Declare each attribute key at most once within a provider.",
+			"Fetch with a real key: a principal id for the user and machine slots, an account id for the account slot. An empty key names nobody.",
+			"Resolve the account wildcard \"*\" to a concrete account before fetching attributes; it is never a legal attribute key.",
+		},
+	},
+	APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED: {
+		Message: "no attribute provider is registered for the slot",
+		Fixups: []string{
+			"Register an AttributeProvider for the slot before fetching its attributes.",
+			"Check that the principal's kind maps to the slot you wired: a machine principal reads the machine slot, not the user slot.",
+			"Deployment genuinely has no subjects of this kind? Then nothing should be fetching that slot — fix the caller rather than registering an empty provider.",
+		},
+	},
+	APERTURE_ATTRIBUTE_PROVIDER_FETCH: {
+		Message: "attribute provider returned an error",
+		Fixups: []string{
+			"Inspect the wrapped cause for the underlying provider failure.",
+			"Return APERTURE_NOT_FOUND from the provider for a key it does not know, so an unknown subject stays distinguishable from an unreachable directory.",
+		},
+	},
 	APERTURE_SQL_PROVIDER_QUERY: {
 		Message: "SQL object provider could not run its statement",
 		Fixups: []string{
@@ -630,6 +691,10 @@ var AllCodes = []Code{
 	APERTURE_PROVIDER_FETCH,
 	APERTURE_PROVIDER_REFERENCE_INVALID,
 	APERTURE_PROVIDER_REFERENCE_MISMATCH,
+	APERTURE_ATTRIBUTE_SLOT_UNKNOWN,
+	APERTURE_ATTRIBUTE_PROVIDER_INVALID,
+	APERTURE_ATTRIBUTE_PROVIDER_UNREGISTERED,
+	APERTURE_ATTRIBUTE_PROVIDER_FETCH,
 	APERTURE_SQL_PROVIDER_QUERY,
 	APERTURE_SQL_PROVIDER_AMBIGUOUS,
 	APERTURE_SQL_PROVIDER_SCAN,
