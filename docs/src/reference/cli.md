@@ -14,6 +14,7 @@
 
 | Command | Summary |
 | --- | --- |
+| [`attributes`](#aperture-attributes) | Inspect the attribute directories a seed wires, read one, or drop cached bags |
 | [`bestow`](#aperture-bestow) | Bestow (delegate) a grant you hold to another principal |
 | [`bulk`](#aperture-bulk) | Provision or deprovision many grants in one transactional call |
 | [`check`](#aperture-check) | Decide whether a principal may take an action on an object |
@@ -31,6 +32,161 @@
 | [`revoke`](#aperture-revoke) | Revoke a grant you previously bestowed |
 | [`serve`](#aperture-serve) | Run the Aperture HTTP server |
 | [`template`](#aperture-template) | Manage and apply provisioning templates |
+
+## `aperture attributes`
+
+Inspect the attribute directories a seed wires, read one, or drop cached bags
+
+An attribute slot is a HOST DIRECTORY — the user table, the service-account
+registry, the tenant catalogue — that a rule reads `principal.*` and `account.*`
+out of. There are exactly three slots (user, machine, account) and each caches
+the bags it has fetched, per slot, with its own ttl: and max_size:.
+
+THE CACHE WINDOW IS A SECURITY PROPERTY, not only a tuning knob. Object metadata
+that goes stale for a TTL is usually tolerable. An attribute bag is the ASKER'S
+STANDING — the clearance, the department, the plan — so until a cached bag
+expires, every decision about that subject keeps evaluating against access the
+host has ALREADY TAKEN AWAY. Principals are the classic revoke case, and a
+revocation that takes effect `ttl:` later is a revocation that has not happened
+yet. What a slot's ttl: buys in fetch traffic it pays for in that delay.
+
+So: pick a slot's ttl: for how fast its revocations must land, read back what a
+deployment is actually running with `aperture attributes slots`, and close the
+window on a specific subject with `aperture attributes invalidate`.
+
+Reading a directory in bulk (`query`) and dropping cached bags (`invalidate`)
+are SYSTEM-TIER operations: both require --principal holding system-admin
+authority in --account, and a refusal returns nothing at all — no partial page,
+no count, and nothing that tells an unauthorized caller which slots exist.
+
+```
+aperture attributes <command>
+```
+
+### `aperture attributes invalidate`
+
+Drop cached attribute bags so the next decision re-reads them (system-admin tier)
+
+Drops cached bags, so the next decision about the affected subjects pulls fresh
+ones from the host directory. Three forms:
+
+```text
+  aperture attributes invalidate user --id alice   one subject, one slot
+  aperture attributes invalidate user             every bag in one slot
+  aperture attributes invalidate --all            every bag in every slot
+```
+
+INVALIDATION IS A SECURITY CONTROL, NOT A PERFORMANCE KNOB. A cached attribute
+bag is the asker's standing, so a REVOKED CLEARANCE KEEPS AUTHORIZING until that
+bag expires: for the length of the slot's ttl:, every decision about that
+subject is made against access the host has already removed. Waiting the window
+out is not a remedy, it is the exposure. An operator who has just removed
+someone's access invalidates that subject here, and then the removal is true.
+
+Scope: this drops the caches of THE PROCESS THAT RUNS IT. That makes it exact
+for a host embedding Aperture (it is the operator's spelling of
+provider.AttributeRegistry.Invalidate, which such a host calls the moment its
+directory changes) and it makes a ONE-SHOT invocation self-contained: this
+process starts with a cold cache and exits with it, so there is nothing here for
+a stale bag to survive in. For a long-running `aperture serve`, the controls
+that reach ITS cache are the slot's ttl: — set it to how fast that directory's
+revocations must land — and a restart.
+
+Requires --principal holding system-admin authority in --account: the result
+reports whether a bag was cached, which is a fact about who has recently been
+decided about, and clearing a large slot costs the next wave of decisions a
+provider round-trip each.
+
+```
+aperture attributes invalidate [options] <slot>
+```
+
+| Name | Aliases | Type | Default | Usage |
+| --- | --- | --- | --- | --- |
+| `--account` | — | string | — | active account (required for system-tier authority resolution) |
+| `--all` | — | bool | — | clear EVERY slot's cache; takes no &lt;slot&gt; argument and no --id |
+| `--id` | — | string | — | drop only this subject's cached bag (a bare principal or account id); omit to clear the whole slot |
+| `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
+| `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
+
+### `aperture attributes query`
+
+Read a page of one attribute slot's directory (system-admin tier)
+
+Returns up to --limit records of &lt;slot&gt; — user, machine, or account — as a JSON
+array of {id, attributes}, narrowed by attribute predicates.
+
+THIS IS A SYSTEM-TIER READ. Unfiltered, it returns the head of the host's user
+table, keys and bags together, so it requires --principal holding system-admin
+authority in --account. A refusal returns NOTHING — no partial page, no count,
+and no way to tell an empty slot from a full one or from an unwired one. Ask
+`aperture explain` about your own authority if a refusal is unexpected.
+
+--field and --fields-json narrow the result by ATTRIBUTE, on exactly the
+predicate `aperture enumerate` applies to object metadata: predicates are ANDed,
+a field the bag does not carry never matches, a list-valued field matches by
+membership, and everything else matches by TYPED equality, so the string "5"
+never matches the number 5. --field always sends a string; use --fields-json
+when a number, bool, or list is genuinely meant:
+
+```text
+  aperture attributes query user --principal alice --account acme \
+    --field department=eng --fields-json '{"clearance":3}'
+```
+
+Both may be given together: --fields-json is merged FIRST and --field entries
+then override it by key.
+
+A slot whose sql: entry declares no get_all: is FETCH-ONLY by design — it can
+answer the decision path without exposing the whole table to an enumeration —
+and this command reports that provider's coded refusal rather than an empty
+page.
+
+```
+aperture attributes query [options] <slot>
+```
+
+| Name | Aliases | Type | Default | Usage |
+| --- | --- | --- | --- | --- |
+| `--account` | — | string | — | active account (required for system-tier authority resolution) |
+| `--field` | — | string | — | object-metadata predicate as key=value, repeatable; the value is ALWAYS a string, so --field seats=5 matches the string "5" and never the number 5 (use --fields-json for that). Overrides --fields-json on a key collision |
+| `--fields-json` | — | string | — | object-metadata predicates as a JSON object, for values that are genuinely a number, bool, or list (e.g. '{"seats":5,"active":true,"tags":["a"]}'). Merged first; --field entries then override by key |
+| `--limit` | — | int | `0` | cap the number of returned records (&lt;=0 means the default; the registry clamps it regardless) |
+| `--principal` | — | string | — | authenticated principal performing the mutation (env: `APERTURE_PRINCIPAL`) |
+| `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
+
+### `aperture attributes slots`
+
+List the three attribute slots, the source each is wired to, and its cache settings
+
+Prints one row per slot — user, machine, account — with the source the seed
+declares for it (csv, sql, or inline), the cache freshness window, the cached-bag
+cap, and how many bags this process currently holds.
+
+THE TTL COLUMN IS THE REVOCATION WINDOW. A slot's cached bag keeps authorizing
+until it expires, so `ttl` is the longest a removed clearance can keep working.
+`never` means a bag, once fetched, is only dropped by eviction or by an explicit
+`aperture attributes invalidate` — correct for a fixed inline block, dangerous
+for a live directory.
+
+The `cached` column counts THIS process's cache. A one-shot invocation starts
+cold, so it reads 0; it is the number that matters in a long-running
+`aperture serve`.
+
+No actor is required: this reports the wiring in the seed file you passed and
+the configuration this process built from it. It contacts no provider and prints
+no subject key and no attribute value.
+
+```
+aperture attributes slots [options]
+```
+
+| Name | Aliases | Type | Default | Usage |
+| --- | --- | --- | --- | --- |
+| `--seed` | — | string | — | path to a JSON/YAML seed model (defaults to the embedded example) |
+| `--store` | — | string | — | DSN for the backing store: a postgres:// or postgresql:// URL for PostgreSQL, any other value as a SQLite path (defaults to in-memory). Set APERTURE_POSTGRES_SCHEMA to place Aperture's tables in a named PostgreSQL schema; unset uses the connection's search_path |
 
 ## `aperture bestow`
 

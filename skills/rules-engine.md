@@ -345,9 +345,69 @@ The expression environment exposes four roots; a variable under any other root i
 an unknown variable, rejected at validation:
 
 - `object` — the object's metadata fields (read-only snapshot from the provider).
-- `principal` — principal attributes; `principal.id` always present. Richer
-  attributes come from a `PrincipalResolver` (`WithPrincipalResolver`).
-- `account` — account attributes (reserved; empty until wired).
+- `principal` — principal attributes. The **floor** is `{id, kind}` and the engine
+  stamps it over every resolver's answer, so both are always present and a host
+  bag carrying its own `id` / `kind` key cannot shadow them (a directory with an
+  internal `id` column would otherwise silently redefine what
+  `principal.id == object.owner` compares). Richer attributes come from a
+  `PrincipalResolver` (`WithPrincipalResolver`), whose
+  `Attributes(ctx, kind, principal)` receives the principal's kind (`"user"` /
+  `"machine"`, empty = unknown) so one resolver can dispatch per kind; it returns
+  the host's bag alone, and `nil` is a complete answer.
+  A `*provider.AttributeRegistry` is wired straight in: the kind picks the
+  attribute **slot** (`user` → the user slot, `machine` → the machine slot;
+  `"account"` is a slot but not a principal kind, so it never resolves here). A
+  slot with **no registered provider** — and a registered provider with no record
+  for the key — yields the floor and **no error**, so a deployment with a human
+  directory and no machine directory keeps deciding. Any other failure surfaces
+  verbatim and the resolver treats it as a non-decision: an outage must not read
+  as "this principal has no attributes".
+  `principal.kind` exists because per-kind providers make a rule silently
+  kind-dependent — a rule written against the user directory reads nothing for a
+  machine principal, which denies safely in an **inclusive** grant but **widens**
+  access in an **exclusive** one, where not-selected means not-excluded. Say the
+  dependence out loud:
+  `principal.kind == "user" && principal.tier == "gold"`.
+  The bag is resolved **once per decision**, not once per object — see "One bag
+  per decision".
+  Under an **active impersonation** the root describes the EFFECTIVE subject, not
+  the requesting principal: `become` resolves the target's id and the target's
+  kind (so `principal.*` comes from the target's directory), `augment` the
+  operator's. The rule and the grant set must describe the same principal — a
+  decision resolving the target's grants while reading the operator's attributes
+  is an authorization bug that leaves no mark in a trace. `Request.Principal` and
+  `Decision.Impersonation` still name the real operator, so audit is unaffected;
+  the target's kind costs no extra read (it arrives with the subject-set
+  expansion become already performs). An inert or expired session elevates
+  nothing and reads the operator's own bag.
+- `account` — the **active** account's attributes: the tenancy the decision is
+  being made in, never the account a grant is stamped to (a wildcard-stamped
+  grant evaluates inside whatever account is active, so reading the stamp would
+  give one tenant's decision another tenant's plan). The **floor** is `{id}` and
+  the engine stamps it over every resolver's answer, so a host account table with
+  its own `id` column cannot shadow it. It is `{id}` and not `{id, kind}` on
+  purpose: there is one account slot, so a `kind` key would be the same constant
+  in every bag in every deployment — a value that can never discriminate is
+  noise, not information. Richer attributes come from an `AccountResolver`
+  (`WithAccountResolver`), whose `AccountAttributes(ctx, account)` is spelled with
+  that name — not `Attributes` — precisely so ONE `*provider.AttributeRegistry`
+  can satisfy both this seam and `PrincipalResolver`; Go has no overloading, and
+  the registry already holds both directories and both caches. The account slot
+  with **no registered provider**, and a registered one with no record for the
+  account, both yield the floor and **no error**, exactly as for a principal.
+  **`"*"` is never an attribute fetch key.** It is the all-accounts grant
+  sentinel, not an account — `ValidateAccount` refuses to store a row for it, and
+  the only bag that could answer "the attributes of every account" is one
+  tenant's data served as every other's. It is still a live *active* account
+  (platform authority is anchored there, so `Gate.RequireSystemAdmin` runs a
+  `Check` with it), so a platform-scope decision sees the floor and nothing else:
+  `account.id == "*"`, every host field absent. The engine short-circuits before
+  consulting a resolver — refusing instead would make every rule-backed grant
+  undecidable at platform scope, including the ones that never mention `account`
+  — and `provider.AttributeRegistry` refuses `"*"` with
+  `APERTURE_ATTRIBUTE_PROVIDER_INVALID`, so that refusal is the backstop rather
+  than the mechanism. Like `principal`, the bag is resolved **once per
+  decision** — see "One bag per decision".
 - `action` — the action verb (a string).
 
 There is deliberately **no `NOW` root**. See "The clock, and one `NOW` per
@@ -422,6 +482,58 @@ output for the same decision.
 **Testing.** Time-dependent tests pin the clock and never assert against
 `time.Now()` — an expectation derived from the real clock only exercises the
 interesting calendar path on the days the calendar happens to cooperate.
+
+## One bag per decision
+
+`object` is legitimately per object — a decision over a thousand objects reads a
+thousand metadata bags, each describing something different. `principal` and
+`account` are not: both are **constant for the whole decision**, so they are
+resolved **once per decision**, exactly as `NOW` is snapshotted once:
+
+```
+PrincipalResolver → DecisionAttributes (scope) → principalBag → Input.Principal
+AccountResolver   → DecisionAttributes (scope) → accountBag   → Input.Account
+```
+
+The decision engine opens the scope (`rules.WithDecisionAttributes`) at the same
+three boundaries it opens `WithDecisionInstant` at — `Check`, `Enumerate`,
+`Explain` — and every evaluation underneath shares the **first** bags resolved.
+Nesting is idempotent, so a per-candidate decision inside an enumeration keeps the
+enumeration's bags. Outside a scope — a host driving `rules.Engine` directly, a
+hand-built `rules.Input` — each evaluation resolves its own, which is the same
+guarantee narrowed to one evaluation. **The scope is never mandatory**; unscoped
+is correct, merely unmemoized.
+
+**It is a correctness property, not only a cost one.** The cost is plain: a
+rule-backed `Enumerate` evaluates its rule twice per candidate, so N objects
+without the scope means 2N principal fetches and 2N account fetches — a host
+round-trip inside a loop, and the `Check` NFR broken outright. The correctness
+half is that an attribute bag is served through a cache **with a TTL**: a TTL
+expiring halfway through an enumeration would judge the first candidates against
+one version of the principal and the last against another, returning a set no
+single view of the principal justifies, with no error anywhere. That is the same
+defect as a decision straddling a tick, and it takes the same fix.
+
+**A memo, not a cache, and not an injection point.** It holds ONE principal bag
+and ONE account bag rather than a map of them, so it cannot grow with what a
+decision looks at and it dies with the request. There is no API for a caller to
+supply a bag: the value always comes from the engine's resolver, for the reason
+there is no API to supply an instant. It is also **keyed** — it records which
+subject each bag was resolved for and re-resolves on a mismatch — so a scope that
+travels somewhere its author did not picture cannot serve one principal's
+attributes as another's; the failure mode is a re-fetch, which is correct and
+slow. **Failures are not memoized**: a directory that blinks is retried, and what
+a failure means to a decision stays the resolver's contract.
+
+**Read-only, and more so than before.** A resolved bag was always read-only
+transitively; memoizing widens who holds it to *every evaluation in the decision*,
+on top of every concurrent decision for the same key through the provider's
+cache. One write at any depth is therefore every rule, for every object, in every
+in-flight decision for that subject. The engine stamps the floor into a **fresh**
+map (`principalBag` / `accountBag`) and never into the resolver's.
+
+A decision at the account wildcard resolves no account bag at all — `"*"` never
+reaches a resolver — so there is nothing to memoize there.
 
 ## Missing fields: nested access is nil-safe, but `nin` grants
 
@@ -542,7 +654,7 @@ object.hired_at: between bounds are inverted; the lower bound is after the upper
 Notes are `rules.Note` values — `Kind`, `Rule`, `Op`, `Path`, `Expected`,
 `Actual` — carrying **shape and path only, never a metadata value**. That last
 point is not a nicety for dates: a date is often personal data (a birth date, a
-termination date), and the same trace crosses the Twirp and MCP surfaces. Five
+termination date), and the same trace crosses the Twirp and MCP surfaces. Six
 kinds are recorded today:
 
 - `shape_mismatch` — a collection operator met a non-collection, **or** a date
@@ -563,6 +675,23 @@ kinds are recorded today:
   rule evaluation: it comes from the engine's enumeration path
   (`engine/reference.go`), but it is the same class of observation and rides the
   same collector, so it renders identically. See `skills/object-references.md`.
+- `attributes_floor_only` — a rule read a **host-defined field** off `principal`
+  or `account` while that root carried nothing but the engine's floor
+  (`principal.id` + `principal.kind`, `account.id`). `Path` is the root; there is
+  nothing else to say, because there was nothing there. It is the mitigation the
+  attribute leniency contract promises: a missing bag makes every comparison
+  against it false, which is deny-safe in an **inclusive** grant and
+  access-**widening** in an **exclusive** one, and nothing in the verdict says so.
+
+  Two things about it are deliberate. It is **one kind, not two** — "nothing was
+  wired" and "a directory answered and had nothing" are different operator
+  situations, but the distinction this layer can draw ("is a resolver
+  installed?") is not that one: an `AttributeRegistry` with no slot for this
+  principal's kind is installed and answers identically, so a second kind would
+  be confidently wrong a lot of the time. And it fires only when the rule
+  **names** a non-floor path on the root — otherwise every trace of every
+  rule-backed grant in the many deployments that wire no attribute provider
+  would carry it, and the traces where it matters would be unfindable.
 
 The channel is opt-in and costs the decision path nothing: `Check` and
 `Enumerate` install no collector, so nothing is recorded and nothing is

@@ -405,7 +405,7 @@ func TestEngineStampsTheRuleOnNotes(t *testing.T) {
 
 	ctx, collector := WithNoteCollector(context.Background())
 	object := identity.MustParse("account:acme/document:1")
-	selected, err := eng.Selected(ctx, "shapecheck", object, "alice", "read")
+	selected, err := eng.Selected(ctx, "shapecheck", object, "acme", "user", "alice", "read")
 	if err != nil {
 		t.Fatalf("Selected: %v", err)
 	}

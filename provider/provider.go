@@ -44,6 +44,17 @@
 //     Metadata it was given, at ANY depth;
 //   - a consumer that needs to modify metadata copies it (deeply) first.
 //
+// A SECOND seam lives in this package and answers the other half of a decision's
+// question. An ObjectProvider says what is known about the object being acted
+// on; an AttributeProvider (attribute.go) says what is known about the party
+// acting — the user, the machine, or the account — through an AttributeRegistry
+// with three fixed slots. It shares this file's value model, cache, and
+// read-only contract wholesale, and differs in exactly two ways that matter: its
+// keys are bare strings rather than identities, and its registry deliberately
+// does NOT satisfy the scope.ObjectLister contract that *Registry does, so a
+// principal directory can never become an enumerable object set inside a
+// decision. See the type doc on AttributeRegistry.
+//
 // Dependencies stay minimal: provider imports only identity and errors, never
 // scope/engine/model, so it remains a leaf those layers adapt to.
 package provider

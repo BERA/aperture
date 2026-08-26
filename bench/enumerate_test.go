@@ -306,7 +306,7 @@ func BenchmarkEnumerateRuleBackedRuleEval(b *testing.B) {
 	}, reg)
 
 	for _, id := range ids { // warm the metadata cache and the compiled-rule cache
-		if ok, err := eng.Selected(ctx, enumRule, id, enumUser, enumAction); err != nil || !ok {
+		if ok, err := eng.Selected(ctx, enumRule, id, enumAccount, string(model.PrincipalUser), enumUser, enumAction); err != nil || !ok {
 			b.Fatalf("warm Selected(%s): ok=%v err=%v", id, ok, err)
 		}
 	}
@@ -315,7 +315,7 @@ func BenchmarkEnumerateRuleBackedRuleEval(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, id := range ids {
-			if _, err := eng.Selected(ctx, enumRule, id, enumUser, enumAction); err != nil {
+			if _, err := eng.Selected(ctx, enumRule, id, enumAccount, string(model.PrincipalUser), enumUser, enumAction); err != nil {
 				b.Fatalf("Selected: %v", err)
 			}
 		}

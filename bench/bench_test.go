@@ -10,6 +10,7 @@ import (
 	"github.com/frankbardon/aperture/audit"
 	"github.com/frankbardon/aperture/engine"
 	"github.com/frankbardon/aperture/service"
+	"github.com/frankbardon/aperture/storage/memory"
 )
 
 // newService builds the facade under test. With audit on it wires a sampled,
@@ -21,15 +22,21 @@ func newService(tb testing.TB, m benchModel, withAudit bool) (*service.Service, 
 	if !withAudit {
 		return service.New(eng), func() {}
 	}
-	return newAuditedService(tb, m, eng)
+	return newAuditedService(tb, m.store, eng)
 }
 
 // newAuditedService wraps an already-built engine in the sampled, asynchronous
-// audit shape. It is shared with newRuleService (collection_test.go) so both
-// service constructors wire audit identically.
-func newAuditedService(tb testing.TB, m benchModel, eng *engine.Engine) (*service.Service, func()) {
+// audit shape. It is shared with newRuleService (collection_test.go) and
+// newAttributeService (attribute_test.go) so every service constructor wires
+// audit identically.
+//
+// It takes the store rather than a benchModel because the attribute fixture is a
+// self-contained model of its own: what audit needs is somewhere to write, and
+// tying that to one fixture type would force the next fixture to either duplicate
+// this or pretend to be a benchModel.
+func newAuditedService(tb testing.TB, store *memory.Store, eng *engine.Engine) (*service.Service, func()) {
 	tb.Helper()
-	rec := audit.New(m.store, audit.WithSampleRate(0.01), audit.WithBuffer(4096))
+	rec := audit.New(store, audit.WithSampleRate(0.01), audit.WithBuffer(4096))
 	return service.New(eng, service.WithAudit(rec)), func() { _ = rec.Close() }
 }
 

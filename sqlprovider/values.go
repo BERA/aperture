@@ -10,7 +10,6 @@ import (
 	"time"
 
 	aerr "github.com/frankbardon/aperture/errors"
-	"github.com/frankbardon/aperture/identity"
 	"github.com/frankbardon/aperture/provider"
 )
 
@@ -78,10 +77,18 @@ const (
 //	time.Time  →  .UTC(), then the canonical date value model's text
 //	anything else → a hard error naming the column and the Go type
 //
-// Errors name the COLUMN and the row's IDENTITY — the developer's own statement
-// and the caller's own input — and never the value, which is host data belonging
-// to some account and which ends up in a log.
-func metadataValue(v any, column string, id identity.Identity) (value any, present bool, err error) {
+// Errors name the COLUMN and the row's KEY — the developer's own statement and
+// the caller's own input — and never the value, which is host data belonging to
+// some account and which ends up in a log.
+//
+// id is that key rendered as text, and it is a plain string rather than an
+// identity.Identity because this table serves BOTH seams: an object provider
+// passes its identity's String(), an attribute provider passes the bare subject
+// key it was handed. The mapping itself does not depend on which — one table,
+// one set of rules, so a host that reads a column through an object provider and
+// the same column through an attribute provider gets the same value and
+// therefore the same decision.
+func metadataValue(v any, column, id string) (value any, present bool, err error) {
 	switch x := v.(type) {
 	case nil:
 		// A NULL OMITS its field; it does not store nil. This is csvprovider's
@@ -112,7 +119,7 @@ func metadataValue(v any, column string, id identity.Identity) (value any, prese
 		return nil, false, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 			"sqlprovider: result column holds a driver value of a Go type this provider does not map; cast or serialise it in the statement",
 			map[string]any{
-				"id":     id.String(),
+				"id":     id,
 				"column": column,
 				"type":   goTypeName(v),
 				"mapped": strings.Join(mappedDriverTypes, ", "),
@@ -140,7 +147,7 @@ func metadataValue(v any, column string, id identity.Identity) (value any, prese
 // Every container comes fresh from the decoder on every call, which is what
 // keeps provider.Metadata read-only transitively at depth. Nothing here aliases
 // b, which matters twice over: a driver may reuse that buffer for the next row.
-func jsonValue(b []byte, column string, id identity.Identity) (any, bool, error) {
+func jsonValue(b []byte, column, id string) (any, bool, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	// UseNumber is the house pattern (csvprovider's json column, rules/ast.go's
 	// decodeScalar): defer the int/float choice to normalizeJSONNumbers instead
@@ -151,12 +158,12 @@ func jsonValue(b []byte, column string, id identity.Identity) (any, bool, error)
 	if err := dec.Decode(&v); err != nil {
 		return nil, false, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 			"sqlprovider: result column is a []byte that is not valid JSON; a []byte column is decoded as JSON, so cast a non-JSON value in the statement (to_jsonb(...) for an array, ::text for an identifier, ::float8 for a numeric)",
-			map[string]any{"id": id.String(), "column": column, "reason": reasonJSONDecode, "error": err.Error()})
+			map[string]any{"id": id, "column": column, "reason": reasonJSONDecode, "error": err.Error()})
 	}
 	if _, err := dec.Token(); !stderrors.Is(err, io.EOF) {
 		return nil, false, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 			"sqlprovider: result column holds trailing content after its JSON value",
-			map[string]any{"id": id.String(), "column": column, "reason": reasonJSONDecode})
+			map[string]any{"id": id, "column": column, "reason": reasonJSONDecode})
 	}
 	if v == nil {
 		// A JSON null omits its field, exactly as a SQL NULL does. The two say
@@ -182,7 +189,7 @@ func jsonValue(b []byte, column string, id identity.Identity) (any, bool, error)
 // everything else a float64 — applied at every depth. It is csvprovider's rule,
 // deliberately identical, so a host that migrates a CSV to a table gets the same
 // decisions.
-func normalizeJSONNumbers(v any, column string, id identity.Identity) (any, error) {
+func normalizeJSONNumbers(v any, column, id string) (any, error) {
 	switch x := v.(type) {
 	case json.Number:
 		if i, err := x.Int64(); err == nil {
@@ -193,7 +200,7 @@ func normalizeJSONNumbers(v any, column string, id identity.Identity) (any, erro
 		}
 		return nil, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 			"sqlprovider: result column holds a JSON number no int64 or float64 can represent",
-			map[string]any{"id": id.String(), "column": column, "reason": reasonJSONNumber})
+			map[string]any{"id": id, "column": column, "reason": reasonJSONNumber})
 	case map[string]any:
 		for k, elem := range x {
 			nv, err := normalizeJSONNumbers(elem, column, id)
@@ -237,7 +244,7 @@ func normalizeJSONNumbers(v any, column string, id identity.Identity) (any, erro
 // The alternative — a per-column granularity declaration in YAML — would be a
 // second spelling for an intent the statement already carries, and two spellings
 // for one intent drift apart.
-func dateValue(t time.Time, column string, id identity.Identity) (any, bool, error) {
+func dateValue(t time.Time, column, id string) (any, bool, error) {
 	s := t.UTC().Format(provider.DateTimeLayout)
 	v, err := provider.ParseDateValue(s)
 	if err != nil {
@@ -246,7 +253,7 @@ func dateValue(t time.Time, column string, id identity.Identity) (any, bool, err
 		return nil, false, aerr.WithContext(aerr.APERTURE_SQL_PROVIDER_SCAN,
 			"sqlprovider: result column holds a timestamp the canonical date value model cannot represent",
 			map[string]any{
-				"id":       id.String(),
+				"id":       id,
 				"column":   column,
 				"reason":   reasonDate,
 				"expected": provider.DateTimeLayout,

@@ -36,6 +36,14 @@ type decisionStack struct {
 	// empty registry for a seed declaring neither) and is handed to the facade so
 	// `identifiers` can enumerate a type.
 	registry *provider.Registry
+	// attributes is the SUBJECT-attribute registry built from the seed's
+	// `attribute_providers:` and `attributes:` sections — the bags a rule reads off
+	// `principal` and off `account`. It is always non-nil (BuildAttributeRegistry returns an empty
+	// registry for a seed declaring none) and is wired into the rules engine as
+	// BOTH the principal resolver and the account resolver, so the CLI and `serve`
+	// cannot disagree about what a principal or a tenant knows any more than they
+	// can disagree about a rule.
+	attributes *provider.AttributeRegistry
 	// ruleSource is the storage-backed rule source the engine resolves rule
 	// references through. `serve` also hands it to the facade (WithRuleSource) so
 	// the node editor's what-if can preview an UNSAVED rule; the one-shot commands
@@ -51,6 +59,13 @@ type decisionStack struct {
 	// silently would be hostile, and `seed` has no logging path of its own, so it
 	// reports the fact and the caller surfaces it (reportCollisions).
 	collisions []string
+	// attributeCollisions are the attribute SLOTS declared in BOTH the seed's
+	// `attribute_providers:` and `attributes:` sections. The external source wins
+	// and the inline bags for those slots are discarded entirely — the same
+	// documented default, at slot granularity — and it is reported for the same
+	// reason: discarding data silently would be hostile, and `seed` has no logging
+	// path of its own.
+	attributeCollisions []string
 	// conns are the database pools BuildRegistryWithConnections opened for the
 	// seed's `connections:` block — one per named connection, shared by every
 	// `kind: sql` provider entry referencing it. It is the only part of the stack
@@ -74,24 +89,33 @@ func (s decisionStack) Close() error {
 
 // reportCollisions writes a warning naming every object type whose inline
 // `objects:` entries were discarded because a `providers:` entry claimed the same
-// type. Nothing is written when there is no collision, so a normal boot stays
-// silent. Only object TYPES are named — never ids — so the warning cannot leak
-// cross-account data.
+// type, and every attribute SLOT whose inline `attributes:` entries were
+// discarded because an `attribute_providers:` entry claimed the same slot.
+// Nothing is written when there is no collision, so a normal boot stays silent.
+// Only object TYPES and slot NAMES are named — never ids, never keys — so the
+// warning cannot leak cross-account data or a directory's contents.
 func (s decisionStack) reportCollisions(w io.Writer) {
-	if len(s.collisions) == 0 || w == nil {
+	if w == nil {
 		return
 	}
-	fmt.Fprintf(w, "warning: seed declares %d object type(s) in both providers: and objects: — "+
-		"the providers: entry wins and the inline entries were discarded: %s\n",
-		len(s.collisions), strings.Join(s.collisions, ", "))
+	if len(s.collisions) > 0 {
+		fmt.Fprintf(w, "warning: seed declares %d object type(s) in both providers: and objects: — "+
+			"the providers: entry wins and the inline entries were discarded: %s\n",
+			len(s.collisions), strings.Join(s.collisions, ", "))
+	}
+	if len(s.attributeCollisions) > 0 {
+		fmt.Fprintf(w, "warning: seed declares %d attribute slot(s) in both attribute_providers: and attributes: — "+
+			"the attribute_providers: entry wins and the inline bags were discarded: %s\n",
+			len(s.attributeCollisions), strings.Join(s.attributeCollisions, ", "))
+	}
 }
 
 // buildDecisionStack wires the decision graph over an already-seeded store.
 //
 // seedPath is the same --seed value buildStore was given: the seed file is read a
-// second time as a Document because two of its sections — `providers:` and
-// `objects:` — are runtime WIRING that Apply never writes to storage, so the file
-// is their only source of truth.
+// second time as a Document because several of its sections — `providers:`,
+// `objects:` and `attributes:` — are runtime WIRING that Apply never writes to
+// storage, so the file is their only source of truth.
 //
 // Both sections feed ONE *provider.Registry, which in turn feeds BOTH the rules
 // engine's metadata fetcher (so a rule can read object.category_id) AND the scope
@@ -141,11 +165,52 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 		metaSource = reg
 	}
 
+	// The seed's `attributes:` and `attribute_providers:` sections feed a DIFFERENT
+	// registry: an attribute bag is keyed by a bare subject id and is never an
+	// enumerable object set, so it deliberately cannot reach the scope resolver's
+	// object lister.
+	//
+	// The pools are PASSED IN, not re-opened. `connections:` is the document's
+	// single pool set, shared by every `kind: sql` entry of EITHER section — a
+	// second set opened here would double every deployment's connections, and half
+	// of them would be held by a registry this stack has no handle to close.
+	attrs, err := doc.BuildAttributeRegistryWithConnections(seedBaseDir(seedPath), conns)
+	if err != nil {
+		// bootError, not a bare wrap: an attribute declaration fails with
+		// APERTURE_ATTRIBUTE_SLOT_UNKNOWN (naming the three legal slots) or
+		// APERTURE_METADATA_INVALID (naming the field and the cap it broke), and
+		// re-stamping either APERTURE_BOOT would hand the operator "aperture
+		// failed to start" instead of the remedy.
+		_ = conns.Close()
+		return decisionStack{}, bootError("cli: building attribute providers failed", err)
+	}
+	var ruleOpts []rules.Option
+	// The gate MUST count every attribute source the document can declare, which
+	// is why it is asked of the document rather than re-derived here — see
+	// seed.Document.HasAttributeSources, and hasObjectSources below it for the bug
+	// that taught us why a gate written over one section of two is a silent one.
+	//
+	// Wiring the resolver unconditionally would be harmless today (an unfilled
+	// slot resolves to the floor bag), but the gate states the intent: with no
+	// declared source, `principal` is exactly its floor — id and kind — and no
+	// attribute machinery is consulted at all.
+	if doc.HasAttributeSources() {
+		// One registry, both resolver seams. The principal seam reads the user and
+		// machine slots keyed on the principal's kind; the account seam reads the
+		// account slot keyed on the ACTIVE account. They are separate options
+		// because a rule's `principal` and `account` roots are separate contracts,
+		// but wiring them from the same registry is what keeps the caches, the
+		// value model and the leniency identical for both.
+		ruleOpts = append(ruleOpts,
+			rules.WithPrincipalResolver(attrs),
+			rules.WithAccountResolver(attrs))
+	}
+
 	// The rules engine resolves references against the SAME store the node editor
 	// saves through PutRule, so a saved rule takes effect on the next decision and
 	// there is no second rule store to keep in sync.
 	ruleSource := service.NewStorageRuleSource(store)
-	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher)
+	scopeDeps.Rules = rules.NewEngine(ruleSource, fetcher, ruleOpts...)
 
 	opts := make([]engine.Option, 0, len(engOpts)+3)
 	opts = append(opts, engine.WithScopeResolution(nil, scopeDeps))
@@ -165,10 +230,13 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 	return decisionStack{
 		eng:        engine.New(store, opts...),
 		registry:   reg,
+		attributes: attrs,
 		ruleSource: ruleSource,
 		fetcher:    fetcher,
 		collisions: doc.ProviderCollisions(),
-		conns:      conns,
+
+		attributeCollisions: doc.AttributeCollisions(),
+		conns:               conns,
 	}, nil
 }
 
@@ -177,9 +245,17 @@ func buildDecisionStack(store model.Storage, seedPath string, engOpts ...engine.
 // dependencies — `serve` passes storage, the admin gate, delegation,
 // impersonation, audit and the editor's rule source, while a one-shot command
 // passes nothing and gets the read-only decision facade.
+//
+// The ATTRIBUTE registry is wired here too, unconditionally and for the same
+// reason every other attribute wiring lands in this one builder: a surface that
+// assembled its own stack could answer differently from the rest. It is not a
+// grant of access. service.ListAttributes is a system-tier read that refuses
+// any actor without system-admin authority and refuses outright when no gate is
+// wired — which is exactly the one-shot decision commands, so passing the
+// registry to them changes nothing they can do.
 func (s decisionStack) newService(opts ...service.Option) *service.Service {
-	all := make([]service.Option, 0, len(opts)+1)
-	all = append(all, service.WithProviders(s.registry))
+	all := make([]service.Option, 0, len(opts)+2)
+	all = append(all, service.WithProviders(s.registry), service.WithAttributes(s.attributes))
 	all = append(all, opts...)
 	return service.New(s.eng, all...)
 }

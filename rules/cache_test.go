@@ -189,7 +189,7 @@ func TestCacheHitCountIsExactUnderConcurrency(t *testing.T) {
 
 	// Warm: the single compile that populates the entry, so the concurrent phase
 	// below is all hits and the miss count is pinned at one.
-	if _, err := eng.Selected(ctx, "public", object, "alice", "read"); err != nil {
+	if _, err := eng.Selected(ctx, "public", object, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("warm Selected: %v", err)
 	}
 	if st := eng.CacheStats(); st.Hits != 0 || st.Misses != 1 {
@@ -205,7 +205,7 @@ func TestCacheHitCountIsExactUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			<-start // release everyone at once, so the bumps genuinely overlap
 			for i := 0; i < perGoroutine; i++ {
-				if _, err := eng.Selected(ctx, "public", object, "alice", "read"); err != nil {
+				if _, err := eng.Selected(ctx, "public", object, "acme", "user", "alice", "read"); err != nil {
 					errs <- err
 					return
 				}

@@ -341,3 +341,43 @@ func TestEvaluateRulePreviewSurfacesDenySafeNotes(t *testing.T) {
 		t.Errorf("notes = %+v, want none for a clean evaluation", ok.Notes)
 	}
 }
+
+// TestTheRulePreviewReadsNoPrincipalOrAccount is a NON-GOAL held open on
+// purpose (E5-S1). Explain deliberately discloses attribute values; the
+// what-if preview deliberately discloses none, because it is the wider-audience
+// surface — a rule author's editor — and supplying it a principal or account bag
+// would turn "evaluate this draft rule" into a read oracle for the principal
+// directory: name a subject, compare a field, read the answer off the verdict.
+//
+// So the preview evaluates rules.Input{Object, Now} and nothing else. The two
+// assertions are the observable consequences: a rule reading `principal` sees
+// NOTHING (not even the engine's floor, which every real decision supplies), and
+// the preview records no floor-only note, because there is no resolver behind it
+// whose silence could be reported.
+//
+// If a future story finds a reason to change this, it changes the disclosure
+// boundary of the whole preview surface — rewrite this test and the reasoning
+// above together, do not delete it.
+func TestTheRulePreviewReadsNoPrincipalOrAccount(t *testing.T) {
+	svc := newPreviewService(t)
+	ctx := context.Background()
+
+	for _, path := range []string{"principal.id", "principal.tier", "account.id", "account.plan"} {
+		// `exists` is the most generous probe there is: it matches on ANY non-nil
+		// value, so it is true for the floor keys in every real decision.
+		p, err := svc.EvaluateRulePreview(ctx, rules.Unary(rules.OpExists, rules.Var(path)), "staff:1")
+		if err != nil {
+			t.Fatalf("EvaluateRulePreview(%s): %v", path, err)
+		}
+		if p.Result {
+			t.Fatalf("the preview supplied a value for %s; it must supply no principal or "+
+				"account input at all", path)
+		}
+		for _, n := range p.Notes {
+			if n.Kind == rules.NoteAttributesFloorOnly {
+				t.Fatalf("the preview recorded %q — the floor-only note belongs to Explain, "+
+					"which resolves bags; the preview resolves none", n.String())
+			}
+		}
+	}
+}

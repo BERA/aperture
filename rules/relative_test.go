@@ -462,14 +462,14 @@ func TestRelativeDateDecidesAgainstThePinnedClock(t *testing.T) {
 	past := identity.MustParse("account:acme/document:1")
 	future := identity.MustParse("account:acme/document:2")
 
-	got, err := eng.Selected(ctx, "recent", past, "alice", "read")
+	got, err := eng.Selected(ctx, "recent", past, "acme", "user", "alice", "read")
 	if err != nil {
 		t.Fatalf("selected: %v", err)
 	}
 	if !got {
 		t.Errorf("a 2020 date must be on or before the pinned instant")
 	}
-	got, err = eng.Selected(ctx, "recent", future, "alice", "read")
+	got, err = eng.Selected(ctx, "recent", future, "acme", "user", "alice", "read")
 	if err != nil {
 		t.Fatalf("selected: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestRelativeDateDecidesAgainstThePinnedClock(t *testing.T) {
 	// Move the clock past the future date and the SAME cached program decides
 	// the other way: the instant is data, never baked into the compiled source.
 	clock.advance(20 * 365 * 24 * time.Hour)
-	got, err = eng.Selected(ctx, "recent", future, "alice", "read")
+	got, err = eng.Selected(ctx, "recent", future, "acme", "user", "alice", "read")
 	if err != nil {
 		t.Fatalf("selected: %v", err)
 	}

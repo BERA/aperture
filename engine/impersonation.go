@@ -104,9 +104,13 @@ func ImpersonationFromContext(ctx context.Context) (ImpersonationContext, bool) 
 // For an active session:
 //   - the request's principal MUST be the operator (req.Principal == ic.RealActor);
 //   - augment resolves over operator∪target subjects, become over target alone;
+//   - a rule reads `principal.*` off the EFFECTIVE subject — the target under
+//     become, the operator under augment — so the rule and the grant set always
+//     describe the same principal (see elevatedSubjects);
 //   - the operator and target must BOTH be members of the active account, else
 //     the decision is a fail-closed deny (cross-account impersonation refused);
-//   - the returned Decision carries ic on Decision.Impersonation for audit.
+//   - the returned Decision carries ic on Decision.Impersonation for audit, and
+//     req.Principal — the operator — is still what the reason string names.
 func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationContext) (Decision, error) {
 	if !ic.active(e.now()) {
 		return e.Check(ctx, req)
@@ -122,7 +126,7 @@ func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationConte
 		return Decision{}, err
 	}
 
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, subject, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -137,7 +141,7 @@ func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationConte
 			"engine: failed to load grants for impersonated subjects", err)
 	}
 	permCache := make(map[string]*model.Permission, len(grants))
-	dec, err := e.evaluate(ctx, req, object, grants, permCache)
+	dec, err := e.evaluate(ctx, req, subject, object, grants, permCache)
 	if err != nil {
 		return Decision{}, err
 	}
@@ -149,6 +153,10 @@ func (e *Engine) CheckAs(ctx context.Context, req Request, ic ImpersonationConte
 // objects the EFFECTIVE subject set may act on. Inert ic delegates to Enumerate
 // (an expired session enumerates only the operator's own access). For an active
 // session a cross-account boundary violation fails closed to the empty set.
+//
+// As in CheckAs, a rule-backed grant reads `principal.*` off the effective
+// subject, so an enumeration under become lists what the TARGET may act on by
+// both halves of the question — its grants and its attributes.
 func (e *Engine) EnumerateAs(ctx context.Context, req EnumerateRequest, ic ImpersonationContext) ([]string, error) {
 	if !ic.active(e.now()) {
 		return e.Enumerate(ctx, req)
@@ -163,7 +171,7 @@ func (e *Engine) EnumerateAs(ctx context.Context, req EnumerateRequest, ic Imper
 	if err != nil {
 		return nil, err
 	}
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, subject, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +179,7 @@ func (e *Engine) EnumerateAs(ctx context.Context, req EnumerateRequest, ic Imper
 		return []string{}, nil
 	}
 	ctx = WithImpersonation(ctx, ic)
-	return e.enumerateWithSubjects(ctx, req, query, subjects)
+	return e.enumerateWithSubjects(ctx, req, subject, query, subjects)
 }
 
 // ExplainAs is the impersonation-aware sibling of Explain: it returns the full
@@ -193,7 +201,7 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 	if err != nil {
 		return Trace{}, err
 	}
-	subjects, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
+	subjects, subject, ok, err := e.elevatedSubjects(ctx, req.Account, ic)
 	if err != nil {
 		return Trace{}, err
 	}
@@ -202,7 +210,7 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 		return Trace{Request: req, Decision: dec, Considered: []GrantEvaluation{}, Impersonation: cloneIC(ic)}, nil
 	}
 	ctx = WithImpersonation(ctx, ic)
-	tr, err := e.explainWithSubjects(ctx, req, object, subjects)
+	tr, err := e.explainWithSubjects(ctx, req, subject, object, subjects)
 	if err != nil {
 		return Trace{}, err
 	}
@@ -216,36 +224,75 @@ func (e *Engine) ExplainAs(ctx context.Context, req Request, ic ImpersonationCon
 // is not a member of account — neither mode may cross an account boundary. On
 // ok, augment yields operator∪target subjects and become yields the target's
 // subjects alone.
-func (e *Engine) elevatedSubjects(ctx context.Context, account string, ic ImpersonationContext) (subjects []model.Subject, ok bool, err error) {
+//
+// # The effective principal follows the subject set (E4-S3)
+//
+// subject is WHO the rule layer is told about: `principal.id` and the attribute
+// slot `principal.*` is read from. It is the target under BECOME and the operator
+// under AUGMENT — the same principal the returned subject set describes, which is
+// the whole invariant.
+//
+// This is a deliberate behaviour change, not a repair. Until attributes existed
+// `principal` was `{"id": …}`, nothing read it, and reporting the operator under
+// become was an oversight cheap enough to ignore. It stopped being cheap the
+// moment the bag carried `tier` / `clearance` / `department`: a decision whose
+// GRANT SET is the target's and whose RULE describes the operator answers a
+// question nobody asked, and nothing in a trace reveals it unless you already
+// suspect it. So `principal.id` genuinely MEANS the target under become. Do not
+// "fix" it back to req.Principal.
+//
+// Audit is untouched and must stay that way: the real operator is on
+// Decision.Impersonation / Trace.Impersonation, and Request.Principal — which is
+// what the deny reason and the trace's Request record — is still the operator.
+// The rule sees whose authority answered; the audit trail sees who acted. Both.
+//
+// # It costs no extra storage read
+//
+// The target's kind arrives on the subjectSet call this function ALREADY makes to
+// expand the target's subjects, and the operator's on the one augment already
+// makes. Become therefore still reads exactly one principal row and augment two,
+// exactly as before — the kind was always in hand and was simply discarded. (The
+// earlier contract returned an EMPTY kind under become on the grounds that
+// substituting the target's would describe the wrong principal. Under this story
+// the target IS the principal being described, so the unknown-kind state has no
+// remaining occasion to exist: an unknown kind would silently pick no attribute
+// slot and hand every rule the floor bag.)
+func (e *Engine) elevatedSubjects(ctx context.Context, account string, ic ImpersonationContext) (subjects []model.Subject, subject effectivePrincipal, ok bool, err error) {
 	opMember, err := e.store.IsMember(ctx, ic.RealActor, account)
 	if err != nil {
-		return nil, false, aerr.Wrap(aerr.APERTURE_STORAGE,
+		return nil, effectivePrincipal{}, false, aerr.Wrap(aerr.APERTURE_STORAGE,
 			"engine: failed to check operator membership for impersonation", err)
 	}
 	tgtMember, err := e.store.IsMember(ctx, ic.EffectiveSubject, account)
 	if err != nil {
-		return nil, false, aerr.Wrap(aerr.APERTURE_STORAGE,
+		return nil, effectivePrincipal{}, false, aerr.Wrap(aerr.APERTURE_STORAGE,
 			"engine: failed to check target membership for impersonation", err)
 	}
 	if !opMember || !tgtMember {
-		return nil, false, nil
+		// Fail closed BEFORE any principal row or attribute bag is read: a refused
+		// cross-account session must not become a way to learn what the other
+		// account's directory says about anybody.
+		return nil, effectivePrincipal{}, false, nil
 	}
 
-	target, err := e.subjectSet(ctx, ic.EffectiveSubject)
+	target, targetPrincipal, err := e.subjectSet(ctx, ic.EffectiveSubject)
 	if err != nil {
-		return nil, false, err
+		return nil, effectivePrincipal{}, false, err
 	}
 	if ic.Mode == ModeBecome {
-		return target, true, nil
+		return target, targetPrincipal, true, nil
 	}
 
 	// Augment: union the operator's own subject set with the target's, deduped so
-	// a subject shared by both (e.g. a common group) is consulted once.
-	operator, err := e.subjectSet(ctx, ic.RealActor)
+	// a subject shared by both (e.g. a common group) is consulted once. The
+	// operator keeps acting under its OWN identity in this mode — that is what
+	// separates augment from become — so the operator is also the effective
+	// principal the rule reads.
+	operator, operatorPrincipal, err := e.subjectSet(ctx, ic.RealActor)
 	if err != nil {
-		return nil, false, err
+		return nil, effectivePrincipal{}, false, err
 	}
-	return unionSubjects(operator, target), true, nil
+	return unionSubjects(operator, target), operatorPrincipal, true, nil
 }
 
 // unionSubjects returns the deduplicated union of two subject sets, preserving

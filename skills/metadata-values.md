@@ -1,6 +1,6 @@
 ---
 name: metadata-values
-description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the sqlprovider driver-value mapping table whose spelling is a cast in the SELECT list rather than a column suffix, the seed document's inline objects section, its optional field_types: date declarations, and provider.Static), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
+description: The shared metadata value model — what shapes a provider.Metadata field may hold (scalar, scalar array, one object level), the two canonical date forms a date-typed string scalar may take and what is rejected at load (non-UTC offsets, impossible dates, non-RFC3339 layouts), the depth and size caps, the load-time validation entry point every loader calls, how each loader spells the model (the csvprovider header grammar including its :date and :datetime column suffixes, the sqlprovider driver-value mapping table whose spelling is a cast in the SELECT list rather than a column suffix, the seed document's inline objects section, its optional field_types: date declarations, provider.Static, the inline attributes: section, and the two attribute loaders whose value model is identical and whose keys are BARE subject ids), the type-level precedence when a seed's providers: and objects: sections claim the same object type, and how a Filter.Fields predicate compares against each shape (membership for a collection, typed equality for the rest).
 applies_to: [cli, http, mcp]
 ---
 
@@ -275,6 +275,32 @@ including a date, which reaches it as the plain string scalar it is — is
 and the JSON kind or the decoder's message; a date rejection carries the column,
 the line, the `reason`, and the layout `expected`. Neither ever carries the cell.
 
+#### The attribute variant: `csvprovider.NewAttributes`
+
+An attribute slot's CSV file uses **the same header grammar and every one of the
+suffixes above**, unchanged — `parseTable` is literally the same walk, so
+`clearance:int` in a user file normalises exactly as `seats:int` in a brand file:
+
+```text
+id,department,clearance:int,teams:list,hired_at:date
+alice,eng,3,platform|oncall,2024-03-04
+```
+
+Two things differ, and neither is about the value model:
+
+- **The `id` column holds a BARE subject id** — `alice`, never `user:alice`. An
+  attribute key is an opaque handle into the host's directory, so an
+  identity-shaped key is a legal string that loads, caches, enumerates, and then
+  matches no id any `Fetch` presents. The slot silently never answers, and there
+  is nothing the loader can test the key against. The seed entry's `id_column:`
+  is a `kind: sql` concept and does not apply here: the header column is `id`,
+  the same spelling the object file uses.
+- **Loading is EAGER**, where `*Provider` is lazy. An unparseable attribute file
+  is not one object type failing to answer, it is *every decision for that slot*,
+  so the coded error lands at construction — naming the file and the row — while
+  the operator is present. `Reload` re-reads afterwards and leaves the current
+  set untouched if the new one does not parse.
+
 ### `sqlprovider`
 
 The SQL loader's spelling of the model is **a cast in the `SELECT` list**. That
@@ -329,6 +355,34 @@ parses `sqlprovider/values.go` with `go/ast` and fails if the type switch and
 `provider.ValidateMetadata` like every other loader's output — the loader never
 re-implements the rules. See `skills/sql-provider.md` for the wiring, the
 connection defaults, and the errors.
+
+#### The attribute variant: `sqlprovider.NewAttributes`
+
+`*Attributes` reads through the **same** `metadataValue` — literally the same
+function, the same closed mapping table, the same four casting rules — so a
+column read as object metadata and the same column read as an attribute produce
+the same Go value and therefore the same decision. Cast it in the statement here
+too:
+
+```sql
+get_one: SELECT department, to_jsonb(teams) AS teams, hired_on::text AS hired_on
+           FROM users WHERE id = $1
+get_all: SELECT u.id AS id, u.department, to_jsonb(u.teams) AS teams FROM users u
+```
+
+What differs is only what a **key** is, and both differences are contract:
+
+- `get_one` binds the **bare subject id verbatim** (`Fetch(ctx, "alice")` →
+  `QueryContext(stmt, "alice")`), where an object provider binds the identity's
+  terminal segment value;
+- `get_all` selects a **bare id** in the id column (`SELECT u.id AS id`, never
+  `SELECT 'user:' || u.id AS id`) — the trap with no error attached, for the same
+  reason the CSV `id` column has it;
+- `ListQuery` is **optional** here (an empty one yields a fetch-only slot; only
+  the admin enumeration refuses), where `Config.ListQuery` is required.
+
+A diagnostic names the slot, the column, the row's position, and the key — never
+a value, exactly as on the object seam.
 
 ### The seed document's `objects:` section
 
@@ -503,6 +557,57 @@ and **deep-copies its input** so a caller that keeps and mutates those maps cann
 reach into metadata the Registry has already cached. Reads hand out its own maps
 **by reference**, exactly as `csvprovider` does.
 
+### The seed document's `attributes:` section
+
+The same YAML spelling, pointed at the party **asking** rather than the thing
+being acted on:
+
+```yaml
+attributes:
+  - subject: user
+    id: alice
+    metadata:
+      department: eng
+      clearance: 3
+      teams: [platform, infra]
+  - subject: account
+    id: acme
+    metadata: { plan: enterprise }
+```
+
+Two keys differ from `objects:`, and both differences follow from what an
+attribute key *is*:
+
+- **`subject:` is declared, not derived.** An `objects:` id is a segmented
+  identity, so its terminal segment names its type. An attribute key is a bare
+  opaque handle into the host's directory with no segments to derive anything
+  from, so the slot — `user`, `machine`, or `account`, a **closed** set — is
+  stated. An unknown one is `APERTURE_ATTRIBUTE_SLOT_UNKNOWN` naming the entry and
+  the three legal subjects.
+- **Keys are deduplicated per slot**, not across the whole section: a tenant
+  called `acme` and a service principal called `acme` are unrelated subjects.
+
+Everything about the VALUE is identical, and deliberately so — one value model,
+one normalisation, one rejection:
+
+- **Numbers normalise identically** (raw JSON, `UseNumber`, exact `int64` else
+  `float64`), so `principal.clearance == 3` answers the same in YAML and JSON;
+- **`metadata:` must be a mapping**, and an omitted or null one is a subject that
+  exists and carries nothing — not a missing subject;
+- **the bag goes through `provider.ValidateMetadata`** at build. A rejection keeps
+  the value model's own **`APERTURE_METADATA_INVALID`**, with the offending entry
+  added to the message: `aerr.Wrap` re-stamps, so re-coding it
+  `APERTURE_CONFIG_INVALID` would replace the fixups that name the legal shapes
+  and the two caps with generic ones. A missing `subject:`/`id:`, a duplicate
+  pair, or a non-mapping `metadata:` **is** `APERTURE_CONFIG_INVALID`; the account
+  wildcard `"*"` as a key is `APERTURE_ATTRIBUTE_PROVIDER_INVALID`, refused by
+  `provider.NewStaticAttributes`, which this loader does not restate.
+
+`Document.BuildAttributeRegistry(baseDir)` registers one
+`provider.StaticAttributes` per declared slot with a TTL of 0. Like every other
+wiring section: no storage row, no `Apply` write, no export
+(`TestAttributeWiringIsNotModelState`).
+
 ## Querying the model: `Filter.Fields`
 
 The shape a field holds decides how a `provider.Filter.Fields` predicate compares
@@ -597,6 +702,8 @@ Changing the value model means changing all of these in the same PR:
 | The **SQL driver-value mapping** (`metadataValue`'s type switch or `mappedDriverTypes` in `sqlprovider/values.go`) | the "`sqlprovider`" section above + `skills/sql-provider.md` + the `sqlprovider` package doc + `docs/src/concepts/providers.md` — gated by `TestDriverValueMappingTableMatchesTheTypeSwitch`, which parses the source with `go/ast` |
 | The seed `field_types:` section (its spelling, its vocabulary, what it applies to) | "The seed document's `field_types:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and its two type words must stay identical to the CSV `:date`/`:datetime` suffixes, which is the whole reason it exists |
 | The seed `objects:` shape, or `provider.Static` | "The seed document's `objects:` section" above + `docs/src/concepts/seed.md` + `docs/src/concepts/providers.md` — and it must stay **wiring**: no storage table, no `Apply` row, no export |
+| The seed `attributes:` shape (a key, the subject vocabulary, the dedup rule), or `provider.StaticAttributes` | "The seed document's `attributes:` section" above + `docs/src/concepts/seed.md` ("Inline subject attributes") + the `Attribute` / `BuildAttributeRegistry` doc comments in `seed/attribute.go` — and it must stay **wiring**: no storage table, no `Apply` row, no export, and no `metadata:` key on `principals:`/`accounts:` |
+| An attribute LOADER's spelling of the model (`csvprovider.Attributes`' header handling or its eager load; `sqlprovider.AttributeConfig`'s statements) | "The attribute variant" under the loader above + the loader's file doc + `skills/attribute-providers.md` ("Wiring") + `skills/sql-provider.md` ("The attribute seam") + `docs/src/concepts/providers.md` ("Attribute providers") + `docs/src/concepts/seed.md` ("External attribute sources") — the VALUE half must stay identical to the object loader's (one `parseTable`, one `metadataValue`), and the KEY half — a bare subject id, never an identity — has **no gate and cannot have one**, which is why it is restated in every one of those places |
 | The `providers:` / `objects:` precedence rule, or `BuildRegistry`'s options | "When `providers:` and `objects:` claim the same type" above + `docs/src/concepts/seed.md` + the `BuildRegistry` / `StrictProviderCollision` doc comments in `seed/provider.go` and `Document.ProviderCollisions` in `seed/object.go` |
 
 `provider/` imports only `identity`, `errors`, and the standard library — the

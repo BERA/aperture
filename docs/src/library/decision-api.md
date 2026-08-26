@@ -300,6 +300,8 @@ type Trace struct {
 	Considered     []GrantEvaluation     // every grant loaded, each tagged with how it fared
 	MaxSpecificity int                   // top specificity among covering candidates; 0 when nothing covered
 	Notes          []EvaluationNote      // diagnostics rule evaluation recorded; empty when no rule ran
+	Attributes     TraceAttributes       // the `principal` and `account` bags the rules read; zero when no rule ran
+	Now            time.Time             // the reference instant rule evaluation resolved against; zero when no rule ran
 	Decision       Decision              // the final verdict — identical to what Check returns
 	Impersonation  *ImpersonationContext // non-nil only under an active impersonation session
 }
@@ -326,7 +328,8 @@ one mistyped field cannot break every decision that touches it. See
 type EvaluationNote struct {
 	GrantID  string // the grant whose scope resolution recorded it
 	Rule     string // the rule reference that was evaluated
-	Kind     string // "shape_mismatch" | "absent_field"
+	Kind     string // "shape_mismatch" | "absent_field" | "date_invalid" |
+	                //   "date_bounds_inverted" | "dangling_reference" | "attributes_floor_only"
 	Op       string // the comparison operator ("hasAll", …)
 	Path     string // the dotted variable path ("object.tags")
 	Expected string // the shape the operator requires ("collection")
@@ -335,6 +338,12 @@ type EvaluationNote struct {
 }
 ```
 
+Six kinds are recorded today: `shape_mismatch`, `absent_field`, `date_invalid`,
+`date_bounds_inverted`, `dangling_reference` (an enumeration skipped a declared
+reference whose target no longer exists), and `attributes_floor_only` (a rule
+read a **host-defined** field off `principal` or `account` while that root
+carried nothing but the engine's floor, so every such comparison was false).
+
 Three rules govern them:
 
 1. **Diagnostic only** — a note never influences a verdict.
@@ -342,6 +351,40 @@ Three rules govern them:
    record nothing, allocate nothing, and behave exactly as before.
 3. **Shape and path only** — never a metadata value, never anything that could
    cross an account boundary, the same discipline error messages follow.
+
+### The attribute bags
+
+`Attributes` carries the `principal` and `account` roots this decision's rules
+were evaluated against — the host's bag with the engine's floor stamped over it,
+exactly as a rule read it:
+
+```go
+type TraceAttributes struct {
+	Principal map[string]any `json:"principal,omitempty"`
+	Account   map[string]any `json:"account,omitempty"`
+}
+```
+
+Both are nil on a decision that evaluated no rule, and `Account` is *also* nil for
+a decision made at the account wildcard `"*"` — that is not an account, so no bag
+is resolved for it and none is invented here.
+
+**This field deliberately discloses VALUES**, and it is the one place a `Trace`
+does. It is not an oversight to fix, and it does not contradict rule 3 above: a
+note is produced by a comparison against an *object's* metadata, on whatever
+objects a wide decision happened to sweep, while these two bags are the
+**subjects of the very question being asked** — the principal in
+`Request.Principal` and the account in `Request.Account`. A trace that discloses
+them tells the asker about their own decision and nothing else.
+
+The disclosure is also the point: *"why was this denied?"* is unanswerable from a
+grant list when the deciding comparison was `principal.tier == "gold"` and the
+operator cannot see that the tier is `"silver"`, or absent entirely. So do not
+redact these into a note, and do not widen them past those two subjects. The
+wider-audience [rule what-if
+preview](service-facade.md#related-what-if-reads) takes the opposite side on
+purpose and supplies no principal or account input at all, so a rule author's
+editor cannot become a directory read oracle.
 
 `Trace` implements `String()`, which renders an operator-readable, deterministic
 report:
@@ -361,7 +404,9 @@ fmt.Print(tr.String())
 
 `tr.Decision` is byte-for-byte the decision `Check` returns for the same request,
 so a surface can render a verdict and its explanation from a single `Explain`
-call.
+call. The rendered report prints each non-empty attribute root as one
+key-sorted line **before** the grants — they are the input the grants' rules were
+judged against — and stays byte-identical for the same decision.
 
 ## When to use each
 

@@ -32,9 +32,24 @@ func (l fakeLister) List(_ context.Context, _ string, pattern identity.Pattern, 
 // regardless of the rule ref — enough to exercise the rule seam.
 type fakeRules struct {
 	selected map[string]bool
+	// seen, when non-nil, records the evaluation context of the last call. It is
+	// how a test proves the account and principal kind survive the trip from
+	// GrantContext to the evaluator instead of being dropped in the resolver.
+	seen *ruleCall
 }
 
-func (r fakeRules) Selected(_ context.Context, _ string, object identity.Identity, _, _ string) (bool, error) {
+// ruleCall is the request context a rule-backed resolver hands the evaluator.
+type ruleCall struct {
+	account   string
+	kind      string
+	principal string
+	action    string
+}
+
+func (r fakeRules) Selected(_ context.Context, _ string, object identity.Identity, account, kind, principal, action string) (bool, error) {
+	if r.seen != nil {
+		*r.seen = ruleCall{account: account, kind: kind, principal: principal, action: action}
+	}
 	return r.selected[object.String()], nil
 }
 
@@ -167,6 +182,42 @@ func TestInclusiveRulePath(t *testing.T) {
 	}
 	if ok, _ := res.Contains(ctx, identity.MustParse("account:acme/document:6")); ok {
 		t.Errorf("non-selected object must not be covered")
+	}
+}
+
+// TestRuleContextReachesTheEvaluator pins the whole point of the account and
+// principal-kind fields on GrantContext: a resolver that carries them but does
+// not hand them over would compile, evaluate, and be silently wrong — the rule
+// would read attributes for the wrong account. Both rule-backed strategies are
+// asserted, because they call the evaluator from two different places.
+func TestRuleContextReachesTheEvaluator(t *testing.T) {
+	object := identity.MustParse("account:acme/document:5")
+	want := ruleCall{account: "acme", kind: "machine", principal: "svc-1", action: "read"}
+
+	for _, tc := range []struct {
+		name     string
+		strategy string
+	}{
+		{"inclusive", StrategyInclusive},
+		{"exclusive", StrategyExclusive},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var seen ruleCall
+			ctxOf := gc(tc.strategy, "account:acme/**", "document", nil, "myrule")
+			ctxOf.Account = want.account
+			ctxOf.PrincipalKind = want.kind
+			ctxOf.Principal = want.principal
+			ctxOf.Action = want.action
+
+			res := mustResolve(t, DefaultRegistry(), ctxOf,
+				Deps{Rules: fakeRules{selected: map[string]bool{object.String(): true}, seen: &seen}})
+			if _, err := res.Contains(context.Background(), object); err != nil {
+				t.Fatalf("Contains: %v", err)
+			}
+			if seen != want {
+				t.Errorf("evaluator saw %+v, want %+v", seen, want)
+			}
+		})
 	}
 }
 

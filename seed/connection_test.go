@@ -42,19 +42,32 @@ type fakeTable struct {
 
 // fakeDB is the canned behaviour of one fake database plus what it observed.
 type fakeDB struct {
-	mu           sync.Mutex
-	tables       map[string]fakeTable
-	queries      []string
+	mu      sync.Mutex
+	tables  map[string]fakeTable
+	queries []string
+	// args are the parameters bound to the last statement, which is how a test
+	// proves WHAT a get_one was handed — an object provider binds the identity's
+	// terminal segment value, an attribute provider binds the bare subject id
+	// verbatim, and the difference is invisible in the statement text alone.
+	args         []driver.Value
 	lastDeadline time.Duration // remaining budget observed on the last statement
 }
 
-func (f *fakeDB) record(ctx context.Context, query string) {
+func (f *fakeDB) record(ctx context.Context, query string, args []driver.Value) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queries = append(f.queries, query)
+	f.args = args
 	if dl, ok := ctx.Deadline(); ok {
 		f.lastDeadline = time.Until(dl)
 	}
+}
+
+// boundArgs returns the parameters of the last statement.
+func (f *fakeDB) boundArgs() []driver.Value {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]driver.Value(nil), f.args...)
 }
 
 func (f *fakeDB) observedQueries() []string {
@@ -115,8 +128,12 @@ func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
 func (c *fakeConn) Close() error              { return nil }
 func (c *fakeConn) Begin() (driver.Tx, error) { return nil, errors.New("fake: no transactions") }
 
-func (c *fakeConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	c.db.record(ctx, query)
+func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	vals := make([]driver.Value, len(args))
+	for i, a := range args {
+		vals[i] = a.Value
+	}
+	c.db.record(ctx, query, vals)
 	c.db.mu.Lock()
 	tbl, ok := c.db.tables[query]
 	c.db.mu.Unlock()

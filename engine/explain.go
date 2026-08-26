@@ -49,6 +49,10 @@ type Trace struct {
 	// Notes are DIAGNOSTIC ONLY: they never influence the verdict, and Check /
 	// Enumerate do not collect them at all.
 	Notes []EvaluationNote
+	// Attributes are the `principal` and `account` roots this decision's rules
+	// were evaluated against — the bags themselves, values included. Zero on any
+	// decision that evaluated no rule.
+	Attributes TraceAttributes
 	// Now is the reference instant this decision's rule evaluation resolved
 	// against — the snapshot the rules engine took from its injected clock,
 	// always UTC, taken ONCE for the whole decision however many rules it
@@ -108,6 +112,64 @@ type GrantEvaluation struct {
 	Outcome string
 }
 
+// TraceAttributes is the pair of attribute bags a trace's rules were evaluated
+// against: the `principal` root and the `account` root, each exactly as a rule
+// read it — the host's attributes with the engine's floor stamped over them
+// (principal.id / principal.kind, account.id).
+//
+// # This DELIBERATELY DISCLOSES VALUES, and that is not an oversight to fix
+//
+// A rules.Note carries shape and path only and must never carry a value. This
+// type carries the values, on purpose, and the two rules coexist because they
+// are about different data. A note is produced by a comparison against an
+// OBJECT's metadata, one note per surprising comparison, on whatever objects a
+// wide decision happened to sweep. These two bags are the SUBJECTS of the very
+// question being asked — the principal named in Request.Principal and the
+// account named in Request.Account — so a trace that discloses them tells the
+// asker about the decision they asked about, and nothing else. There is no
+// cross-account edge to cross: the account bag is the ACTIVE account's, never a
+// grant's stamped account (see rules.Engine.Selected), and the principal bag is
+// resolved for the principal the grants were resolved for.
+//
+// The disclosure is also the point. "Why was this denied?" is unanswerable from
+// a grant list alone when the deciding comparison was `principal.tier ==
+// "gold"`: the operator needs to see that tier is "silver", or that it is absent
+// entirely. Withholding the value leaves the trace saying a rule did not select
+// and refusing to say why, which is the failure Explain exists to prevent.
+//
+// So: do NOT redact these fields to make them look like a Note, and do not widen
+// them to carry anything that is not one of these two subjects' own attributes.
+// The narrow, checkable rule is that a Trace discloses the parties to ITS OWN
+// request. Explain is an operator diagnostic and callers gate it accordingly;
+// the wider-audience what-if preview (service.EvaluateRulePreview) deliberately
+// takes no principal or account input at all, so it cannot become a read oracle
+// for either directory.
+type TraceAttributes struct {
+	// Principal is the `principal` root the rules read, floor included. Nil when
+	// the decision evaluated no rule.
+	Principal map[string]any `json:"principal,omitempty"`
+	// Account is the `account` root the rules read, floor included. Nil when the
+	// decision evaluated no rule, and ALSO nil for a decision made at the account
+	// wildcard: "*" is not an account, so no bag is resolved for it and none is
+	// invented here. The trace's floor-only note is what records that case.
+	Account map[string]any `json:"account,omitempty"`
+}
+
+// traceAttributes projects the decision's attribute memo onto the trace's own
+// type. A decision that evaluated no rule resolved no bag, and the zero value is
+// the honest report of that — no empty bag is invented for a decision that never
+// asked for one.
+func traceAttributes(attrs *rules.DecisionAttributes) TraceAttributes {
+	var out TraceAttributes
+	if principal, ok := attrs.PrincipalRoot(); ok {
+		out.Principal = principal
+	}
+	if account, ok := attrs.AccountRoot(); ok {
+		out.Account = account
+	}
+	return out
+}
+
 // EvaluationNote is one diagnostic observation a rule evaluation recorded while
 // a grant's scope was being resolved, tied back to the grant that triggered it.
 //
@@ -131,7 +193,8 @@ type EvaluationNote struct {
 	// Rule is the rule reference that was evaluated.
 	Rule string
 	// Kind classifies the observation ("shape_mismatch", "absent_field",
-	// "date_invalid", "date_bounds_inverted", "dangling_reference").
+	// "date_invalid", "date_bounds_inverted", "dangling_reference",
+	// "attributes_floor_only").
 	Kind string
 	// Op is the comparison operator that made the observation ("hasAll", ...).
 	Op string
@@ -192,11 +255,11 @@ func (e *Engine) Explain(ctx context.Context, req Request) (Trace, error) {
 		return Trace{Request: req, Decision: nonMemberDeny(req), Considered: []GrantEvaluation{}}, nil
 	}
 
-	subjects, err := e.subjectSet(ctx, req.Principal)
+	subjects, subject, err := e.subjectSet(ctx, req.Principal)
 	if err != nil {
 		return Trace{}, err
 	}
-	return e.explainWithSubjects(ctx, req, object, subjects)
+	return e.explainWithSubjects(ctx, req, subject, object, subjects)
 }
 
 // explainWithSubjects builds a Trace over an already-resolved subject set. It is
@@ -204,12 +267,21 @@ func (e *Engine) Explain(ctx context.Context, req Request) (Trace, error) {
 // impersonation-elevated set), so an impersonated trace records the same
 // derivation against a different subject set. req.Principal stays the requesting
 // principal in the trace's Request; the caller attaches any impersonation context.
-func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object identity.Identity, subjects []model.Subject) (Trace, error) {
+// The effective principal a rule is evaluated against travels separately, in
+// `subject`, and is the target under become — so a trace shows who asked
+// (Request.Principal), whose grants answered (Subjects), and, through the rule's
+// own notes, what the rule was told (see elevatedSubjects).
+func (e *Engine) explainWithSubjects(ctx context.Context, req Request, subject effectivePrincipal, object identity.Identity, subjects []model.Subject) (Trace, error) {
 	// One reference instant for the whole trace. Explain evaluates a rule per
 	// candidate grant, so without the scope a wide trace could resolve its first
 	// grant against one instant and its last against another — and the recorded
 	// Now would then be true of only part of the report.
 	ctx, instant := rules.WithDecisionInstant(ctx)
+	// One principal bag and one account bag for the whole trace, for the reason
+	// the instant is one: a trace that derived its first grant from one view of
+	// the principal and its last from another would be a report of a decision
+	// nothing ever made.
+	ctx, attrs := rules.WithDecisionAttributes(ctx)
 
 	grants, err := e.store.GrantsForSubjects(ctx, req.Account, subjects)
 	if err != nil {
@@ -253,7 +325,7 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 		// scope seam without widening any of its interfaces. One collector per
 		// grant is what ties each note to the grant that produced it.
 		noteCtx, collector := rules.WithNoteCollector(ctx)
-		covered, spec, err := e.coverer.cover(noteCtx, req, g, perm, object)
+		covered, spec, err := e.coverer.cover(noteCtx, req, subject, g, perm, object)
 		if err != nil {
 			return Trace{}, err
 		}
@@ -287,6 +359,9 @@ func (e *Engine) explainWithSubjects(ctx context.Context, req Request, object id
 	if at, ok := instant.At(); ok {
 		tr.Now = at
 	}
+	// The bags the rules read, for the same reason and with the same shape as the
+	// instant above: recorded when a rule actually ran, left zero when none did.
+	tr.Attributes = traceAttributes(attrs)
 	return tr, nil
 }
 
@@ -347,6 +422,12 @@ func (t Trace) String() string {
 	sort.Strings(subjects)
 	fmt.Fprintf(&b, "  subjects: %s\n", strings.Join(subjects, ", "))
 
+	// The attribute roots come before the grants because they are the INPUT the
+	// grants' rules were judged against: an operator reading "the rule did not
+	// cover" needs the values in hand by the time they reach that line.
+	b.WriteString(renderAttributeRoot("principal", t.Attributes.Principal))
+	b.WriteString(renderAttributeRoot("account", t.Attributes.Account))
+
 	fmt.Fprintf(&b, "  grants considered (%d):\n", len(t.Considered))
 	for _, ev := range sortedEvaluations(t.Considered) {
 		marker := " "
@@ -368,6 +449,33 @@ func (t Trace) String() string {
 	fmt.Fprintf(&b, "  verdict: %s (top specificity %d)\n", verdict, t.MaxSpecificity)
 	fmt.Fprintf(&b, "  reason: %s\n", t.Decision.Reason)
 	return b.String()
+}
+
+// renderAttributeRoot renders one attribute root as a single report line, or ""
+// when the decision resolved no bag for it (no rule ran, or — for `account` — the
+// decision was made at the wildcard). The keys are sorted for the reason the
+// grants and notes are: String promises byte-identical output for the same
+// decision, and Go's map iteration order is deliberately random. Values print
+// through %v, which sorts nested maps' keys too, so a bag holding an object-valued
+// attribute renders deterministically as well.
+//
+// This line carries VALUES, unlike every note line below it. That is the
+// deliberate disclosure documented on TraceAttributes — read it before changing
+// what is printed here.
+func renderAttributeRoot(root string, bag map[string]any) string {
+	if len(bag) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(bag))
+	for k := range bag {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, len(keys))
+	for i, k := range keys {
+		pairs[i] = fmt.Sprintf("%s=%v", k, bag[k])
+	}
+	return fmt.Sprintf("  %s: %s\n", root, strings.Join(pairs, ", "))
 }
 
 // sortedEvaluations returns a copy of the considered grants in a total order.

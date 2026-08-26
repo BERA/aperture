@@ -77,8 +77,8 @@ anything else is an unknown variable:
 | Root | Type | Contents |
 |---|---|---|
 | `object` | map | the object's metadata snapshot (host-defined fields, e.g. `object.classification`) |
-| `principal` | map | the principal's attribute bag (e.g. `principal.tier`); default exposes only `principal.id` |
-| `account` | map | account attributes |
+| `principal` | map | the principal's attribute bag (e.g. `principal.tier`); the floor `{id, kind}` is always present |
+| `account` | map | the **active** account's attribute bag (e.g. `account.plan`); the floor `{id}` is always present |
 | `action` | string | the action verb (`action == "read"`) |
 
 The three metadata roots are `map[string]any` so a rule reads host-defined
@@ -468,22 +468,164 @@ in-memory default; a missing reference yields `APERTURE_RULE_NOT_FOUND`) and a
 `MetadataFetcher` (whose signature matches `*provider.Registry.Fetch`, so a
 [provider registry](providers.md) wires in directly as the object-metadata
 source without the rules package importing `provider`). An optional
-`PrincipalResolver` supplies principal attributes; the default exposes only
-`principal.id`.
+`PrincipalResolver` supplies principal attributes, keyed by
+`Attributes(ctx, kind, principal)`. A resolver returns the **host's bag alone**;
+returning `nil` is a complete answer, because the engine stamps the floor over
+whatever comes back. The `kind` is `model.PrincipalKind`'s
+spelling (`"user"` / `"machine"`) carried as a string, so one resolver can
+dispatch to a different attribute source per kind — a human directory and a
+service-account registry are rarely the same store. An **empty** kind means the
+caller did not have the principal's record in hand: treat it as unknown, never
+as a default, or a machine gets answered for out of the human directory.
 
-`Engine.Selected(ctx, rule, object, principal, action)` is the full path:
+An optional `AccountResolver` supplies the **active** account's attributes,
+keyed by `AccountAttributes(ctx, account)`. It is the same contract one root
+over: the host's bag alone, `nil` is a complete answer, the engine stamps the
+floor. The method is spelled `AccountAttributes` rather than `Attributes` so
+that **one** `*provider.AttributeRegistry` can satisfy both seams — Go has no
+overloading, and the registry already holds both directories and both caches.
+
+### The floor bag, and `principal.kind`
+
+`principal` always carries `{id, kind}`, whatever is wired. The floor is stamped
+**last**, so a host bag with its own `id` or `kind` key cannot shadow it — the
+realistic collision is innocent (a directory with an internal `id` column), and a
+floor that can be shadowed silently changes what `principal.id == object.owner`
+compares. An unknown kind is published as the empty string rather than omitted,
+so "unknown" is a value a rule can compare against.
+
+`kind` is published because attribute providers are registered **per kind**,
+which makes a rule silently kind-dependent: a rule reading the user directory
+finds nothing for a machine principal. In an **inclusive** grant that denies
+safely; in an **exclusive** one — where being selected means being *excluded* — a
+rule that quietly stops selecting **widens** access. `principal.kind` is how an
+author states the dependence instead of hiding it:
+
+```text
+principal.kind == "user" && principal.tier == "gold"
+```
+
+### The `account` floor, and the wildcard
+
+`account` always carries `{id}` — the **active** account, the tenancy the
+decision is being made in, never the account a grant happens to be stamped to. A
+wildcard-stamped grant is evaluated inside whatever account is active, so reading
+its attributes off the stamp would give one tenant's decision another tenant's
+plan.
+
+The floor is `{id}` and deliberately **not** `{id, kind}`: there is one account
+slot, so a `kind` key would be the same constant in every bag in every
+deployment, and a value that can never discriminate is noise a rule author would
+eventually compare against. As with `principal`, the floor is stamped **last**,
+so a host account table with its own internal `id` column cannot silently change
+what `account.id == object.account` compares.
+
+`"*"` — the all-accounts grant sentinel — is **never** an attribute fetch key.
+There is no account row for it (`ValidateAccount` refuses to store one), and the
+only bag that could answer "the attributes of every account" is one tenant's data
+served as every other's. It is nonetheless a live *active* account: platform-tier
+authority is anchored there, so `authz.Gate.RequireSystemAdmin` really does run a
+`Check` with it. A decision made at platform scope therefore sees the **floor and
+nothing else** — `account.id` is `"*"`, which truthfully says "not scoped to a
+tenant", and every host-defined field is absent exactly as it is for an unwired
+slot. The engine short-circuits before any resolver is consulted, so a
+rule-backed grant guarding the system anchor stays decidable; presenting `"*"` to
+`provider.AttributeRegistry` directly is `APERTURE_ATTRIBUTE_PROVIDER_INVALID`,
+which makes that refusal a backstop rather than the mechanism.
+
+### Wiring a `*provider.AttributeRegistry`
+
+A `provider.AttributeRegistry` — the host seam that maps each of the three
+attribute slots (`user`, `machine`, `account`) to a provider plus a per-slot
+cache — is both a `PrincipalResolver` and an `AccountResolver` as it stands,
+structurally, with `provider` importing nothing from `rules`:
+
+```go
+attrs := provider.NewAttributeRegistry()
+attrs.MustRegister(provider.AttributeSlotUser, userDirectory)
+attrs.MustRegister(provider.AttributeSlotAccount, tenantDirectory)
+eng := rules.NewEngine(source, objects,
+    rules.WithPrincipalResolver(attrs),
+    rules.WithAccountResolver(attrs))
+```
+
+The kind picks the **slot**: `"user"` resolves the user slot, `"machine"` the
+machine slot. `"account"` is a real slot but is **not** a principal kind, so it
+never resolves through `WithPrincipalResolver` — a tenant's bag must never be
+served as a principal's. `WithAccountResolver` is the only door to it, and it is
+keyed on the active account, not on any principal.
+
+A deployment that has no directory to point at declares the bags **in the seed
+file** instead, under [`attributes:`](seed.md#inline-subject-attributes), and
+`Document.BuildAttributeRegistry` returns exactly the registry above — so
+`aperture check` decides on principal attributes with no Go written by the host.
+
+A **missing source is not a failed decision**. A slot with no registered
+provider, and a registered provider with no record for the key, both yield the
+floor and no error, so a deployment with a human directory and no machine
+directory keeps deciding normally. Everything else — an unreachable directory, a
+bag the value model rejects — surfaces verbatim with its code and fixups intact
+and is treated as a non-decision, because an outage must not read as "this
+principal has no attributes".
+
+`Engine.Selected(ctx, rule, object, account, principalKind, principal, action)`
+is the full path:
 
 1. resolve the rule reference through the `RuleSource`;
 2. compile-and-cache its AST;
 3. fetch the object's metadata (empty when no fetcher is configured);
-4. resolve the principal's attributes;
-5. build the `Input` and evaluate.
+4. resolve the principal's attributes for its kind, and stamp the floor over them
+   into a fresh map (the resolver's bag may be cached and shared, and is
+   read-only, transitively);
+5. resolve the active account's attributes the same way, through the same
+   read-only contract, and stamp `{id}` over them into a fresh map;
+6. build the `Input` and evaluate.
 
 Any step's failure is an `APERTURE_*` coded error, and the caller treats it as a
 **non-decision** — there is no select-on-error. That signature is exactly
 `scope.RuleEvaluator`, which is how the rule-backed inclusive/exclusive
 [scope strategies](scopes.md) get their variant: the engine is wired as
 `scope.Deps{Rules: engine}`.
+
+### One bag per decision
+
+`principal` and `account` are constant for the whole decision, so they are
+resolved **once** and memoized for it, exactly as the reference instant `NOW` is
+snapshotted once. The decision engine opens that scope at the same three
+boundaries it opens the instant's — `Check`, `Enumerate`, `Explain`.
+
+It is a **correctness** property, not only a cost one: a bag is served through a
+cache with a TTL, and a TTL expiring halfway through an enumeration would judge
+the first candidates against one version of the principal and the last against
+another — a result set no single view of the principal justifies, with no error
+anywhere. An **absence memoizes** (an unwired slot, or a directory with no
+record, is a complete answer describing a steady state, so a 1,000-object
+enumeration performs one resolution); a **failure does not**, and that costs
+almost nothing, because a failure ends the decision.
+
+The memo is keyed by the subject each bag was resolved for and re-resolves on a
+mismatch, so a scope travelling somewhere its author did not picture cannot serve
+one principal's attributes as another's. There is no API to hand a bag in: a
+caller-supplied principal bag would be a caller-supplied answer to "who is
+asking".
+
+### Under impersonation, `principal.*` is the effective subject
+
+When a decision resolves under an active [impersonation](impersonation.md)
+session, the rule is told about the **effective subject** — the *target* under
+`become`, the *operator* under `augment` — which is the same principal the
+resolved grant set describes. `become` resolves the target's id **and** the
+target's kind, so `principal.*` is read from the target's directory.
+
+The invariant is that the rule and the grant set always describe the same
+principal. A decision resolving the target's grants while reading the operator's
+attributes is an authorization bug that leaves no mark in a trace.
+
+Audit is unaffected: the request and the decision still name the real operator,
+and the trace still records the session. An inert or expired session elevates
+nothing and reads the operator's own bag. Note that `principal.id` therefore
+*changes meaning* under `become` — a rule comparing `principal.id ==
+object.owner` asks "does the target own it", which is what that mode means.
 
 ## Where this leads
 

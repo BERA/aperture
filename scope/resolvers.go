@@ -71,7 +71,8 @@ func (r inclusiveResolver) Contains(ctx context.Context, object identity.Identit
 	// Rule path: consult the rule evaluator only when a rule is declared, so a
 	// pure list-backed grant never touches the rule dependency.
 	if r.gc.Spec.Rule != "" {
-		return r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object, r.gc.Principal, r.gc.Action)
+		return r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object,
+			r.gc.Account, r.gc.PrincipalKind, r.gc.Principal, r.gc.Action)
 	}
 	return false, nil
 }
@@ -171,7 +172,8 @@ func (r exclusiveResolver) Contains(ctx context.Context, object identity.Identit
 	}
 	// Rule path: excluded iff the rule selects the object.
 	if r.gc.Spec.Rule != "" {
-		excluded, err := r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object, r.gc.Principal, r.gc.Action)
+		excluded, err := r.deps.rules().Selected(ctx, r.gc.Spec.Rule, object,
+			r.gc.Account, r.gc.PrincipalKind, r.gc.Principal, r.gc.Action)
 		if err != nil {
 			return false, err
 		}

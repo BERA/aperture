@@ -9,6 +9,13 @@ its provider plus a per-type cache and is the seam every consumer resolves
 through. The code lives in the `provider` package; `csvprovider` (a file) and
 `sqlprovider` (a database) are the two concrete worked examples.
 
+There are **two** provider seams, and this page covers both. An `ObjectProvider`
+describes the thing being acted on; an [`AttributeProvider`](#attribute-providers)
+describes the party **asking** — the principal and the account a rule reads
+`principal.*` and `account.*` out of. They share one value model and one cache
+design, and differ in everything that follows from an attribute key being a bare
+opaque id rather than a segmented identity.
+
 A load-bearing rule: **Aperture never persists provider data as a source of
 truth.** The host owns it; Aperture only ever caches a copy. Cached metadata is
 handed back **by reference and treated read-only** — the cache never copies a map
@@ -283,6 +290,204 @@ clears a type, `InvalidateAll` clears every cache. `Stats(objectType)` exposes
 `Hits / Misses / Evictions / Expirations / Invalidations / Entries` for
 observability and the latency benchmark. The `provider` package depends only on
 `identity` and `errors` — never scope, engine, or model — so it stays a leaf.
+
+## Attribute providers
+
+An `ObjectProvider` answers *"what do you know about this **object**?"*. An
+**`AttributeProvider`** answers *"what do you know about the party **asking**?"*
+— the principal's department and clearance, the account's plan and region — so a
+rule can be written about the asker instead of only about the thing being acted
+on:
+
+```text
+principal.kind == "user" && principal.department == object.department
+account.plan == "enterprise"
+```
+
+The two seams are not variants of each other, and the difference is the fan-out.
+Object metadata is resolved **per object**: a decision touching a thousand
+objects reads a thousand bags, each describing something different. An attribute
+bag is resolved **once per decision** and then read by every rule against every
+object in it. Almost everything below follows from that.
+
+### The three slots, and there is no fourth
+
+`provider.AttributeSlot` is a **closed** set:
+
+| Slot | Constant | Keyed by | Backs |
+|---|---|---|---|
+| `user` | `AttributeSlotUser` | a bare principal id | `principal.*` for a human principal |
+| `machine` | `AttributeSlotMachine` | a bare principal id | `principal.*` for a service account, API client, or job runner |
+| `account` | `AttributeSlotAccount` | a bare account id | `account.*` for the tenancy a decision is made in |
+
+The object `Registry` is an **open**, type-keyed map because the host's object
+types are the host's business. The slots are not: they are the parties a decision
+has, and a decision has exactly these. An open map would let a host register a
+fourth "kind" of subject nothing in the engine knows how to fetch — discovered at
+evaluation time as an empty bag, which is to say as a silent denial. A further
+distinction is a **field in the bag**, never a fourth slot. `user` and `machine`
+are separate slots because in every host that has both, the two are served by
+different systems.
+
+The interface is three methods, and the key is the whole difference from an
+object provider:
+
+```go
+type AttributeProvider interface {
+	Fetch(ctx context.Context, id string) (Metadata, error)
+	List(ctx context.Context) ([]AttributeRecord, error)
+	Query(ctx context.Context, filter AttributeFilter) ([]AttributeRecord, error)
+}
+```
+
+An `AttributeRecord` pairs one **bare string key** with a `Metadata` bag. An
+object identity is a segmented path (`account:acme/project:atlas/document:42`)
+precisely so a scope can contain and pattern-match it; an attribute key is an
+opaque handle into the host's directory with no hierarchy to spell and no
+containment relation to anything. A provider returns `APERTURE_NOT_FOUND` for a
+key it does not know, must be safe for concurrent use, and owes the same
+[transitively read-only contract](#the-read-only-contract-is-transitive) an
+object provider owes — more strictly, in fact, because one attribute bag is
+shared across every object in a decision and every concurrent decision for that
+subject.
+
+The bag **is** a `provider.Metadata`: the same [value
+model](#the-metadata-value-model), the same depth and size caps, the same
+`ValidateMetadata`, the same two canonical date forms, the same number
+normalisation in every loader. There is no second model, so
+`principal.clearance == 3` answers identically whether the bag was authored in
+YAML, read from a CSV `:int` column, or read from a SQL `integer`.
+
+### The registry, the per-slot cache, and the revocation window
+
+`provider.AttributeRegistry` binds each slot to a provider plus **its own**
+cache — its own TTL, size cap, and counters — because the three slots have
+genuinely different change rates and cardinalities:
+
+```go
+attrs := provider.NewAttributeRegistry()
+attrs.MustRegister(provider.AttributeSlotUser, dir, provider.WithTTL(60*time.Second))
+attrs.MustRegister(provider.AttributeSlotAccount, tenants)
+```
+
+Registering a slot twice is **refused**, not replaced: "last writer wins" is how
+one deployment's directory quietly shadows another's during wiring, and the
+failure then surfaces as attributes that are merely *wrong* rather than absent. A
+slot left unregistered is not an error — a deployment with no machine principals
+wires no machine provider.
+
+Staleness is not only a tuning knob here. An object's metadata going stale for a
+TTL is usually tolerable: a document's category is a fact about a thing. An
+attribute bag is the **asker's standing** — the clearance, the department, the
+plan — so until a cached bag expires, every decision about that subject is made
+against access the host may have **already taken away**. Pick a slot's TTL for
+how fast its revocations must land, and close the window explicitly when you
+cannot wait: `Invalidate(slot, id)` drops one subject (and reports whether an
+entry was present), `InvalidateSlot(slot)` a whole directory, `InvalidateAll()`
+everything. Invalidation is **process-local**: it clears the caches of the
+process that runs it and cannot reach a different one.
+
+### Leniency: a missing bag decides, a broken directory does not
+
+The registry satisfies the rules engine's two resolver seams structurally,
+without importing `rules`:
+
+```go
+eng := rules.NewEngine(ruleSource, objectRegistry,
+	rules.WithPrincipalResolver(attrs),  // Attributes(ctx, kind, principal)
+	rules.WithAccountResolver(attrs))    // AccountAttributes(ctx, account)
+```
+
+Two outcomes are **lenient** — they yield a nil bag and *no error*, so the
+decision proceeds against the engine's [floor
+bag](rules.md#the-floor-bag-and-principalkind):
+
+- the slot has no registered provider, or the principal's kind names no principal
+  slot at all;
+- a registered provider has no record for this key (`APERTURE_NOT_FOUND`).
+
+Everything else — an unreachable directory, a bag the value model rejects —
+surfaces **verbatim**, keeping its code and its registry fixups, and every
+consumer treats it as a **non-decision**. That distinction is the point of the
+seam: an outage must not read as "this principal has no attributes", because that
+is an authorization change wearing an infrastructure failure's clothes.
+
+Leniency leaves one hazard, and it is accepted rather than solved. An absent
+attribute makes every comparison against it **false**. In an **inclusive** grant
+that is deny-safe. In an **exclusive** grant, selection means *excluded* — so a
+rule that quietly stops selecting stops excluding, and the object the exclusion
+was written to withhold becomes covered, with nothing in the verdict saying so.
+The mitigations are visibility, not refusal: `principal.kind`, so an author can
+state a rule's kind-dependence out loud, and the `attributes_floor_only`
+[evaluation note](rules.md#evaluation-notes), so a trace says the bag was empty.
+
+**A principal bag is global, and keeping it account-neutral is a host
+obligation.** A fetch is keyed by the bare principal id alone — it carries no
+account — so one principal's bag is visible to rules evaluating in **every**
+account that principal is a member of. Facts about the person or the machine are
+account-neutral; facts about the person *in one tenancy* are not, and putting one
+in a principal bag publishes one account's data into every other account that
+principal touches. Aperture cannot detect it: the values are opaque host data.
+Per-tenant facts belong on the **account** slot, which is bounded — the account
+bag is always resolved from the **active** account.
+
+### The containment boundary: enumeration is never scope resolution
+
+`*provider.Registry` deliberately **does** satisfy `scope.ObjectLister`, which is
+how an exclusive scope enumerates a type. `*provider.AttributeRegistry`
+deliberately **does not**.
+
+If the principal directory were reachable through that seam, the principal table
+would become an enumerable object set *inside a decision* — every principal in
+the deployment listable by anything holding a lister, bounded only by the grant's
+own scope, with no admin tier consulted.
+
+Go's typing is **structural**, so intending otherwise is worth nothing: a method
+with a matching signature satisfies the interface whether or not anybody meant it
+to, and the wiring mistake it enables is silent. So the containment is structural
+too, four times over — enumeration is called **`Enumerate`**, not `List`; it is
+keyed by an **`AttributeSlot`**, not a bare object-type string; it takes an
+**`AttributeFilter`**, which carries **no `identity.Pattern`** to bound with; and
+it returns **`[]AttributeRecord`** (bare keys), not `[]identity.Identity`. Any
+one of the four makes the signature unassignable; all four make it unassignable
+by accident. `TestAttributeRegistryIsNotAScopeLister` asserts the negative
+against the real interface, with `*provider.Registry` as the positive control.
+
+`AttributeFilter` carries no pattern for the same reason. There is nothing to
+match — an attribute key has no segments, so a pattern over it could only be a
+substring test dressed as containment — and `Filter.Pattern` exists solely to
+bound an enumeration *to a grant's scope*. Its `Fields` predicate is exactly the
+object seam's [`Filter.Fields` contract](#the-filterfields-contract), and both
+`Fields` and `Limit` are re-enforced by the registry on whatever a provider
+returns, so a provider that ignores them is still correct and no caller can
+materialise an unbounded directory.
+
+Enumeration is therefore reachable from exactly one place: `service.ListAttributes`,
+a **system-tier** administrative read gated through `authz.Gate.RequireSystemAdmin`,
+surfaced as [`aperture attributes query`](../cli/attributes.md). The decision
+path's `Fetch` is not gated and must never be — a decision resolves one bag for a
+subject it already named.
+
+### Where the bags come from
+
+| Implementation | Source | Notes |
+|---|---|---|
+| `provider.StaticAttributes` | an in-memory slice | immutable after construction; everything validated up front, so a read can never fail for a reason wiring could have reported |
+| `csvprovider.NewAttributes(path)` | one CSV file | the same header grammar and column-type suffixes as the object loader, but loaded **eagerly**: a malformed file is a coded error at boot naming the row, because an unparseable attribute file is not one type failing to answer, it is every decision for that slot |
+| `sqlprovider.NewAttributes(q, cfg)` | two statements over a `Querier` | the same driver-value mapping, value model, and casting rules as the object provider |
+
+Declaratively, a seed document's [`attributes:`](seed.md#inline-subject-attributes)
+block lists bags inline and
+[`attribute_providers:`](seed.md#external-attribute-sources) points a slot at a
+file or a connection. Both are runtime **wiring**, never model state.
+
+One asymmetry is worth repeating here because nothing can catch it: an attribute
+provider's keys are **bare** ids. A CSV `id` column holds `alice`, not
+`user:alice`; a SQL `get_all` selects `u.id AS id`, not `'user:' || u.id AS id`.
+An identity-shaped key is a legal opaque string that enumerates and caches
+happily and then matches no id any fetch ever presents, so the slot silently
+never answers. See [the bare-id
+contract](seed.md#the-bare-id-contract).
 
 ## Declared references
 
@@ -825,7 +1030,11 @@ which is the allocation-aware half of the same contract.
 
 ## Where this leads
 
-Providers feed two consumers documented elsewhere: the object metadata a
-[rule](rules.md) reads, and the object enumeration an
-[implicit/exclusive scope](scopes.md) performs. For the CLI that inspects
-registered providers, see the [provisioning commands](../cli/provisioning.md).
+Providers feed three consumers documented elsewhere: the object metadata a
+[rule](rules.md) reads, the object enumeration an
+[implicit/exclusive scope](scopes.md) performs, and — through the attribute seam
+— the `principal.*` and `account.*` roots the [same rule](rules.md#the-floor-bag-and-principalkind)
+reads about the asker. For the CLI that inspects registered providers, see the
+[provisioning commands](../cli/provisioning.md); for the one that inspects
+attribute slots and drops cached bags, see [`aperture
+attributes`](../cli/attributes.md).

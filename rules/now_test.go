@@ -192,7 +192,7 @@ func TestEngineSnapshotsNowOncePerEvaluation(t *testing.T) {
 	clk := newAdvancingClock()
 	eng, obj := nowProbeEngine(t, func(at time.Time) { seen = append(seen, at) }, WithClock(clk))
 
-	if _, err := eng.Selected(context.Background(), "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(context.Background(), "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected: %v", err)
 	}
 	if len(seen) != 2 {
@@ -220,7 +220,7 @@ func TestDecisionScopeSharesOneInstant(t *testing.T) {
 		t.Fatal("a fresh scope must hold no instant until an evaluation needs one")
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+		if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 			t.Fatalf("Selected(%d): %v", i, err)
 		}
 	}
@@ -244,7 +244,7 @@ func TestDecisionScopeSharesOneInstant(t *testing.T) {
 	if same != instant {
 		t.Fatal("a nested WithDecisionInstant must reuse the enclosing scope")
 	}
-	if _, err := eng.Selected(inner, "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(inner, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected(nested): %v", err)
 	}
 	if got := clk.count(); got != 1 {
@@ -262,7 +262,7 @@ func TestUnscopedEvaluationSnapshotsPerEvaluation(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+		if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 			t.Fatalf("Selected(%d): %v", i, err)
 		}
 	}
@@ -281,7 +281,7 @@ func TestDecisionInstantIsNotAnInjectionPoint(t *testing.T) {
 	eng, obj := nowProbeEngine(t, func(time.Time) {}, WithClock(clk))
 
 	ctx, instant := WithDecisionInstant(context.Background())
-	if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected: %v", err)
 	}
 	at, ok := instant.At()
@@ -326,13 +326,13 @@ func TestCachedProgramCarriesNoInstant(t *testing.T) {
 	eng, obj := nowProbeEngine(t, func(at time.Time) { seen = append(seen, at) }, WithClock(clk))
 
 	ctx := context.Background()
-	if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected(first): %v", err)
 	}
 	before := eng.CacheStats()
 
 	clk.advance(48 * time.Hour)
-	if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected(second): %v", err)
 	}
 	after := eng.CacheStats()
@@ -369,7 +369,7 @@ func TestPinnedClockAlsoFreezesCacheExpiry(t *testing.T) {
 
 	ctx, instant := WithDecisionInstant(context.Background())
 	for i := 0; i < 5; i++ {
-		if _, err := eng.Selected(ctx, "probe", obj, "alice", "read"); err != nil {
+		if _, err := eng.Selected(ctx, "probe", obj, "acme", "user", "alice", "read"); err != nil {
 			t.Fatalf("Selected(%d): %v", i, err)
 		}
 	}
@@ -388,7 +388,7 @@ func TestPinnedClockAlsoFreezesCacheExpiry(t *testing.T) {
 	// Advancing the clock moves BOTH: the entry expires and the instant a fresh
 	// decision resolves against moves with it.
 	clk.advance(time.Second)
-	if _, err := eng.Selected(context.Background(), "probe", obj, "alice", "read"); err != nil {
+	if _, err := eng.Selected(context.Background(), "probe", obj, "acme", "user", "alice", "read"); err != nil {
 		t.Fatalf("Selected(after advance): %v", err)
 	}
 	if st := eng.CacheStats(); st.Evictions == 0 {

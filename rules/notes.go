@@ -80,6 +80,65 @@ const (
 	// identity itself is never carried: it goes to the operator's log, not to a
 	// diagnostic that crosses account boundaries.
 	NoteDanglingReference NoteKind = "dangling_reference"
+	// NoteAttributesFloorOnly records that a rule READ a host-defined field off
+	// `principal` or `account` while that root carried NOTHING but the engine's
+	// floor — id and kind for a principal, id for an account. No host attribute
+	// was resolved, so every comparison the rule made against that root's
+	// host-defined fields was false.
+	//
+	// It is the mitigation the attribute leniency contract promised, and the
+	// hazard is specific enough to be worth restating here. A missing bag is
+	// LENIENT by design (see provider.AttributeRegistry.Attributes): a deployment
+	// that wires a user directory and no machine directory must keep deciding, so
+	// an absent source yields an empty bag rather than an error. That is deny-safe
+	// in an INCLUSIVE grant — a rule that selects nothing covers nothing — and
+	// access-WIDENING in an EXCLUSIVE one, where selecting means "excluded", so a
+	// rule that quietly stops selecting stops excluding and the object the
+	// exclusion was written to withhold becomes covered. Nothing in the verdict
+	// says so. This note is what says so, in the one place an operator reading a
+	// surprising allow is already looking.
+	//
+	// # Why it is recorded per EVALUATION and not per failed comparison
+	//
+	// Every other kind here is recorded BY a comparison that went a surprising
+	// way. This one describes the INPUT the rule was handed, because the failure
+	// it exposes is a comparison that never visibly happened: the author wrote
+	// `principal.tier == "contractor"` against a field a renamed column, an
+	// unwired slot, or a directory with no row for this subject makes
+	// unreachable, and the operator sees only that the rule did not select. So
+	// the note fires on the rule's DECLARED reads — any path under the root that
+	// is not a floor key — whether the comparison was reached, short-circuited
+	// away, or evaluated and found false.
+	//
+	// The same test is what keeps it from becoming noise. A rule that reads only
+	// `object.*`, or only `principal.id`, is not exposed to the hazard at all:
+	// the floor is always present and always says the same thing. Recording it
+	// for those rules would put the note on every trace of every rule-backed
+	// grant in the very common deployment that wires no attribute provider, and
+	// the traces where it matters would be unfindable. See recordFloorOnly.
+	//
+	// # Why ONE kind, and not one per cause
+	//
+	// "No provider was ever wired" and "a provider answered and had nothing for
+	// this id" are genuinely different operator situations, and they are
+	// deliberately NOT split into two kinds. The distinction this layer can
+	// actually draw is not the distinction that matters: a resolver is wired or it
+	// is not, but the live shape of "unwired" is an *AttributeRegistry that is
+	// wired and simply has no slot for this principal's kind, which is
+	// indistinguishable here from a slot whose directory has no row. A second kind
+	// keyed on "is a resolver installed" would confidently report "a directory
+	// answered and had nothing" for a deployment that has no directory for this
+	// kind at all, and send the operator to inspect rows in a table nothing
+	// serves. One honest kind naming the ROOT is better than two kinds that are
+	// right about the cause only some of the time; the follow-up question — what
+	// serves this slot — is answered by the deployment's wiring, not by a note.
+	//
+	// Narrowing it properly would mean widening PrincipalResolver and
+	// AccountResolver to report WHY a bag is empty, which puts diagnostic plumbing
+	// on the signature every host implements and on the path every decision takes.
+	// That trade was not worth making for a distinction the trace can already
+	// point at.
+	NoteAttributesFloorOnly NoteKind = "attributes_floor_only"
 )
 
 // Note is one diagnostic observation recorded during rule evaluation.
@@ -115,6 +174,7 @@ const anonymousOperand = "(expression)"
 //	object.hired_at: not a canonical date; before expects 2006-01-02 or 2006-01-02T15:04:05Z
 //	object.hired_at: between bounds are inverted; the lower bound is after the upper bound, so nothing can match
 //	dataset.current_brands: references a brand that no longer exists; the identity was skipped
+//	principal: floor-only; no host attributes were resolved, so every comparison against a host-defined field is false
 func (n Note) String() string {
 	path := n.Path
 	if path == "" {
@@ -133,6 +193,9 @@ func (n Note) String() string {
 	case NoteDanglingReference:
 		return fmt.Sprintf("%s: references a %s that no longer exists; the identity was skipped",
 			path, n.Expected)
+	case NoteAttributesFloorOnly:
+		return fmt.Sprintf("%s: floor-only; no host attributes were resolved, so every "+
+			"comparison against a host-defined field is false", path)
 	default:
 		return fmt.Sprintf("%s: %s (%s)", path, n.Kind, n.Op)
 	}

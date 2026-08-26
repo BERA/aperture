@@ -57,7 +57,7 @@ func TestEngineSelected(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := eng.Selected(ctx, tc.rule, tc.object, tc.principal, tc.action)
+			got, err := eng.Selected(ctx, tc.rule, tc.object, "acme", "user", tc.principal, tc.action)
 			if err != nil {
 				t.Fatalf("Selected: %v", err)
 			}
@@ -71,7 +71,7 @@ func TestEngineSelected(t *testing.T) {
 func TestEngineRuleNotFound(t *testing.T) {
 	eng := newTestEngine()
 	_, err := eng.Selected(context.Background(), "missing",
-		identity.MustParse("account:acme/document:1"), "alice", "read")
+		identity.MustParse("account:acme/document:1"), "acme", "user", "alice", "read")
 	if code := aerr.CodeOf(err); code != aerr.APERTURE_RULE_NOT_FOUND {
 		t.Fatalf("code = %q, want APERTURE_RULE_NOT_FOUND", code)
 	}
@@ -81,7 +81,7 @@ func TestEngineSurfacesMetadataError(t *testing.T) {
 	eng := newTestEngine()
 	// document:99 has no metadata in the fetcher.
 	_, err := eng.Selected(context.Background(), "public",
-		identity.MustParse("account:acme/document:99"), "alice", "read")
+		identity.MustParse("account:acme/document:99"), "acme", "user", "alice", "read")
 	if code := aerr.CodeOf(err); code != aerr.APERTURE_NOT_FOUND {
 		t.Fatalf("code = %q, want APERTURE_NOT_FOUND (metadata error surfaced)", code)
 	}
@@ -92,7 +92,7 @@ func TestEngineSurfacesInvalidRule(t *testing.T) {
 		"bad": {Name: "bad", AST: Compare(OpEq, Var("subject.id"), Lit("x"))},
 	}
 	eng := NewEngine(source, fakeFetcher{"document:1": {}})
-	_, err := eng.Selected(context.Background(), "bad", identity.MustParse("document:1"), "alice", "read")
+	_, err := eng.Selected(context.Background(), "bad", identity.MustParse("document:1"), "acme", "user", "alice", "read")
 	if code := aerr.CodeOf(err); code != aerr.APERTURE_RULE_UNKNOWN_VARIABLE {
 		t.Fatalf("code = %q, want APERTURE_RULE_UNKNOWN_VARIABLE", code)
 	}
@@ -103,7 +103,7 @@ func TestEngineEvalIsCachedAcrossSelected(t *testing.T) {
 	ctx := context.Background()
 	doc1 := identity.MustParse("account:acme/document:1")
 	for i := 0; i < 3; i++ {
-		if _, err := eng.Selected(ctx, "public", doc1, "alice", "read"); err != nil {
+		if _, err := eng.Selected(ctx, "public", doc1, "acme", "user", "alice", "read"); err != nil {
 			t.Fatalf("Selected: %v", err)
 		}
 	}
@@ -127,11 +127,13 @@ func TestEngineSatisfiesScopeRuleEvaluator(t *testing.T) {
 
 	// Inclusive, rule-backed: covers an object the rule selects.
 	incl := scope.GrantContext{
-		Pattern:    pattern,
-		ObjectType: "document",
-		Spec:       scope.Spec{Strategy: scope.StrategyInclusive, Rule: "public"},
-		Principal:  "alice",
-		Action:     "read",
+		Pattern:       pattern,
+		ObjectType:    "document",
+		Spec:          scope.Spec{Strategy: scope.StrategyInclusive, Rule: "public"},
+		Account:       "acme",
+		PrincipalKind: "user",
+		Principal:     "alice",
+		Action:        "read",
 	}
 	inclRes, err := reg.Resolve(incl, scope.Deps{Rules: eng})
 	if err != nil {
@@ -146,11 +148,13 @@ func TestEngineSatisfiesScopeRuleEvaluator(t *testing.T) {
 
 	// Exclusive, rule-backed: excludes an object the rule selects.
 	excl := scope.GrantContext{
-		Pattern:    pattern,
-		ObjectType: "document",
-		Spec:       scope.Spec{Strategy: scope.StrategyExclusive, Rule: "public"},
-		Principal:  "alice",
-		Action:     "read",
+		Pattern:       pattern,
+		ObjectType:    "document",
+		Spec:          scope.Spec{Strategy: scope.StrategyExclusive, Rule: "public"},
+		Account:       "acme",
+		PrincipalKind: "user",
+		Principal:     "alice",
+		Action:        "read",
 	}
 	exclRes, err := reg.Resolve(excl, scope.Deps{Rules: eng})
 	if err != nil {
@@ -171,23 +175,59 @@ func TestEnginePrincipalResolver(t *testing.T) {
 		"clear": {AST: Compare(OpGe, Var("principal.clearance"), Lit(3))},
 	}
 	eng := NewEngine(source, nil, WithPrincipalResolver(principalResolverFunc(
-		func(_ context.Context, p string) (map[string]any, error) {
+		func(_ context.Context, _, p string) (map[string]any, error) {
 			clearance := map[string]int{"alice": 5, "bob": 1}
 			return map[string]any{"id": p, "clearance": clearance[p]}, nil
 		})))
 	ctx := context.Background()
 	obj := identity.MustParse("document:1")
 
-	if ok, err := eng.Selected(ctx, "clear", obj, "alice", "read"); err != nil || !ok {
+	if ok, err := eng.Selected(ctx, "clear", obj, "acme", "user", "alice", "read"); err != nil || !ok {
 		t.Fatalf("alice (clearance 5) should pass (ok=%v err=%v)", ok, err)
 	}
-	if ok, err := eng.Selected(ctx, "clear", obj, "bob", "read"); err != nil || ok {
+	if ok, err := eng.Selected(ctx, "clear", obj, "acme", "user", "bob", "read"); err != nil || ok {
 		t.Fatalf("bob (clearance 1) should fail (ok=%v err=%v)", ok, err)
 	}
 }
 
-type principalResolverFunc func(ctx context.Context, principal string) (map[string]any, error)
+type principalResolverFunc func(ctx context.Context, kind, principal string) (map[string]any, error)
 
-func (f principalResolverFunc) Attributes(ctx context.Context, principal string) (map[string]any, error) {
-	return f(ctx, principal)
+func (f principalResolverFunc) Attributes(ctx context.Context, kind, principal string) (map[string]any, error) {
+	return f(ctx, kind, principal)
+}
+
+// TestEnginePassesThePrincipalKindToTheResolver is the compile-honest half of the
+// signature change made observable: the kind is threaded from Selected's argument
+// list to the resolver, so a host that dispatches per kind gets the right source.
+// The floor bag publishes it too, so a rule can branch on it with no host wiring.
+func TestEnginePassesThePrincipalKindToTheResolver(t *testing.T) {
+	source := MapSource{"any": {AST: Compare(OpEq, Var("principal.id"), Lit("svc-1"))}}
+	var seen string
+	eng := NewEngine(source, nil, WithPrincipalResolver(principalResolverFunc(
+		func(_ context.Context, kind, p string) (map[string]any, error) {
+			seen = kind
+			return map[string]any{"id": p}, nil
+		})))
+
+	if _, err := eng.Selected(context.Background(), "any", identity.MustParse("document:1"),
+		"acme", "machine", "svc-1", "read"); err != nil {
+		t.Fatalf("Selected: %v", err)
+	}
+	if seen != "machine" {
+		t.Errorf("resolver saw kind %q, want %q", seen, "machine")
+	}
+
+	// The default resolver contributes nothing; the floor is the engine's, and it
+	// is exactly {id, kind}.
+	contributed, err := floorPrincipal{}.Attributes(context.Background(), "machine", "svc-1")
+	if err != nil {
+		t.Fatalf("floorPrincipal.Attributes: %v", err)
+	}
+	if len(contributed) != 0 {
+		t.Errorf("the default resolver contributed %v, want nothing", contributed)
+	}
+	bag := principalBag(contributed, "machine", "svc-1")
+	if len(bag) != 2 || bag["id"] != "svc-1" || bag["kind"] != "machine" {
+		t.Errorf("floor bag = %v, want exactly {id, kind}", bag)
+	}
 }

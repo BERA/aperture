@@ -52,7 +52,7 @@ whatever the host registered. Anything malformed is `APERTURE_SCOPE_INVALID`.
 
 Each strategy is a `ScopeResolver`, constructed per evaluation from a
 `GrantContext` (the already-parsed pattern, the permission's object type, the
-parsed `Spec`, and the principal/action context) plus runtime `Deps`:
+parsed `Spec`, and the account/principal/action context) plus runtime `Deps`:
 
 ```go
 type ScopeResolver interface {
@@ -80,9 +80,18 @@ so a zero `Deps` is usable:
 | `ObjectLister` | the [provider Registry](providers.md) (`*Registry` matches its signature byte-for-byte) | `APERTURE_SCOPE_LISTER_UNCONFIGURED` |
 | `RuleEvaluator` | the [rules Engine](rules.md) (`*rules.Engine` satisfies it) | `APERTURE_SCOPE_RULE_UNCONFIGURED` |
 
-`RuleEvaluator.Selected(ctx, rule, object, principal, action)` is exactly
-`rules.Engine.Selected` — that shared signature is how the rule-backed path is
-wired without `scope` importing `rules`.
+`RuleEvaluator.Selected(ctx, rule, object, account, principalKind, principal,
+action)` is exactly `rules.Engine.Selected` — that shared signature is how the
+rule-backed path is wired without `scope` importing `rules`.
+
+`account` and `principalKind` come straight off the `GrantContext`. They are
+there because a rule-backed strategy asks about **attributes**, and an attribute
+only means something once you know whose it is and which account it is read in.
+They are parameters rather than context values on purpose: a missing `ctx` value
+degrades silently to an empty account — a quiet allow-or-deny nobody wrote —
+where a parameter is a compile-time obligation on every caller. `principalKind`
+is `model.PrincipalKind`'s spelling (`"user"` / `"machine"`) carried as a string,
+since `scope` imports no `model`; **empty means unknown**, never a default.
 
 ## How each strategy decides `Contains`
 
@@ -153,11 +162,13 @@ reg := scope.DefaultRegistry()
 
 spec, _ := scope.ParseSpec("exclusive;ids=account:acme/document:7")
 gc := scope.GrantContext{
-    Pattern:    identity.MustParsePattern("account:acme/document:*"),
-    ObjectType: "document",
-    Spec:       spec,
-    Principal:  "user:alice",
-    Action:     "read",
+    Pattern:       identity.MustParsePattern("account:acme/document:*"),
+    ObjectType:    "document",
+    Spec:          spec,
+    Account:       "acme",
+    PrincipalKind: "user",
+    Principal:     "user:alice",
+    Action:        "read",
 }
 resolver, _ := reg.Resolve(gc, scope.Deps{Lister: providerReg /* , Rules: rulesEngine */})
 ok, _ := resolver.Contains(ctx, identity.MustParse("account:acme/document:42"))

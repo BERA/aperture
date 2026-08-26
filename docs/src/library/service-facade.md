@@ -29,6 +29,7 @@ dependencies:
 | `WithImpersonation(i *impersonation.Service)` | `ImpersonationStart` / session issuance. |
 | `WithAudit(r *audit.Recorder)` | The append-only audit trail: mutations synchronously, decision checks sampled + async. |
 | `WithProviders(reg *provider.Registry)` | `ObjectIdentifiers` and `ObjectMetadata` — object enumeration and metadata reads. |
+| `WithAttributes(reg *provider.AttributeRegistry)` | `ListAttributes` and the three attribute-cache invalidations — the gated, system-tier directory reads. It grants nobody anything: the decision path never resolves a bag through this option. |
 | `WithRuleSource(base rules.RuleSource, fetcher rules.MetadataFetcher)` | The what-if preview of an **unsaved** rule via `Simulate`'s `Overlay.Rules`. |
 | `WithClock(now func() time.Time)` | Override the facade clock used to stamp entity timestamps on writes (for deterministic tests). |
 
@@ -263,6 +264,14 @@ one `Check` allows — so an operational failure is a returned error, not a sile
 partial set. `Explain` is a diagnostic, not an enforcement gate; its
 `engine.Trace` is the public contract surfaces serialize.
 
+That trace carries `Notes` — six kinds today: `shape_mismatch`, `absent_field`,
+`date_invalid`, `date_bounds_inverted`, `dangling_reference`, and
+`attributes_floor_only` — and it carries
+[`Attributes`](decision-api.md#the-attribute-bags), the `principal` and `account`
+bags the rules were evaluated against, **values included**. That is a deliberate
+disclosure and the one place a trace carries values: the two bags are the
+subjects of the very request being explained. Callers gate `Explain` accordingly.
+
 ### Batch forms
 
 `CheckBatch`, `EnumerateBatch`, and `ExplainBatch` return per-item
@@ -352,6 +361,15 @@ Because `Simulate` reuses the engine's exact resolution, a hypothetical **deny**
 overlay grant correctly carves out a stored allow, and a shadowing principal
 models "what if alice had role X" — all without a write.
 
+`SimulateExplain` returns the same `engine.Trace` `Explain` does, attribute bags
+included, because it runs the live engine over an overlay store. One nuance:
+when the overlay carries **unsaved rules**, those rules are evaluated through a
+transient rule engine built for the overlay alone, which carries no attribute
+resolvers — so a previewed rule reads the floor bags (`principal.{id, kind}`,
+`account.{id}`) and nothing else, and earns an `attributes_floor_only` note if it
+names a host-defined field. A simulation cannot inject an attribute bag either:
+`Overlay` has no field for one.
+
 ### Related what-if reads
 
 Two adjacent reads support the rule-builder's what-if and require
@@ -374,9 +392,61 @@ Two adjacent reads support the rule-builder's what-if and require
   instant itself — a `rules.Input` with a zero `Now` has none, and every relative
   date correctly resolves to nothing.
 
+  It also supplies **no principal and no account input at all** — not even the
+  engine's floor. A rule reading `principal.tier` in the preview sees nothing,
+  and no `attributes_floor_only` note is recorded, because there is no resolver
+  behind it whose silence could be reported. This is the disclosure boundary of
+  the whole preview surface: it is the wider-audience one (a rule author's
+  editor), and handing it a principal bag would turn "evaluate this draft rule"
+  into a read oracle for the principal directory — name a subject, compare a
+  field, read the answer off the verdict. `Explain` takes the opposite side on
+  purpose.
+
 `ObjectIdentifiers(ctx, objectType, exclude...)` (also `WithProviders`) enumerates
 a type's complete instance set minus any excluded ids — the positive allow-list an
 exclusive allowance materialises to.
+
+## The attribute directory — a system-tier read
+
+`WithAttributes` adds the **one** administrative door onto an attribute slot.
+Listing the `user` slot returns the host's whole user table, keys and bags
+together, so every method here is gated **directly** through
+`authz.Gate.RequireSystemAdmin` — the shape `Export` uses — rather than through a
+mutation tier. Nothing here writes, and nothing here is audited.
+
+```go
+recs, err := svc.ListAttributes(ctx, actor, "user", provider.AttributeFilter{
+	Fields: map[string]any{"department": "eng"},
+	Limit:  100,
+})
+```
+
+| Method | Does |
+|---|---|
+| `ListAttributes(ctx, actor, slot, filter)` | a page of one slot's directory, narrowed by the same `Fields` predicate `Enumerate` applies to object metadata |
+| `InvalidateAttribute(ctx, actor, slot, id)` | drop one subject's cached bag; reports whether one was present |
+| `InvalidateAttributeSlot(ctx, actor, slot)` | drop a whole slot's cache |
+| `InvalidateAllAttributes(ctx, actor)` | drop every slot's cache; names no slot, so it cannot probe which exist |
+| `ExplainAttributeAuthority(ctx, actor)` | the `engine.Trace` behind the authority decision above — deliberately **not** gated on holding that authority, or only the operators who were allowed could find out why the refused ones were not |
+
+Three properties are contract, not implementation:
+
+- **The gate runs before the slot is parsed.** A refused caller gets the
+  identical `APERTURE_AUTHZ_DENIED` — nil slice, no count, no partial page — for
+  a populated slot, an unregistered slot, and a slot name that does not exist, so
+  a refusal cannot be used to probe which directories a deployment wires. A
+  system-admin does get the real diagnostics.
+- **No gate wired means `APERTURE_UNIMPLEMENTED`**, never "unrestricted": a bulk
+  directory read has no narrower fallback to degrade to.
+- **The decision path's fetch is not gated, and must never be.** A decision
+  resolves one bag for a subject it already named, through the rules engine's
+  resolvers — never through this option. The two paths reach the same registry
+  through different seams.
+
+Invalidation is a **security control**, not a performance knob: a slot's TTL is
+the window a revoked clearance keeps authorizing for, and these methods are how
+an operator closes it now instead of waiting it out. They clear the caches of
+**this process** only.
 
 ## Related
 

@@ -53,7 +53,7 @@ func newRuleService(tb testing.TB, m benchModel, withAudit bool) (*service.Servi
 	if !withAudit {
 		return service.New(eng), func() {}
 	}
-	return newAuditedService(tb, m, eng)
+	return newAuditedService(tb, m.store, eng)
 }
 
 // ruleQuery returns the Check query for a rule variant, failing loudly rather
